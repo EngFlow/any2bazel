@@ -32,12 +32,18 @@ from serialize import dump_model
 _COMPILE = {"CppCompile"}
 _LINK = {"CppLink", "CppArchive"}
 
-# map output extension -> target kind (aquery doesn't label rule kind directly
-# in the action graph, so we infer from the primary output of the link action)
-def _kind_from_output(path: str) -> TargetKind:
-    if path.endswith(".a"):
+# Infer target kind from the link ACTION, not just the output extension.
+# Mnemonic is authoritative for archives: CppArchive always produces a static
+# library, whatever the archive extension (.a on Linux, .lo thin-archive on
+# macOS/clang, .lib on Windows). Only for CppLink do we inspect the output to
+# tell a shared library from an executable.
+def _kind_from_link(mnemonic: str, path: str) -> TargetKind:
+    if mnemonic == "CppArchive":
         return TargetKind.STATIC
-    if path.endswith(".so") or path.endswith(".dylib") or ".so." in path:
+    if path.endswith(".a") or path.endswith(".lo") or path.endswith(".lib"):
+        return TargetKind.STATIC
+    if (path.endswith(".so") or path.endswith(".dylib") or ".so." in path
+            or path.endswith(".dll")):
         return TargetKind.SHARED
     return TargetKind.EXECUTABLE
 
@@ -80,8 +86,15 @@ def _source_from_compile_args(args: List[str]) -> Optional[str]:
 
 
 def _label_to_name(label: str) -> str:
-    """//foo/bar:baz -> baz ; keep it simple, names are matched against CMake."""
-    return label.split(":")[-1] if ":" in label else label.rstrip("/").split("/")[-1]
+    """Full-label-derived name, e.g. //absl/log:flags -> 'absl/log:flags'.
+
+    Must NOT reduce to the bare target name: deep package trees reuse names
+    across packages (//absl/log:flags vs //absl/log/internal:flags), and
+    collapsing to 'flags' would merge two distinct targets into one corrupt
+    entry. Library comparison keys on source path (names are irrelevant there);
+    executable alignment with CMake names is handled via target_map.
+    """
+    return label[2:] if label.startswith("//") else label
 
 
 def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
@@ -121,7 +134,7 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
         elif mnem in _LINK:
             outs = [artifacts.get(o, "") for o in action.get("outputIds", [])]
             primary = outs[0] if outs else ""
-            t = target_for(name, _kind_from_output(primary))
+            t = target_for(name, _kind_from_link(mnem, primary))
             # link inputs that are other targets' archives -> deps; system libs
             # appear as -l flags in the argv
             for a in args:

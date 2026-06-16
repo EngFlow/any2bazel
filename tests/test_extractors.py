@@ -104,11 +104,13 @@ def test_full_pipeline_converges():
             json.dump(AQUERY, f)
         b = extract_bazel.extract(aq_path, REPO)
 
-        # both sides describe target 'mylib' compiling src/a.cpp
+        # CMake keeps the target name; Bazel keys by full label (//:mylib ->
+        # ':mylib') to avoid cross-package name collisions. Library comparison
+        # is by source path, so the differing names still converge.
         assert "mylib" in a.targets, a.targets.keys()
-        assert "mylib" in b.targets, b.targets.keys()
+        assert ":mylib" in b.targets, b.targets.keys()
         assert a.targets["mylib"].kind.value == "static_library"
-        assert b.targets["mylib"].kind.value == "static_library"
+        assert b.targets[":mylib"].kind.value == "static_library"
 
         res = summarize(diff_models(a, b))
         assert res["converged"], json.dumps(res, indent=2)
@@ -132,7 +134,7 @@ def test_bazel_infers_kind_and_drops_defaults():
         with open(aq_path, "w") as f:
             json.dump(AQUERY, f)
         b = extract_bazel.extract(aq_path, REPO)
-        tu = b.targets["mylib"].tus[0]
+        tu = b.targets[":mylib"].tus[0]   # full-label key
         # toolchain defaults must be gone after canonicalization
         assert not any("random-seed" in fl for fl in tu.flags)
         assert "-fno-canonical-system-headers" not in tu.flags
