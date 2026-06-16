@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from canonicalize import canonicalize_flags
+from config import MigrationConfig
 from diff import Severity, diff_models, summarize
 from model import (CanonicalModel, Dependency, Target, TargetKind,
                    TargetRole, TranslationUnit)
@@ -81,11 +82,95 @@ def test_include_order_must_be_preserved():
     assert any(d.kind == "includes_diff" for d in discs), "reorder must be caught"
 
 
-def test_missing_link_dep_is_error():
-    a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False), deps=["zlib"])
-    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True), deps=[])
+def test_missing_external_link_dep_is_error():
+    # Only EXTERNAL deps are checked post-union (internal dep names are noise
+    # once libraries are compared as a TU-set). A missing system lib is an error.
+    a = CanonicalModel()
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("z", external=True)]))
+    b = CanonicalModel()
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
     discs = diff_models(a, b)
     assert any(d.kind == "missing_dep" and d.severity == "error" for d in discs)
+
+
+def test_internal_dep_rename_is_not_flagged():
+    # internal (non-external) deps are no longer compared -- a rename mismatch
+    # on an internal dep must NOT produce a discrepancy.
+    a = CanonicalModel()
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("crypto", external=False)]))
+    b = CanonicalModel()
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)],
+                 deps=[Dependency("crypto_internal", external=False)]))
+    assert summarize(diff_models(a, b))["converged"]
+
+
+def test_renamed_library_converges_without_a_map():
+    # TU-set comparison: libraries align by source path, so a library rename
+    # (crypto -> crypto_internal) needs NO target map to converge.
+    a = CanonicalModel()
+    a.add(Target("crypto", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+    b = CanonicalModel()
+    b.add(Target("crypto_internal", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+    assert summarize(diff_models(a, b))["converged"]
+
+
+def test_object_library_foldin_converges():
+    # CMake keeps fipsmodule as a separate object lib; Bazel folds its sources
+    # into crypto_internal. TU-set union makes this a non-issue.
+    a = CanonicalModel()
+    a.add(Target("crypto", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+    a.add(Target("fipsmodule", TargetKind.OBJECT, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("crypto/fips/b.cpp", ["-DFOO=1"], is_bazel=False)]))
+    b = CanonicalModel()
+    b.add(Target("crypto_internal", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=True),
+                      tu_from_raw("crypto/fips/b.cpp", ["-DFOO=1"], is_bazel=True)]))
+    assert summarize(diff_models(a, b))["converged"]
+
+
+def test_ignore_flags_and_defines_suppress_diffs():
+    # A reviewer-approved flag/define difference is suppressed via config and
+    # the diff converges; without the config it's an error.
+    cmake_raw = ["-DFOO=1", "-DBORINGSSL_DISPATCH_TEST", "-Wall",
+                 "-Wctad-maybe-unsupported"]
+    bazel_raw = ["-DFOO=1", "-Wall"]
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+
+    assert not summarize(diff_models(a, b))["converged"]  # un-suppressed: errors
+
+    cfg = MigrationConfig(
+        ignore_defines={"BORINGSSL_DISPATCH_TEST"},
+        ignore_flags={"-Wctad-maybe-unsupported"},
+    )
+    assert summarize(diff_models(a, b, cfg))["converged"]  # suppressed: clean
+
+
+def test_ignore_flag_prefixes():
+    a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1", "-Wthread-safety-analysis"],
+                           is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True))
+    cfg = MigrationConfig(ignore_flag_prefixes=("-Wthread-safety",))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
+def test_executables_still_aligned_by_identity():
+    # executables are the link deliverables: a missing exe IS a real gap.
+    a = CanonicalModel()
+    a.add(Target("bssl", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("tool/m.cpp", ["-DFOO=1"], is_bazel=False)]))
+    b = CanonicalModel()
+    discs = diff_models(a, b)
+    assert any(d.kind == "missing_target" for d in discs)
 
 
 def test_nonparticipating_roles_are_excluded_not_diffed():

@@ -43,8 +43,35 @@ IGNORABLE_FLAG_PREFIXES = (
     "-O",            # optimization level -- ditto
     "-fdebug-prefix-map=",
     "-ffile-prefix-map=",
+    "-ffile-compilation-dir=",     # reproducibility; output-path derived
     "-MD", "-MF", "-MT", "-MMD",  # dep-file generation; build-system bookkeeping
+    # --- toolchain / sysroot selection: environment-specific, not a migration
+    # decision. These differ per machine/SDK and must never be a discrepancy. ---
+    "-mmacosx-version-min=",
 )
+
+# Driver MECHANICS, hardcoded: how the compiler is invoked, not what it does.
+# These are universal facts (a -o names an output; -c means compile-only), never
+# migration decisions, so they're stripped at canonicalization, not configured.
+# Flags that consume the FOLLOWING token (drop both):
+_DRIVER_PAIR_FLAGS = {"-o", "-c", "-isysroot", "--sysroot", "-arch", "-target",
+                      "-gcc-toolchain", "-x", "--serialize-diagnostics"}
+
+# Defines the Bazel toolchain injects for reproducible builds (arrive as
+# KEY="..." after -D splitting). Matched by KEY before '='. Hardcoded fact.
+_DROP_DEFINE_KEYS = {"__DATE__", "__TIME__", "__TIMESTAMP__"}
+
+
+def _is_driver_token(tok: str) -> bool:
+    """A bare positional argv token on the Bazel side: the compiler path, a
+    wrapper script, the source file, or the .o output. Compile flags always
+    start with '-' (or '/' on Windows, handled separately), so any other bare
+    token is driver mechanics to drop. CMake File-API fragments never contain
+    these, so this only affects the Bazel side."""
+    if tok.startswith("-"):
+        return False
+    return (tok.endswith((".sh", ".o", ".obj", ".cc", ".cpp", ".cxx", ".c", ".C"))
+            or "/" in tok and not tok.startswith("/"))  # relative exec/source paths
 
 
 def _to_repo_relative(path: str, repo_root: str) -> str:
@@ -74,6 +101,14 @@ def _matches_any(flag: str, prefixes: Iterable[str]) -> bool:
     return any(flag == p or flag.startswith(p) for p in prefixes)
 
 
+def _add_define(defines: List[str], d: str) -> None:
+    """Append a define unless it's a hardcoded reproducibility injection
+    (__DATE__/__TIME__/__TIMESTAMP__), matched by key before '='."""
+    key = d.split("=", 1)[0]
+    if key not in _DROP_DEFINE_KEYS:
+        defines.append(d)
+
+
 def canonicalize_flags(
     raw: List[str],
     repo_root: str,
@@ -91,17 +126,28 @@ def canonicalize_flags(
     includes: List[str] = []
     other: List[str] = []
 
-    it = iter(range(len(raw)))
     i = 0
     n = len(raw)
+    # On the Bazel side the first argv token is the compiler/wrapper path
+    # (driver mechanics). CMake File-API fragments don't include it.
+    if is_bazel and n and _is_driver_token(raw[0]):
+        i = 1
     while i < n:
         tok = raw[i]
 
+        # driver flags that consume the next token (-o out.o, -isysroot /sdk,
+        # -arch arm64, -c src). Pure invocation mechanics -- drop flag + arg.
+        if tok in _DRIVER_PAIR_FLAGS and i + 1 < n:
+            i += 2; continue
+        # bare positional driver tokens (compiler path mid-argv, .o output)
+        if _is_driver_token(tok):
+            i += 1; continue
+
         # -Dfoo / -D foo
         if tok == "-D" and i + 1 < n:
-            defines.append(raw[i + 1]); i += 2; continue
+            _add_define(defines, raw[i + 1]); i += 2; continue
         if tok.startswith("-D"):
-            defines.append(tok[2:]); i += 1; continue
+            _add_define(defines, tok[2:]); i += 1; continue
 
         # include flavors: -I, -isystem, -iquote, -idirafter (split or joined)
         if tok in ("-I", "-isystem", "-iquote", "-idirafter") and i + 1 < n:

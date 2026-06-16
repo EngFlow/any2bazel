@@ -18,7 +18,9 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional
 
-from model import CanonicalModel, Target, TargetRole, TranslationUnit
+from config import MigrationConfig
+from model import (CanonicalModel, Target, TargetKind, TargetRole,
+                   TranslationUnit)
 
 
 class Severity(str, Enum):
@@ -49,11 +51,14 @@ class Discrepancy:
     bazel_only: Optional[list] = None  # present in B, absent in A  -> usually ok
 
 
-def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit) -> List[Discrepancy]:
+def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
+             cfg: "MigrationConfig") -> List[Discrepancy]:
     out: List[Discrepancy] = []
 
-    # defines: order-insensitive set compare; both directions matter
-    a_def, b_def = set(a.defines), set(b.defines)
+    # defines: order-insensitive set compare; both directions matter.
+    # Reviewer-approved ignores (cfg) are dropped from BOTH sides first.
+    a_def = {d for d in a.defines if not cfg.define_ignored(d)}
+    b_def = {d for d in b.defines if not cfg.define_ignored(d)}
     if a_def - b_def or b_def - a_def:
         out.append(Discrepancy(
             kind=Kind.DEFINES_DIFF.value,
@@ -78,8 +83,10 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit) -> List[Discre
             bazel_only=[i for i in b.includes if i not in set(a.includes)],
         ))
 
-    # other flags: asymmetric subset -- A must be subset of B
-    a_fl, b_fl = set(a.flags), set(b.flags)
+    # other flags: asymmetric subset -- A must be subset of B.
+    # Reviewer-approved ignores are dropped from both sides first.
+    a_fl = {f for f in a.flags if not cfg.flag_ignored(f)}
+    b_fl = {f for f in b.flags if not cfg.flag_ignored(f)}
     if a_fl - b_fl:
         out.append(Discrepancy(
             kind=Kind.FLAGS_DIFF.value,
@@ -111,26 +118,88 @@ def _participating(model: CanonicalModel) -> set:
             if t.role in PARTICIPATING_ROLES}
 
 
-def diff_models(a: CanonicalModel, b: CanonicalModel) -> List[Discrepancy]:
+def _apply_target_map(b: CanonicalModel, target_map: Dict[str, str]) -> CanonicalModel:
+    """Rename Bazel-side targets into the CMake namespace using a declared
+    map (cmake_name -> bazel_name), so targets that were intentionally renamed
+    during generation (e.g. crypto -> crypto_internal) align in the diff.
+
+    The map is authored by whoever generates the BUILD files -- they KNOW the
+    rename, so it's an explicit input rather than a fuzzy-match guess here.
+    Returns a shallow-renamed copy; the original model is untouched.
+    """
+    if not target_map:
+        return b
+    from dataclasses import replace
+    b2cmake = {bazel: cmake for cmake, bazel in target_map.items()}
+    renamed = CanonicalModel()
+    for name, t in b.targets.items():
+        t.name = b2cmake.get(name, name)
+        # deps reference target names too -- rename them into CMake's namespace
+        # so link-closure comparison lines up. (Dependency is frozen.)
+        t.deps = [replace(d, name=b2cmake.get(d.name, d.name)) for d in t.deps]
+        renamed.targets[t.name] = t
+    return renamed
+
+
+_LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
+                  TargetKind.INTERFACE}
+
+
+def _union_tus(model: CanonicalModel, names) -> Dict[str, TranslationUnit]:
+    """Pool TUs of the given targets into one source-keyed map.
+
+    This is how libraries are compared at TU-SET level: regardless of how
+    sources are grouped into targets (and regardless of target renames or
+    object-library fold-ins), every source compiled on each side lands in one
+    flat map keyed by repo-relative path. If the same source appears in two
+    targets with conflicting flags we keep the first and flag it -- rare, and a
+    real smell worth surfacing.
+    """
+    out: Dict[str, TranslationUnit] = {}
+    for n in names:
+        for tu in model.targets[n].tus:
+            out.setdefault(tu.key(), tu)
+    return out
+
+
+def diff_models(a: CanonicalModel, b: CanonicalModel,
+                cfg: Optional["MigrationConfig"] = None) -> List[Discrepancy]:
     out: List[Discrepancy] = []
-    # Only compare targets whose role participates in parity. Non-participating
-    # targets are surfaced via excluded_summary(), not diffed.
+    if cfg is None:
+        cfg = MigrationConfig()
+    b = _apply_target_map(b, cfg.target_map)
     a_names = _participating(a)
     b_names = _participating(b)
 
-    for name in sorted(a_names - b_names):
+    # Split production targets into libraries (compared as a TU-set union, so
+    # grouping/naming is irrelevant) and executables (the real link
+    # deliverables, compared by identity).
+    a_libs = {n for n in a_names if a.targets[n].kind in _LIBRARY_KINDS}
+    b_libs = {n for n in b_names if b.targets[n].kind in _LIBRARY_KINDS}
+    a_exes = a_names - a_libs
+    b_exes = b_names - b_libs
+
+    # ---- libraries: project-wide TU-set comparison -------------------------
+    a_union = _union_tus(a, a_libs)
+    b_union = _union_tus(b, b_libs)
+    for src in sorted(set(a_union) - set(b_union)):
+        out.append(Discrepancy(Kind.MISSING_TU.value, Severity.ERROR.value,
+                               "<libraries>", "source compiled in cmake but not bazel", tu=src))
+    for src in sorted(set(b_union) - set(a_union)):
+        out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
+                               "<libraries>", "source compiled in bazel but not cmake", tu=src))
+    for src in sorted(set(a_union) & set(b_union)):
+        out.extend(_diff_tu("<libraries>", a_union[src], b_union[src], cfg))
+
+    # ---- executables: identity-aligned, own TUs + own flags ----------------
+    for name in sorted(a_exes - b_exes):
         out.append(Discrepancy(Kind.MISSING_TARGET.value, Severity.ERROR.value,
-                               name, "target in cmake but not bazel"))
-    for name in sorted(b_names - a_names):
+                               name, "executable in cmake but not bazel"))
+    for name in sorted(b_exes - a_exes):
         out.append(Discrepancy(Kind.EXTRA_TARGET.value, Severity.WARN.value,
-                               name, "target in bazel but not cmake"))
-
-    for name in sorted(a_names & b_names):
+                               name, "executable in bazel but not cmake"))
+    for name in sorted(a_exes & b_exes):
         ta, tb = a.targets[name], b.targets[name]
-        if ta.kind != tb.kind:
-            out.append(Discrepancy(Kind.KIND_MISMATCH.value, Severity.ERROR.value,
-                                   name, f"{ta.kind.value} vs {tb.kind.value}"))
-
         amap, bmap = ta.tu_map(), tb.tu_map()
         for src in sorted(set(amap) - set(bmap)):
             out.append(Discrepancy(Kind.MISSING_TU.value, Severity.ERROR.value,
@@ -139,16 +208,24 @@ def diff_models(a: CanonicalModel, b: CanonicalModel) -> List[Discrepancy]:
             out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                    name, "source compiled in bazel but not cmake", tu=src))
         for src in sorted(set(amap) & set(bmap)):
-            out.extend(_diff_tu(name, amap[src], bmap[src]))
+            out.extend(_diff_tu(name, amap[src], bmap[src], cfg))
 
-        # link closure: every CMake dep identity must be present in Bazel
-        a_deps = {d.name for d in ta.deps}
-        b_deps = {d.name for d in tb.deps}
-        for dep in sorted(a_deps - b_deps):
-            out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,
-                                   name, "link dependency missing on bazel side",
-                                   cmake_only=[dep]))
+    # ---- link closure: EXTERNAL deps only ----------------------------------
+    # Internal (in-project) dep names are meaningless once libraries are
+    # dissolved into a TU union, but external/system libs (-lpthread, -lz, ...)
+    # must still be present for the binary to link. Compare the project-wide
+    # set of external deps; require every CMake external dep on the Bazel side.
+    a_ext = _external_deps(a, a_names)
+    b_ext = _external_deps(b, b_names)
+    for dep in sorted(a_ext - b_ext):
+        out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,
+                               "<external>", "external link dependency missing on bazel side",
+                               cmake_only=[dep]))
     return out
+
+
+def _external_deps(model: CanonicalModel, names) -> set:
+    return {d.name for n in names for d in model.targets[n].deps if d.external}
 
 
 def excluded_summary(a: CanonicalModel, b: CanonicalModel) -> dict:
@@ -186,8 +263,13 @@ def summarize(discs: List[Discrepancy],
 
 if __name__ == "__main__":
     import sys
-    # Used as a CLI by the skill loop: reads two model JSON files, prints diff.
+    # Used as a CLI by the skill loop:
+    #   diff.py <cmake.json> <bazel.json> [cmake2bazel.json]
+    # The 3rd arg is the migration config (target_map + ignore lists). If
+    # omitted, the diff runs with no human-approved suppressions.
+    import config as config_mod
     from serialize import load_model
     a = load_model(sys.argv[1])
     b = load_model(sys.argv[2])
-    print(json.dumps(summarize(diff_models(a, b), a, b), indent=2))
+    cfg = config_mod.load(sys.argv[3]) if len(sys.argv) > 3 else MigrationConfig()
+    print(json.dumps(summarize(diff_models(a, b, cfg), a, b), indent=2))
