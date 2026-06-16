@@ -102,6 +102,7 @@ files as the durable record of migration decisions:
   "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
   "target_map": { "some_cmake_exe": ":some_bazel_exe" },
   "exclude_targets": ["benchmark", "some_tool"],
+  "include_tests": false,
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
@@ -122,16 +123,22 @@ files as the durable record of migration decisions:
   third-party Bazel pulls externally, or out-of-scope tooling). The only lever
   for `missing_tu`/`missing_target` on whole subtrees; excluded targets are
   still reported under `excluded.config_excluded`.
+- **`include_tests`** (default `false`) — opt in to diffing test targets too.
+  Requires both models extracted with tests enabled at the **same scope**
+  (symmetric configure + `//...` aquery). Test sources are compared as a
+  project-wide TU-set union; a `test_binary_count` warning flags differing
+  numbers of test executables. Per-binary identity alignment is a later layer.
 - **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved flag/define
   differences (`flags_prefixes` matches by prefix).
 - **`ignore.include_map` vs `ignore.include_prefixes`** — for an include root
   spelled differently on each side (a dep that's in-tree under CMake, external
   under Bazel). **`include_map`** rewrites both sides' spellings to a canonical
-  token and keeps verifying the dep is present + ordered (several `from`
-  prefixes can collapse to one `to` token; longest `from` wins). **Prefer it**
-  over **`include_prefixes`**, which merely deletes the path — a blind spot. If
-  the dep's include is genuinely missing on the Bazel side, the map catches it;
-  ignore does not.
+  token and keeps verifying the dep is present (several `from` prefixes can
+  collapse to one `to` token; longest `from` wins). **Prefer it** over
+  **`include_prefixes`**, which merely deletes the path — a blind spot. If the
+  dep's include is genuinely missing on the Bazel side, the map catches it;
+  ignore does not. (Include search **order** is not currently enforced — see
+  `FUTURE-include-order-collision-check.md`.)
 
 Applied at **diff time** to **both sides**, so suppressions can be tuned and
 re-diffed without re-running cmake/bazel. Every entry is an explicit, auditable
@@ -149,13 +156,17 @@ future oracles.
 
 **Supported (MVP):**
 - Static / shared / object libraries and executables
-- Plain C/C++ sources, compile flags, defines, include search order
+- Plain C/C++ sources, compile flags, defines, include presence
 - External link deps recorded as **abstract identities** (resolution to a Bazel
   label is a pluggable concern, not hardcoded)
+- Tests — opt-in via `include_tests`, compared as a TU-set union + a coarse
+  test-binary count check
 
 **Not yet supported:**
 - Custom commands / generated code (`configure_file`, protoc, `add_custom_command`)
-- Tests (tracked via the `test` role; not yet diffed)
+- Per-test-binary identity alignment (tests compare at TU-set level for now)
+- Include search **order** (presence only — see
+  `FUTURE-include-order-collision-check.md`)
 - Packaging / install rules
 - Automatic external-dependency resolution (find_package → bzlmod /
   rules_foreign_cc). External deps surface as a discrepancy class; the model is

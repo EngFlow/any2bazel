@@ -65,6 +65,13 @@ class MigrationConfig:
     # so the comparison is reproducible. Read by the skill/operator, not by the
     # diff itself (the diff consumes the already-extracted model).
     bazel_args: tuple = ()
+    # Opt-in: also diff TEST targets (role=test). OFF by default because test
+    # diffing requires BOTH models to be extracted with tests enabled and the
+    # SAME test scope (symmetric configure + aquery); turning it on against a
+    # tests-off extraction would fabricate findings. When on, test sources are
+    # compared as their own project-wide TU-set union (like libraries), plus a
+    # test-binary existence/count check. See PARTICIPATING_ROLES in diff.py.
+    include_tests: bool = False
 
     def flag_ignored(self, flag: str) -> bool:
         return (flag in self.ignore_flags
@@ -111,6 +118,7 @@ def load(path: str) -> MigrationConfig:
             (e["from"], e["to"]) for e in ig.get("include_map", [])),
         exclude_targets=set(obj.get("exclude_targets", [])),
         bazel_args=tuple(obj.get("bazel_args", [])),
+        include_tests=bool(obj.get("include_tests", False)),
     )
 
 

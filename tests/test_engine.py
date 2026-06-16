@@ -307,6 +307,58 @@ def test_config_loads_all_fields_from_json():
     assert cfg.map_include("external/absl+/base") == "@absl/base"  # rewrite
 
 
+def _test_models(cmake_test_srcs, bazel_test_srcs, n_cmake_bins=1, n_bazel_bins=1):
+    """Build a/b models with a shared production lib plus test targets carrying
+    the given sources, split across n_*_bins test executables."""
+    def build(srcs, nbins, is_bazel):
+        m = CanonicalModel()
+        m.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=is_bazel)]))
+        for i in range(nbins):
+            chunk = srcs[i::nbins]
+            m.add(Target(f"test{i}", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                         tus=[tu_from_raw(s, ["-DFOO=1"], is_bazel=is_bazel) for s in chunk]))
+        return m
+    return (build(cmake_test_srcs, n_cmake_bins, False),
+            build(bazel_test_srcs, n_bazel_bins, True))
+
+
+def test_tests_excluded_by_default():
+    # With include_tests off, a test source only in cmake must NOT be flagged.
+    a, b = _test_models(["t/x_test.cc"], [])
+    res = summarize(diff_models(a, b), a, b)
+    assert res["converged"], res
+    assert "test" in res["excluded"]["cmake"]  # reported as excluded, not diffed
+
+
+def test_test_tu_union_compares_when_opted_in():
+    # Same test sources, differently grouped into binaries -> converges (TU-set
+    # union is grouping-agnostic, like libraries).
+    srcs = ["t/a_test.cc", "t/b_test.cc", "t/c_test.cc"]
+    a, b = _test_models(srcs, srcs, n_cmake_bins=1, n_bazel_bins=3)
+    cfg = MigrationConfig(include_tests=True)
+    assert summarize(diff_models(a, b, cfg), a, b, cfg)["converged"]
+
+
+def test_missing_test_source_caught_when_opted_in():
+    a, b = _test_models(["t/a_test.cc", "t/b_test.cc"], ["t/a_test.cc"])
+    cfg = MigrationConfig(include_tests=True)
+    discs = diff_models(a, b, cfg)
+    assert any(d.kind == "missing_test_tu" and d.tu == "t/b_test.cc" for d in discs)
+
+
+def test_test_binary_count_mismatch_is_warned():
+    # Same sources, but cmake has 1 test binary and bazel has 2 -> count warn.
+    srcs = ["t/a_test.cc", "t/b_test.cc"]
+    a, b = _test_models(srcs, srcs, n_cmake_bins=1, n_bazel_bins=2)
+    cfg = MigrationConfig(include_tests=True)
+    discs = diff_models(a, b, cfg)
+    cnt = [d for d in discs if d.kind == "test_binary_count"]
+    assert cnt and cnt[0].severity == Severity.WARN.value
+    # source compilation still converges (count diff is only a warning)
+    assert summarize(discs)["converged"]
+
+
 def test_nonparticipating_roles_are_excluded_not_diffed():
     # A dashboard target present only in cmake must NOT create a missing_target
     # discrepancy; it must appear in the excluded summary instead.

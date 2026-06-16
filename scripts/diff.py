@@ -38,6 +38,10 @@ class Kind(str, Enum):
     INCLUDES_DIFF = "includes_diff"
     FLAGS_DIFF = "flags_diff"
     MISSING_DEP = "missing_dep"
+    # test-specific (only emitted when cfg.include_tests):
+    MISSING_TEST_TU = "missing_test_tu"     # test source compiled in cmake, not bazel
+    EXTRA_TEST_TU = "extra_test_tu"         # test source compiled in bazel, not cmake
+    TEST_BINARY_COUNT = "test_binary_count"  # differing number of test executables
 
 
 @dataclass
@@ -242,6 +246,50 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
         out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,
                                "<external>", "external link dependency missing on bazel side",
                                cmake_only=[dep]))
+
+    # ---- tests (opt-in) ----------------------------------------------------
+    if cfg.include_tests:
+        out.extend(_diff_tests(a, b, cfg))
+    return out
+
+
+def _diff_tests(a: CanonicalModel, b: CanonicalModel,
+                cfg: "MigrationConfig") -> List[Discrepancy]:
+    """Compare TEST targets. Two checks (per the agreed first cut):
+
+      1. TU-SET union of all test sources (like libraries): same test .cc files
+         compiled with equivalent flags, regardless of how they're grouped into
+         test binaries or named. This is "union now"; per-binary alignment is a
+         later layer.
+      2. Test-binary EXISTENCE by count: a coarse check that both sides produce
+         a comparable number of test executables, catching the case where test
+         sources compile but are never linked into runnable tests. Reported as a
+         warning (not a per-binary identity check yet -- naming is deferred).
+    """
+    out: List[Discrepancy] = []
+    a_tests = {n for n, t in a.targets.items()
+               if t.role == TargetRole.TEST and not cfg.target_excluded(n)}
+    b_tests = {n for n, t in b.targets.items()
+               if t.role == TargetRole.TEST and not cfg.target_excluded(n)}
+
+    # 1. test-source TU-set union
+    a_union = _union_tus(a, a_tests)
+    b_union = _union_tus(b, b_tests)
+    for src in sorted(set(a_union) - set(b_union)):
+        out.append(Discrepancy(Kind.MISSING_TEST_TU.value, Severity.ERROR.value,
+                               "<tests>", "test source compiled in cmake but not bazel", tu=src))
+    for src in sorted(set(b_union) - set(a_union)):
+        out.append(Discrepancy(Kind.EXTRA_TEST_TU.value, Severity.WARN.value,
+                               "<tests>", "test source compiled in bazel but not cmake", tu=src))
+    for src in sorted(set(a_union) & set(b_union)):
+        out.extend(_diff_tu("<tests>", a_union[src], b_union[src], cfg))
+
+    # 2. test-binary existence by count
+    if len(a_tests) != len(b_tests):
+        out.append(Discrepancy(
+            Kind.TEST_BINARY_COUNT.value, Severity.WARN.value, "<tests>",
+            f"test executable count differs: cmake={len(a_tests)} bazel={len(b_tests)}",
+            cmake_only=sorted(a_tests), bazel_only=sorted(b_tests)))
     return out
 
 
@@ -257,12 +305,17 @@ def excluded_summary(a: CanonicalModel, b: CanonicalModel,
     skipped dashboard/codegen/test target, or a config-excluded third-party
     subtree, is an explicit, reviewable line item rather than a silent omission.
     """
+    # tests participate when opted in, so they are no longer "excluded" then
+    participating = set(PARTICIPATING_ROLES)
+    if cfg.include_tests:
+        participating.add(TargetRole.TEST)
+
     def by_reason(model: CanonicalModel) -> dict:
         out: Dict[str, List[str]] = {}
         for name, t in sorted(model.targets.items()):
             if cfg.target_excluded(name):
                 out.setdefault("config_excluded", []).append(name)
-            elif t.role not in PARTICIPATING_ROLES:
+            elif t.role not in participating:
                 out.setdefault(t.role.value, []).append(name)
         return out
     return {"cmake": by_reason(a), "bazel": by_reason(b)}

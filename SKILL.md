@@ -97,6 +97,7 @@ files as the durable record of migration decisions:
   "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
   "target_map": { "some_cmake_exe": ":some_bazel_exe" },
   "exclude_targets": ["benchmark", "some_tool"],
+  "include_tests": false,
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
@@ -122,6 +123,12 @@ Fields:
   third-party/vendored code Bazel pulls as an external module, or tooling out
   of scope. The **only** lever for `missing_tu`/`missing_target` on whole
   subtrees. Excluded targets still appear under `excluded.config_excluded`.
+- **`include_tests`** (default `false`) — opt in to also diffing **test**
+  targets. OFF by default because it requires BOTH models to be extracted with
+  tests enabled and the **same** test scope (symmetric configure + aquery);
+  turning it on against a tests-off extraction fabricates findings. When on,
+  test sources are compared as their own project-wide TU-set union (like
+  libraries) and a coarse test-binary count check runs. See step 4b / step 7.
 - **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved flag/define
   differences. `flags`/`defines` match exact tokens; `flags_prefixes` by prefix.
 - **`ignore.include_prefixes` vs `ignore.include_map`** — two ways to handle an
@@ -130,13 +137,15 @@ Fields:
   `include_map`:**
   - **`include_map`** rewrites differing spellings of the same root to a
     canonical token (on both sides) and **keeps checking** — the dependency
-    must still be present and correctly ordered. Several `from` prefixes may map
-    to one `to` token (collapse Bazel's `external/X` and its `bazel-out/.../bin/
-    external/X` twin). Longest `from` wins.
+    must still be present. Several `from` prefixes may map to one `to` token
+    (collapse Bazel's `external/X` and its `bazel-out/.../bin/external/X` twin).
+    Longest `from` wins.
   - **`include_prefixes`** just **deletes** the path from the comparison — a
     blind spot. Use only when there's no meaningful counterpart to map to.
   - The difference matters: if the dependency's include is genuinely missing on
     the Bazel side, the map **catches it**; ignore stays silent.
+  - Note: include **search order** is currently not enforced (presence only) —
+    see `FUTURE-include-order-collision-check.md`.
 
 The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
@@ -145,12 +154,14 @@ cmake/bazel.
 ## Scope (MVP — check before running)
 
 Supported: static/shared/object libraries and executables; plain C/C++ sources,
-compile flags, defines, include search order; external deps recorded as abstract
-identities.
+compile flags, defines, include presence; external deps recorded as abstract
+identities. Tests are opt-in (`include_tests`) at TU-set + binary-count level
+(step 8).
 
 **NOT yet supported — stop and tell the user if the project has these:**
 - Custom commands / generated code (`configure_file`, protoc, `add_custom_command`)
-- Tests (tracked via the `test` role, but not yet diffed)
+- Per-test-binary identity alignment, and include search **order** (presence
+  only) — both have planned follow-ups
 - Packaging / install rules
 - Automatic external-dependency resolution (find_package → bzlmod)
 
@@ -239,17 +250,32 @@ correctness flags).
 | `missing_target` | add the missing `cc_binary`, or `target_map` a renamed exe, or `exclude_targets` if out of scope |
 | `missing_tu`     | add the source to some library's `srcs`, or `exclude_targets` if it's a vendored/out-of-scope subtree |
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
-| `includes_diff`  | add/reorder `includes` to preserve CMake search order; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
+| `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `missing_dep`    | add the external dep to `deps` (resolve via the dep adapter) |
+| `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
+| `test_binary_count` | (tests on, warning) note the differing test-binary count; per-binary alignment is not yet enforced |
 
 Re-run steps 4–6 (or just 5–6 if only the config changed). Repeat until
 `converged: true`. Report remaining `warn` items and the `excluded` roles.
 
-### 8. Report
+### 8. (Optional) Diff tests
+Once production parity is reached, opt into test diffing:
+- Re-extract **both** sides with tests enabled and the **same** scope: CMake
+  configured without `-D..._BUILD_TESTING=OFF`; aquery over `//...` (not a
+  single target). Asymmetric scope fabricates findings.
+- Set `"include_tests": true` in `cmake2bazel.json` and re-run steps 5–7.
+- Test sources are compared as a project-wide TU-set union (grouping/naming
+  agnostic); a `test_binary_count` warning flags differing numbers of test
+  executables. Per-binary identity alignment is a later layer — for now,
+  `missing_test_tu` tells you a test source isn't compiled on the Bazel side
+  (e.g. an un-ported test binary).
+
+### 9. Report
 Summarize: production targets reconciled, rounds taken, suppressions recorded in
-`cmake2bazel.json` (with rationale), and excluded roles (dashboard/test/codegen)
-for human follow-up.
+`cmake2bazel.json` (with rationale), excluded roles (dashboard/codegen) for
+human follow-up, and — if `include_tests` was on — test-source parity and any
+test-binary count gap.
 
 ## Files
 
