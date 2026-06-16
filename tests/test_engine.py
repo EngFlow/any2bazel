@@ -1,9 +1,12 @@
 """Tests for the deterministic diff engine.
 
-These prove the two behaviors the whole approach hinges on:
+Cornerstone behaviors the whole approach hinges on:
   1. Bazel's injected toolchain-default flags do NOT create false discrepancies
      (otherwise the migrate loop never converges).
   2. A genuinely missing CMake correctness flag IS caught (asymmetric subset).
+Plus coverage of: TU-set library comparison (renames/fold-ins), role filtering,
+and every migration-config lever (ignore flags/defines/includes, exclude_targets,
+JSON round-trip).
 """
 
 import os
@@ -171,6 +174,77 @@ def test_executables_still_aligned_by_identity():
     b = CanonicalModel()
     discs = diff_models(a, b)
     assert any(d.kind == "missing_target" for d in discs)
+
+
+def test_ignore_include_prefixes():
+    # A vendored third-party include root that differs by path (in-tree under
+    # CMake, external under Bazel) is suppressed via include_prefixes.
+    a = _model(tu_from_raw(
+        "src/a.cpp", ["-DFOO=1", "-I", "/work/proj/third_party/gtest/include"],
+        is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True))
+
+    assert not summarize(diff_models(a, b))["converged"]  # un-suppressed
+
+    cfg = MigrationConfig(ignore_include_prefixes=("third_party/",))
+    assert summarize(diff_models(a, b, cfg))["converged"]  # suppressed
+
+
+def test_exclude_targets_suppresses_structural_diffs():
+    # A whole target present only in cmake (e.g. vendored third-party) produces
+    # missing_tu/missing_target unless excluded. exclude_targets is the only
+    # lever for that (ignore only covers flags/defines/includes).
+    a = CanonicalModel()
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+    a.add(Target("benchmark", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("third_party/benchmark/b.cpp", ["-DFOO=1"],
+                                  is_bazel=False)]))
+    b = CanonicalModel()
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+
+    # without exclusion: benchmark's TU is a missing_tu error
+    assert not summarize(diff_models(a, b))["converged"]
+
+    # with exclusion: converges, and the excluded target is still reported
+    cfg = MigrationConfig(exclude_targets={"benchmark"})
+    res = summarize(diff_models(a, b, cfg), a, b, cfg)
+    assert res["converged"], res
+    assert not any(d.kind == "missing_tu" for d in res["discrepancies"])
+    assert "benchmark" in res["excluded"]["cmake"]["config_excluded"]
+
+
+def test_config_loads_all_fields_from_json():
+    # The skill drives the diff via a cmake2bazel.json on disk, so loading must
+    # populate every lever. Guards against a field added to the dataclass but
+    # not wired into load().
+    import json
+    import tempfile
+    import config as config_mod
+    obj = {
+        "bazel_args": ["--config=macos", "--copt=-fno-rtti"],
+        "target_map": {"a": "b"},
+        "exclude_targets": ["benchmark"],
+        "ignore": {
+            "defines": ["BORINGSSL_DISPATCH_TEST"],
+            "flags": ["-fvisibility=hidden"],
+            "flags_prefixes": ["-Wthread-safety"],
+            "include_prefixes": ["third_party/"],
+        },
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(obj, f)
+        path = f.name
+    cfg = config_mod.load(path)
+    os.unlink(path)
+    assert cfg.bazel_args == ("--config=macos", "--copt=-fno-rtti")
+    assert cfg.target_map == {"a": "b"}
+    assert cfg.target_excluded("benchmark")
+    assert cfg.define_ignored("BORINGSSL_DISPATCH_TEST")
+    assert cfg.flag_ignored("-fvisibility=hidden")
+    assert cfg.flag_ignored("-Wthread-safety-analysis")  # prefix match
+    assert cfg.include_ignored("third_party/gtest/include")
 
 
 def test_nonparticipating_roles_are_excluded_not_diffed():
