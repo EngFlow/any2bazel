@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from canonicalize import canonicalize_flags
 from diff import Severity, diff_models, summarize
 from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TranslationUnit)
+                   TargetRole, TranslationUnit)
 
 REPO = "/work/proj"
 
@@ -26,7 +26,7 @@ def tu_from_raw(source, raw, is_bazel):
 
 def _model(tu, deps=()):
     m = CanonicalModel()
-    m.add(Target("lib", TargetKind.STATIC, tus=[tu],
+    m.add(Target("lib", TargetKind.STATIC, tus=[tu], role=TargetRole.PRODUCTION,
                  deps=[Dependency(n) for n in deps]))
     return m
 
@@ -86,6 +86,23 @@ def test_missing_link_dep_is_error():
     b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True), deps=[])
     discs = diff_models(a, b)
     assert any(d.kind == "missing_dep" and d.severity == "error" for d in discs)
+
+
+def test_nonparticipating_roles_are_excluded_not_diffed():
+    # A dashboard target present only in cmake must NOT create a missing_target
+    # discrepancy; it must appear in the excluded summary instead.
+    a = CanonicalModel()
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+    a.add(Target("Nightly", TargetKind.UNKNOWN, role=TargetRole.DASHBOARD))
+    b = CanonicalModel()
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+    discs = diff_models(a, b)
+    res = summarize(discs, a, b)
+    assert res["converged"], res
+    assert not any(d.kind == "missing_target" for d in discs)
+    assert "Nightly" in res["excluded"]["cmake"]["dashboard"]
 
 
 if __name__ == "__main__":

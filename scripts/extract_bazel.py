@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 
 from canonicalize import canonicalize_flags
 from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TranslationUnit)
+                   TargetRole, TranslationUnit)
 from serialize import dump_model
 
 _COMPILE = {"CppCompile"}
@@ -131,8 +131,20 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
                         t.deps.append(Dependency(dep, external=True))
 
     for t in by_target.values():
+        t.role = _classify_bazel(t)
         model.add(t)
     return model
+
+
+def _classify_bazel(t: Target) -> TargetRole:
+    """Infer role on the Bazel side from kind + name conventions. aquery has no
+    UTILITY/dashboard concept, so roles here are PRODUCTION/TEST/AGGREGATE."""
+    if not t.tus and t.kind != TargetKind.INTERFACE:
+        return TargetRole.AGGREGATE
+    if t.kind == TargetKind.EXECUTABLE and (
+            t.name.endswith(("_test", "_tests", "_shim"))):
+        return TargetRole.TEST
+    return TargetRole.PRODUCTION
 
 
 def _rel(path: str, repo_root: str) -> str:

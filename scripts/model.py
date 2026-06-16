@@ -25,12 +25,30 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 class TargetKind(str, Enum):
+    """Mechanical artifact type. Says nothing about the target's purpose."""
     STATIC = "static_library"
     SHARED = "shared_library"
     EXECUTABLE = "executable"
     OBJECT = "object_library"
     INTERFACE = "interface_library"  # header-only / no TUs
     UNKNOWN = "unknown"
+
+
+class TargetRole(str, Enum):
+    """Inferred FUNCTION of a target -- orthogonal to TargetKind.
+
+    Classification is a heuristic guess, so UNKNOWN is a first-class outcome
+    that stays visible rather than being silently dropped. The diff compares
+    only roles in PARTICIPATING_ROLES (see diff.py); the rest are retained in
+    the model for separate inspection. Turning tests on later is a one-line
+    policy change here, not a re-extraction.
+    """
+    PRODUCTION = "production"   # shippable library or binary -> diffed
+    TEST = "test"              # test executable -> tracked, deferred phase
+    DASHBOARD = "dashboard"    # CTest/CDash UTILITY automation, no artifact
+    AGGREGATE = "aggregate"    # meta target: only deps, no own sources
+    CODEGEN = "codegen"        # generated-code / custom-command target (out of MVP)
+    UNKNOWN = "unknown"        # could not classify -- surfaced, not diffed
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,15 @@ class Target:
     tus: List[TranslationUnit] = field(default_factory=list)
     deps: List[Dependency] = field(default_factory=list)   # link closure (direct)
     link_flags: Tuple[str, ...] = ()
+    # Inferred FUNCTION of the target (see TargetRole). Orthogonal to `kind`,
+    # which is the mechanical artifact type. The diff compares only targets
+    # whose role is in PARTICIPATING_ROLES; everything else is kept in the
+    # model for inspection but skipped, with the role explaining why.
+    role: "TargetRole" = None  # set in __post_init__ if left unspecified
+
+    def __post_init__(self):
+        if self.role is None:
+            self.role = TargetRole.UNKNOWN
 
     def tu_map(self) -> Dict[str, TranslationUnit]:
         return {tu.key(): tu for tu in self.tus}

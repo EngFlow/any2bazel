@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional
 
-from model import CanonicalModel, Target, TranslationUnit
+from model import CanonicalModel, Target, TargetRole, TranslationUnit
 
 
 class Severity(str, Enum):
@@ -99,9 +99,24 @@ def _is_subsequence(needle, haystack) -> bool:
     return all(x in it for x in needle)
 
 
+# Roles the parity diff actually compares. Everything else (dashboard,
+# aggregate, codegen, test, unknown) is retained in the model and reported
+# separately for inspection, but never produces a discrepancy. Flip TEST on
+# here when the test-migration phase begins -- no re-extraction needed.
+PARTICIPATING_ROLES = {TargetRole.PRODUCTION}
+
+
+def _participating(model: CanonicalModel) -> set:
+    return {n for n, t in model.targets.items()
+            if t.role in PARTICIPATING_ROLES}
+
+
 def diff_models(a: CanonicalModel, b: CanonicalModel) -> List[Discrepancy]:
     out: List[Discrepancy] = []
-    a_names, b_names = set(a.targets), set(b.targets)
+    # Only compare targets whose role participates in parity. Non-participating
+    # targets are surfaced via excluded_summary(), not diffed.
+    a_names = _participating(a)
+    b_names = _participating(b)
 
     for name in sorted(a_names - b_names):
         out.append(Discrepancy(Kind.MISSING_TARGET.value, Severity.ERROR.value,
@@ -136,15 +151,37 @@ def diff_models(a: CanonicalModel, b: CanonicalModel) -> List[Discrepancy]:
     return out
 
 
-def summarize(discs: List[Discrepancy]) -> dict:
+def excluded_summary(a: CanonicalModel, b: CanonicalModel) -> dict:
+    """Targets NOT compared, grouped by role and side, for separate inspection.
+
+    This is the visible record of what the parity diff skipped and why -- so a
+    skipped dashboard/codegen/test target is an explicit, reviewable line item
+    rather than a silent omission.
+    """
+    def by_role(model: CanonicalModel) -> dict:
+        out: Dict[str, List[str]] = {}
+        for name, t in sorted(model.targets.items()):
+            if t.role in PARTICIPATING_ROLES:
+                continue
+            out.setdefault(t.role.value, []).append(name)
+        return out
+    return {"cmake": by_role(a), "bazel": by_role(b)}
+
+
+def summarize(discs: List[Discrepancy],
+              a: Optional[CanonicalModel] = None,
+              b: Optional[CanonicalModel] = None) -> dict:
     errors = [d for d in discs if d.severity == Severity.ERROR.value]
-    return {
+    result = {
         "total": len(discs),
         "errors": len(errors),
         "warnings": len(discs) - len(errors),
         "converged": len(errors) == 0,
         "discrepancies": [asdict(d) for d in discs],
     }
+    if a is not None and b is not None:
+        result["excluded"] = excluded_summary(a, b)
+    return result
 
 
 if __name__ == "__main__":
@@ -153,4 +190,4 @@ if __name__ == "__main__":
     from serialize import load_model
     a = load_model(sys.argv[1])
     b = load_model(sys.argv[2])
-    print(json.dumps(summarize(diff_models(a, b)), indent=2))
+    print(json.dumps(summarize(diff_models(a, b), a, b), indent=2))

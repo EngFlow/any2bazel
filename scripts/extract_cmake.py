@@ -28,7 +28,7 @@ from typing import Dict, List, Optional
 
 from canonicalize import canonicalize_flags
 from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TranslationUnit)
+                   TargetRole, TranslationUnit)
 from serialize import dump_model
 
 # CMake target type string -> our TargetKind
@@ -40,6 +40,63 @@ _KIND = {
     "OBJECT_LIBRARY": TargetKind.OBJECT,
     "INTERFACE_LIBRARY": TargetKind.INTERFACE,
 }
+
+# CTest/CDash dashboard target names (add_test/enable_testing machinery). These
+# arrive as UTILITY targets and produce no artifact.
+_DASHBOARD_NAMES = {
+    "Continuous", "Experimental", "Nightly", "NightlyMemoryCheck",
+    "run_tests", "fips_specific_tests_if_any",
+}
+_DASHBOARD_PREFIXES = ("Continuous", "Experimental", "Nightly")
+
+
+def _classify(tobj: dict) -> TargetRole:
+    """Infer a target's FUNCTION from its CMake type, name, and structure.
+
+    Heuristic and deliberately conservative: anything we can't place lands in
+    UNKNOWN so it shows up for inspection instead of being silently diffed or
+    dropped.
+    """
+    name = tobj.get("name", "")
+    ctype = tobj.get("type", "")
+
+    if ctype in ("UTILITY", "GLOBAL_TARGET", "PACKAGE"):
+        if name in _DASHBOARD_NAMES or name.startswith(_DASHBOARD_PREFIXES):
+            return TargetRole.DASHBOARD
+        # a UTILITY with custom commands is codegen; otherwise dashboard-ish
+        return TargetRole.CODEGEN if tobj.get("backtraceGraph") and \
+            _has_custom_command(tobj) else TargetRole.DASHBOARD
+
+    has_sources = bool(tobj.get("compileGroups"))
+    is_exe = ctype == "EXECUTABLE"
+
+    # aggregate: real target type but compiles nothing of its own (only links)
+    if not has_sources and ctype != "INTERFACE_LIBRARY":
+        return TargetRole.AGGREGATE
+
+    # test: an executable that CTest registered, or conventionally named
+    if is_exe and (_is_registered_test(tobj) or name.endswith(("_test", "_tests"))
+                   or name.endswith("_shim")):
+        return TargetRole.TEST
+
+    return TargetRole.PRODUCTION
+
+
+def _has_custom_command(tobj: dict) -> bool:
+    # File API marks generated outputs; a UTILITY with a backtrace into
+    # add_custom_command/target is codegen. We approximate via presence of a
+    # non-empty 'sources' that are all GENERATED, which the codemodel flags.
+    for s in tobj.get("sources", []):
+        if s.get("isGenerated"):
+            return True
+    return False
+
+
+def _is_registered_test(tobj: dict) -> bool:
+    # codemodel doesn't list ctest registration directly on the target; the
+    # name-suffix heuristic above is the primary signal. Hook kept for when we
+    # also parse the ctest reply object.
+    return False
 
 
 def _find_codemodel(reply_dir: str) -> dict:
@@ -93,7 +150,7 @@ def _parse_target(tobj: dict, repo_root: str) -> Target:
             tus.append(TranslationUnit(source=src, defines=cdef,
                                        includes=cinc, flags=cfl, language=lang))
 
-    return Target(name=name, kind=kind, tus=tus)
+    return Target(name=name, kind=kind, tus=tus, role=_classify(tobj))
 
 
 def _attach_deps(target: Target, tobj: dict, id_to_name: Dict[str, str]) -> None:

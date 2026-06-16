@@ -13,7 +13,7 @@ import json
 from typing import Any, Dict
 
 from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TranslationUnit)
+                   TargetRole, TranslationUnit)
 
 
 def dump_model(m: CanonicalModel, path: str) -> None:
@@ -21,6 +21,7 @@ def dump_model(m: CanonicalModel, path: str) -> None:
     for name, t in m.targets.items():
         obj["targets"][name] = {
             "kind": t.kind.value,
+            "role": t.role.value,
             "link_flags": list(t.link_flags),
             "deps": [{"name": d.name, "external": d.external} for d in t.deps],
             "tus": [
@@ -46,6 +47,7 @@ def load_model(path: str) -> CanonicalModel:
         target = Target(
             name=name,
             kind=TargetKind(t["kind"]),
+            role=TargetRole(t.get("role", "unknown")),
             link_flags=tuple(t.get("link_flags", [])),
             deps=[Dependency(d["name"], d.get("external", False)) for d in t.get("deps", [])],
             tus=[
