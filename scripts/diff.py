@@ -71,16 +71,19 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
 
     # includes: ORDER-SENSITIVE. We require A's sequence to appear as a
     # subsequence of B's (B may add extra system includes, but must not drop
-    # or reorder A's search order).
-    if not _is_subsequence(a.includes, b.includes):
-        missing = [i for i in a.includes if i not in set(b.includes)]
+    # or reorder A's search order). Reviewer-approved include prefixes (e.g.
+    # vendored third-party roots) are dropped from both sides first.
+    a_inc = tuple(i for i in a.includes if not cfg.include_ignored(i))
+    b_inc = tuple(i for i in b.includes if not cfg.include_ignored(i))
+    if not _is_subsequence(a_inc, b_inc):
+        missing = [i for i in a_inc if i not in set(b_inc)]
         out.append(Discrepancy(
             kind=Kind.INCLUDES_DIFF.value,
             severity=Severity.ERROR.value,
             target=target, tu=a.source,
             detail="include search order not preserved or entries missing",
             cmake_only=missing,
-            bazel_only=[i for i in b.includes if i not in set(a.includes)],
+            bazel_only=[i for i in b_inc if i not in set(a_inc)],
         ))
 
     # other flags: asymmetric subset -- A must be subset of B.
@@ -113,9 +116,9 @@ def _is_subsequence(needle, haystack) -> bool:
 PARTICIPATING_ROLES = {TargetRole.PRODUCTION}
 
 
-def _participating(model: CanonicalModel) -> set:
+def _participating(model: CanonicalModel, cfg: "MigrationConfig") -> set:
     return {n for n, t in model.targets.items()
-            if t.role in PARTICIPATING_ROLES}
+            if t.role in PARTICIPATING_ROLES and not cfg.target_excluded(n)}
 
 
 def _apply_target_map(b: CanonicalModel, target_map: Dict[str, str]) -> CanonicalModel:
@@ -168,8 +171,8 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     if cfg is None:
         cfg = MigrationConfig()
     b = _apply_target_map(b, cfg.target_map)
-    a_names = _participating(a)
-    b_names = _participating(b)
+    a_names = _participating(a, cfg)
+    b_names = _participating(b, cfg)
 
     # Split production targets into libraries (compared as a TU-set union, so
     # grouping/naming is irrelevant) and executables (the real link
@@ -228,26 +231,29 @@ def _external_deps(model: CanonicalModel, names) -> set:
     return {d.name for n in names for d in model.targets[n].deps if d.external}
 
 
-def excluded_summary(a: CanonicalModel, b: CanonicalModel) -> dict:
-    """Targets NOT compared, grouped by role and side, for separate inspection.
+def excluded_summary(a: CanonicalModel, b: CanonicalModel,
+                     cfg: "MigrationConfig") -> dict:
+    """Targets NOT compared, grouped by reason and side, for separate inspection.
 
     This is the visible record of what the parity diff skipped and why -- so a
-    skipped dashboard/codegen/test target is an explicit, reviewable line item
-    rather than a silent omission.
+    skipped dashboard/codegen/test target, or a config-excluded third-party
+    subtree, is an explicit, reviewable line item rather than a silent omission.
     """
-    def by_role(model: CanonicalModel) -> dict:
+    def by_reason(model: CanonicalModel) -> dict:
         out: Dict[str, List[str]] = {}
         for name, t in sorted(model.targets.items()):
-            if t.role in PARTICIPATING_ROLES:
-                continue
-            out.setdefault(t.role.value, []).append(name)
+            if cfg.target_excluded(name):
+                out.setdefault("config_excluded", []).append(name)
+            elif t.role not in PARTICIPATING_ROLES:
+                out.setdefault(t.role.value, []).append(name)
         return out
-    return {"cmake": by_role(a), "bazel": by_role(b)}
+    return {"cmake": by_reason(a), "bazel": by_reason(b)}
 
 
 def summarize(discs: List[Discrepancy],
               a: Optional[CanonicalModel] = None,
-              b: Optional[CanonicalModel] = None) -> dict:
+              b: Optional[CanonicalModel] = None,
+              cfg: Optional["MigrationConfig"] = None) -> dict:
     errors = [d for d in discs if d.severity == Severity.ERROR.value]
     result = {
         "total": len(discs),
@@ -257,7 +263,7 @@ def summarize(discs: List[Discrepancy],
         "discrepancies": [asdict(d) for d in discs],
     }
     if a is not None and b is not None:
-        result["excluded"] = excluded_summary(a, b)
+        result["excluded"] = excluded_summary(a, b, cfg or MigrationConfig())
     return result
 
 
@@ -272,4 +278,4 @@ if __name__ == "__main__":
     a = load_model(sys.argv[1])
     b = load_model(sys.argv[2])
     cfg = config_mod.load(sys.argv[3]) if len(sys.argv) > 3 else MigrationConfig()
-    print(json.dumps(summarize(diff_models(a, b, cfg), a, b), indent=2))
+    print(json.dumps(summarize(diff_models(a, b, cfg), a, b, cfg), indent=2))
