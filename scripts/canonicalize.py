@@ -30,7 +30,6 @@ BAZEL_DEFAULT_FLAG_PREFIXES = (
     "-Wunused-but-set-parameter",
     "-Wno-free-nonheap-object",
     "-fdiagnostics-color",
-    "-iquote",            # bazel adds repo-root -iquote for its own include style
     "-frandom-seed=",     # derived from output path; pure noise for a diff
     "-D__DATE__",
     "-D__TIMESTAMP__",
