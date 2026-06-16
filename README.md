@@ -34,6 +34,14 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘    ▲
 - **Bazel side: `bazel aquery`**, which reports the real compile *and* link
   actions (with full argv), matching the codemodel's coverage.
 
+> **aquery must mirror the real build.** A bare `bazel aquery //...` omits
+> config-gated flags (`--config`/`.bazelrc`) and top-level copts the embedder
+> sets, fabricating false discrepancies. Run it with the same
+> platform/`--config`/copts the project actually builds with, matching the
+> CMake configure. The tool cannot infer top-level flags (e.g. boringssl sets
+> `-fno-exceptions -fno-rtti` at the top level, not in libraries) — pass them
+> through or record the difference in `cmake2bazel.json`.
+
 ### The comparison is asymmetric
 
 The diff requires every **correctness-relevant CMake flag** to be present on

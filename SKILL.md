@@ -143,12 +143,30 @@ grouping need not match CMake (TU-set comparison is grouping-agnostic), but keep
 as needed.
 
 ### 4. Extract the Bazel side
+> **Critical: aquery must be invoked the way the project is actually built.**
+> A bare `bazel aquery` omits config-gated and top-level flags and will
+> manufacture hundreds of false discrepancies. Mirror the real build:
+> - Pass the project's `--config=<name>` (check `.bazelrc` for `build:<name>`
+>   stanzas; note `--enable_platform_specific_config` auto-expands to
+>   `--config=<os>`).
+> - Pass any top-level `--copt`/`--cxxopt` the project's build/embedder sets
+>   that are **not** in `.bazelrc` (e.g. boringssl expects `-fno-exceptions
+>   -fno-rtti` to be set at the top level, not in libraries). The tool cannot
+>   infer these — get them from the project's build instructions and pass them
+>   through, or record genuinely-irreducible differences in `cmake2bazel.json`.
+> - Use the **same platform/options** as the CMake configure in step 2, or the
+>   two sides aren't comparable.
+
 ```bash
 bazel aquery 'mnemonic("CppCompile|CppLink|CppArchive", //...)' \
+    [--config=<name>] [--copt=... --cxxopt=...] \
     --output=jsonproto > aquery.json
 python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
 ```
-If analysis fails, fix that first before trusting the diff.
+If analysis fails, fix that first before trusting the diff. If a flag differs
+only because of a build-convention gap (e.g. `-std=gnu++17` vs `-std=c++17`,
+GNU-extensions on/off), that's a judgment call for `cmake2bazel.json`, not a
+BUILD-file bug.
 
 ### 5. Diff
 ```bash
