@@ -94,17 +94,37 @@ files as the durable record of migration decisions:
 
 ```json
 {
-  "target_map": { "some_cmake_exe": "some_bazel_exe" },
+  "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
+  "target_map": { "some_cmake_exe": ":some_bazel_exe" },
+  "exclude_targets": ["benchmark", "some_tool"],
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
-    "flags_prefixes": ["-Wthread-safety"]
+    "flags_prefixes": ["-Wthread-safety"],
+    "include_prefixes": ["third_party/"]
   }
 }
 ```
 
-It's applied at **diff time** and to **both sides**, so you can tune
-suppressions and re-diff without re-running cmake/bazel.
+Fields:
+- **`bazel_args`** — the extra args aquery must run with to mirror the real
+  build (see step 4). Recorded so the comparison is reproducible; read by the
+  operator, not the diff.
+- **`target_map`** — `cmake_name → bazel_name` for intentionally renamed
+  **executables**. Bazel targets are keyed by full label, so the value is
+  usually `:name` (e.g. `"bssl": ":bssl"`). Libraries need no mapping.
+- **`exclude_targets`** — CMake target names dropped entirely from the diff:
+  third-party/vendored code Bazel pulls as an external module, or tooling out
+  of scope. The **only** lever for `missing_tu`/`missing_target` on whole
+  subtrees. Excluded targets still appear under `excluded.config_excluded`.
+- **`ignore.{defines,flags,flags_prefixes,include_prefixes}`** — reviewer-
+  approved differences. `flags`/`defines` match exact tokens; `*_prefixes`
+  match by prefix. `include_prefixes` drops include search-path roots (e.g.
+  vendored `third_party/` includes that resolve differently under Bazel).
+
+The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
+time** to **both sides**, so you can tune them and re-diff without re-running
+cmake/bazel.
 
 ## Scope (MVP — check before running)
 
@@ -179,24 +199,38 @@ worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
 Synthetic target names `<libraries>` and `<external>` denote the unioned
 library-TU and external-dep comparisons.
 
-### 6. Triage and fix  *(LLM step)*, then loop
+### 6. Triage
+```bash
+python3 scripts/triage.py diff.json                 # grouped summary
+python3 scripts/triage.py diff.json --kind flags_diff   # drill into one kind
+python3 scripts/triage.py diff.json --json          # full histograms
+```
+A raw `diff.json` can have hundreds of per-TU entries that collapse to a few
+**systematic** causes. `triage.py` groups them by `kind` and shows, per kind, a
+value→frequency histogram of the `cmake_only` (actionable) and `bazel_only`
+(usually tolerated) entries. **Read it this way:** a value on (nearly) every TU
+is systematic — one fix (a copt, an include, a `target_map`/`ignore`/`copts`
+entry) clears it in bulk; a value on one TU is local. Always triage before
+hand-reading the worklist.
+
+### 7. Fix  *(LLM step)*, then loop
 For each `error`, decide: real defect → fix the BUILD file; accepted difference
 → add to `cmake2bazel.json` `ignore` (only for warning/cosmetic flags, **never**
 correctness flags).
 
 | kind             | fix |
 |------------------|-----|
-| `missing_target` | add the missing `cc_binary` (executables) |
-| `missing_tu`     | add the source to some library's `srcs` |
-| `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore` it |
-| `includes_diff`  | add/reorder `includes` to preserve CMake search order |
-| `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore` it |
+| `missing_target` | add the missing `cc_binary`, or `target_map` a renamed exe, or `exclude_targets` if out of scope |
+| `missing_tu`     | add the source to some library's `srcs`, or `exclude_targets` if it's a vendored/out-of-scope subtree |
+| `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
+| `includes_diff`  | add/reorder `includes` to preserve CMake search order, or `ignore.include_prefixes` a vendored root |
+| `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `missing_dep`    | add the external dep to `deps` (resolve via the dep adapter) |
 
-Re-run steps 4–5 (or just 5 if only the config changed). Repeat until
+Re-run steps 4–6 (or just 5–6 if only the config changed). Repeat until
 `converged: true`. Report remaining `warn` items and the `excluded` roles.
 
-### 7. Report
+### 8. Report
 Summarize: production targets reconciled, rounds taken, suppressions recorded in
 `cmake2bazel.json` (with rationale), and excluded roles (dashboard/test/codegen)
 for human follow-up.
@@ -211,6 +245,7 @@ for human follow-up.
 | `scripts/extract_cmake.py`| File API → model, role classification | — |
 | `scripts/extract_bazel.py`| aquery → model, role classification | — |
 | `scripts/diff.py`         | role-filtered, TU-set parity diff | — |
+| `scripts/triage.py`       | groups diff.json into a systematic-cause worklist | — |
 | `scripts/serialize.py`    | model ↔ JSON | — |
 | `<repo>/cmake2bazel.json` | migration decisions (renames + ignores) | **LLM, reviewed** |
 | BUILD.bazel / MODULE.bazel| generated build files | **LLM, each round** |
@@ -221,7 +256,8 @@ judgment goes into the generated BUILD files and `cmake2bazel.json`.
 ## Tests
 
 ```bash
-python3 tests/test_engine.py && python3 tests/test_extractors.py
+python3 tests/test_engine.py && python3 tests/test_extractors.py \
+    && python3 tests/test_triage.py
 ```
 
 Extractor tests run against fixtures that mirror the documented File API and

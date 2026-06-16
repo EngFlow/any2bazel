@@ -99,16 +99,31 @@ files as the durable record of migration decisions:
 
 ```json
 {
-  "target_map": { "some_cmake_exe": "some_bazel_exe" },
+  "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
+  "target_map": { "some_cmake_exe": ":some_bazel_exe" },
+  "exclude_targets": ["benchmark", "some_tool"],
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
-    "flags_prefixes": ["-Wthread-safety"]
+    "flags_prefixes": ["-Wthread-safety"],
+    "include_prefixes": ["third_party/"]
   }
 }
 ```
 
-It's applied at **diff time** to **both sides**, so suppressions can be tuned and
+- **`bazel_args`** — extra args aquery must run with to mirror the real build
+  (recorded for reproducibility; read by the operator, not the diff).
+- **`target_map`** — `cmake_name → bazel_name` for renamed **executables**
+  (Bazel targets are keyed by full label, so values look like `:name`).
+  Libraries need no mapping — they're compared by source-path TU-set.
+- **`exclude_targets`** — CMake targets dropped from the diff (vendored
+  third-party Bazel pulls externally, or out-of-scope tooling). The only lever
+  for `missing_tu`/`missing_target` on whole subtrees; excluded targets are
+  still reported under `excluded.config_excluded`.
+- **`ignore.{defines,flags,flags_prefixes,include_prefixes}`** — reviewer-
+  approved differences (`*_prefixes` match by prefix).
+
+Applied at **diff time** to **both sides**, so suppressions can be tuned and
 re-diffed without re-running cmake/bazel. Every entry is an explicit, auditable
 record of a difference a reviewer chose to accept.
 
@@ -146,10 +161,12 @@ scripts/
   extract_cmake.py  CMake File API codemodel → model.json (+ role classify)
   extract_bazel.py  bazel aquery jsonproto  → model.json (+ role classify)
   diff.py           role-filtered, TU-set parity diff → worklist + converged
+  triage.py         groups diff.json into a systematic-cause worklist
   serialize.py      model ↔ JSON (the contract between stages)
 tests/
   test_engine.py      diff/canonicalize/roles/config/TU-set behavior
   test_extractors.py  full pipeline on synthetic File-API + aquery fixtures
+  test_triage.py      triage grouping/histogram/cap behavior
 SKILL.md            Claude Code skill: the migrate-iterate procedure
 ```
 
@@ -164,14 +181,18 @@ python3 scripts/extract_cmake.py build "$PWD" model.cmake.json
 
 # 2. (generate BUILD.bazel files for your targets) ...
 
-# 3. Bazel side
+# 3. Bazel side — MUST mirror the real build (see warning above): pass the
+#    project's --config / top-level copts, matching the CMake configure.
 bazel aquery 'mnemonic("CppCompile|CppLink|CppArchive", //...)' \
-    --output=jsonproto > aquery.json
+    [--config=<name>] [--copt=...] --output=jsonproto > aquery.json
 python3 scripts/extract_bazel.py aquery.json "$PWD" model.bazel.json
 
-# 4. Diff — "converged": true means parity reached. The optional 3rd arg is the
-#    migration config (target_map + ignore lists).
-python3 scripts/diff.py model.cmake.json model.bazel.json cmake2bazel.json
+# 4. Diff — "converged": true means parity reached. Optional 3rd arg is the
+#    migration config.
+python3 scripts/diff.py model.cmake.json model.bazel.json cmake2bazel.json > diff.json
+
+# 5. Triage — group the worklist by systematic cause before fixing.
+python3 scripts/triage.py diff.json
 ```
 
 Run as a skill, Claude drives step 2 and the triage/fix loop automatically.
@@ -181,6 +202,7 @@ Run as a skill, Claude drives step 2 and the triage/fix loop automatically.
 ```bash
 python3 tests/test_engine.py
 python3 tests/test_extractors.py
+python3 tests/test_triage.py
 ```
 
 The extractor tests run against fixtures under `tests/` that mirror the
