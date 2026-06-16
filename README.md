@@ -19,7 +19,9 @@ and the models are compared:
 ```
 CMake File API codemodel  ──extract_cmake.py──┐
                                               ├─► diff.py ─► worklist / converged?
-Bazel aquery jsonproto    ──extract_bazel.py──┘
+Bazel aquery jsonproto    ──extract_bazel.py──┘    ▲
+                                                   │
+                          cmake2bazel.json (migration decisions)
 ```
 
 ### Why these oracles
@@ -35,62 +37,110 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘
 ### The comparison is asymmetric
 
 The diff requires every **correctness-relevant CMake flag** to be present on
-the Bazel side. Flags that appear *only* on the Bazel side — toolchain
-defaults like `-fno-canonical-system-headers`, sandbox `-iquote` prefixes,
-`-frandom-seed`, optimization/debug levels — are stripped before comparing and
-do **not** count as discrepancies.
+the Bazel side. Flags that appear *only* on the Bazel side are tolerated. This
+asymmetry is the whole point: it lets a build that is *textually different but
+semantically equivalent* converge to zero errors. Without it, every translation
+unit would show a false diff and the loop would never finish.
 
-This asymmetry is the whole point: it lets a build that is *textually
-different but semantically equivalent* converge to zero errors. Without it,
-every translation unit would show a false diff and the loop would never finish.
+### Roles: what gets diffed
 
-### Flag policy (the core IP)
+Every target is tagged with an inferred **role** (`production`, `test`,
+`dashboard`, `aggregate`, `codegen`, `unknown`) — orthogonal to its mechanical
+`kind`. Only `production` targets participate in the parity diff
+(`PARTICIPATING_ROLES` in `diff.py`); the rest are **kept in the model and
+reported** under `excluded`, so a skipped dashboard or test target is an
+explicit line item, never a silent omission. This is why a CMake project's 32
+CTest/CDash dashboard targets don't generate 32 false discrepancies — and why
+flipping tests into the diff later is a one-line change, not a re-extraction.
 
-`canonicalize.py` normalizes each raw flag list with a per-flag policy:
+### Libraries diffed as a TU-set; executables by identity
 
-| flag class            | policy |
-|-----------------------|--------|
-| defines (`-D`)        | order-insensitive → sorted, deduped |
-| includes (`-I`, `-isystem`, `-iquote`) | **order preserved** (search order), paths made repo-relative |
-| optimization/debug (`-O`, `-g`), dep-file (`-MD`…) | ignorable on both sides |
-| Bazel toolchain defaults | stripped on the Bazel side only |
-| everything else       | correctness-relevant → compared as a subset |
+Library targets are dissolved into a **project-wide union of translation units
+keyed by source path**, then compared. Target *names* and *grouping* therefore
+don't matter for libraries: a rename (`crypto` → `crypto_internal`) or an
+object-library fold-in (CMake's `fipsmodule` merged into Bazel's
+`crypto_internal`) converges with no mapping. Executables — the actual link
+deliverables — stay aligned by name; a `target_map` handles intentional
+executable renames. Only **external** link deps are compared; internal dep names
+are noise once libraries are unioned.
+
+### Canonicalization: hardcoded mechanics vs. configurable judgment
+
+`canonicalize.py` normalizes raw flag lists, splitting noise from signal along a
+deliberate line:
+
+| category | examples | handling |
+|----------|----------|----------|
+| **driver mechanics** | compiler/wrapper path, `-c`, `-o`, `.o`/source args | **hardcoded** — stripped at extraction |
+| **toolchain/sysroot** | `-isysroot`, `-arch`, `--sysroot`, `-mmacosx-version-min=` | **hardcoded** — environment-specific |
+| **reproducibility** | `__DATE__`/`__TIME__`/`__TIMESTAMP__`, `-frandom-seed=` | **hardcoded** — universal Bazel facts |
+| **opt/debug, dep-files** | `-O*`, `-g*`, `-M*` | **hardcoded** — ignorable both sides |
+| **warning sets, cosmetic defines** | `-Wctad-maybe-unsupported`, project defines | **configurable** — `cmake2bazel.json` `ignore` |
+| **correctness** | `-std=*`, `-fno-exceptions`, `-fno-rtti`, `-fvisibility=*` | **never ignored** — hard errors |
+| **defines** | `-D…` | order-insensitive → sorted, deduped |
+| **includes** | `-I`, `-isystem`, `-iquote` | **order preserved** (search order), repo-relative |
+
+Hardcoded rules are universal facts baked into the code. Configurable
+suppressions are *judgment calls* and live in a checked-in file (below), so each
+one is reviewable.
+
+## The migration config: `cmake2bazel.json`
+
+Lives at the **migrated project's repo root**, committed alongside the BUILD
+files as the durable record of migration decisions:
+
+```json
+{
+  "target_map": { "some_cmake_exe": "some_bazel_exe" },
+  "ignore": {
+    "defines": ["BORINGSSL_DISPATCH_TEST"],
+    "flags": ["-fvisibility=hidden"],
+    "flags_prefixes": ["-Wthread-safety"]
+  }
+}
+```
+
+It's applied at **diff time** to **both sides**, so suppressions can be tuned and
+re-diffed without re-running cmake/bazel. Every entry is an explicit, auditable
+record of a difference a reviewer chose to accept.
 
 ## "Done" criterion
 
 The current oracle strength is **per-TU compile-flag equivalence + link
 closure**: the same sources compiled with canonically-equal flags, and the same
-link dependency closure. There is (deliberately, for now) no output-artifact or
-symbol diff and no test execution — those are candidate future oracles.
+external link-dependency closure. There is (deliberately, for now) no
+output-artifact or symbol diff and no test execution — those are candidate
+future oracles.
 
 ## Scope
 
 **Supported (MVP):**
 - Static / shared / object libraries and executables
 - Plain C/C++ sources, compile flags, defines, include search order
-- Internal target link deps; external deps recorded as **abstract identities**
-  (resolution to a Bazel label is a pluggable concern, not hardcoded)
+- External link deps recorded as **abstract identities** (resolution to a Bazel
+  label is a pluggable concern, not hardcoded)
 
 **Not yet supported:**
 - Custom commands / generated code (`configure_file`, protoc, `add_custom_command`)
-- Tests (planned as a second phase, after compile+link parity)
+- Tests (tracked via the `test` role; not yet diffed)
 - Packaging / install rules
 - Automatic external-dependency resolution (find_package → bzlmod /
-  rules_foreign_cc). External deps are surfaced as a discrepancy class; the
-  model is designed so a resolver *adapter* can be plugged in per project.
+  rules_foreign_cc). External deps surface as a discrepancy class; the model is
+  designed so a resolver *adapter* can be plugged in per project.
 
 ## Layout
 
 ```
 scripts/
-  model.py          canonical model: targets, TUs, resolution-agnostic deps
-  canonicalize.py   flag-policy normalizer  ← core IP
-  extract_cmake.py  CMake File API codemodel → model.json
-  extract_bazel.py  bazel aquery jsonproto  → model.json
-  diff.py           asymmetric parity diff → worklist + converged flag
+  model.py          canonical model: targets, TUs, TargetRole, deps
+  canonicalize.py   flag normalizer — hardcoded mechanics  ← core IP
+  config.py         cmake2bazel.json loader — configurable judgment calls
+  extract_cmake.py  CMake File API codemodel → model.json (+ role classify)
+  extract_bazel.py  bazel aquery jsonproto  → model.json (+ role classify)
+  diff.py           role-filtered, TU-set parity diff → worklist + converged
   serialize.py      model ↔ JSON (the contract between stages)
 tests/
-  test_engine.py      diff/canonicalize behavior (convergence, asymmetry, order)
+  test_engine.py      diff/canonicalize/roles/config/TU-set behavior
   test_extractors.py  full pipeline on synthetic File-API + aquery fixtures
 SKILL.md            Claude Code skill: the migrate-iterate procedure
 ```
@@ -111,11 +161,12 @@ bazel aquery 'mnemonic("CppCompile|CppLink|CppArchive", //...)' \
     --output=jsonproto > aquery.json
 python3 scripts/extract_bazel.py aquery.json "$PWD" model.bazel.json
 
-# 4. Diff — exits with a worklist; "converged": true means parity reached
-python3 scripts/diff.py model.cmake.json model.bazel.json
+# 4. Diff — "converged": true means parity reached. The optional 3rd arg is the
+#    migration config (target_map + ignore lists).
+python3 scripts/diff.py model.cmake.json model.bazel.json cmake2bazel.json
 ```
 
-Run as a skill, Claude drives steps 2 and the fix loop automatically.
+Run as a skill, Claude drives step 2 and the triage/fix loop automatically.
 
 ## Tests
 
