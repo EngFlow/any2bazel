@@ -48,6 +48,14 @@ class MigrationConfig:
     # third-party/vendored include roots that resolve differently because the
     # dep is in-tree under CMake but an external module under Bazel.
     ignore_include_prefixes: tuple = ()
+    # Include-path PREFIX REWRITES, applied to both sides before comparing:
+    # a list of (from_prefix, to_token) pairs. Unlike ignore_include_prefixes
+    # (which deletes the path, a blind spot), a map canonicalizes the differing
+    # spellings of the SAME dependency to one token so the search-order check is
+    # still performed. Several from-prefixes may map to one token (e.g. Bazel's
+    # 'external/absl+' and 'bazel-out/.../external/absl+' twin both -> '@absl').
+    # Longest from-prefix wins. Applied before ignore_include_prefixes.
+    include_map: tuple = ()  # tuple of (from_prefix, to_token)
     # CMake target names to drop entirely from the diff: third-party/vendored
     # code Bazel pulls as an external module, or tooling out of migration scope.
     # Unlike `ignore` (flags/defines), this is the only lever for missing_tu /
@@ -66,6 +74,18 @@ class MigrationConfig:
         # match on full token or KEY (before '=')
         return define in self.ignore_defines or \
             define.split("=", 1)[0] in self.ignore_defines
+
+    def map_include(self, include: str) -> str:
+        """Apply include_map prefix rewrites (longest from-prefix wins). Returns
+        the include unchanged if no rule matches."""
+        best = None
+        for frm, to in self.include_map:
+            if include.startswith(frm) and (best is None or len(frm) > len(best[0])):
+                best = (frm, to)
+        if best is None:
+            return include
+        frm, to = best
+        return to + include[len(frm):]
 
     def include_ignored(self, include: str) -> bool:
         return any(include.startswith(p) for p in self.ignore_include_prefixes)
@@ -87,6 +107,8 @@ def load(path: str) -> MigrationConfig:
         ignore_flags=set(ig.get("flags", [])),
         ignore_flag_prefixes=tuple(ig.get("flags_prefixes", [])),
         ignore_include_prefixes=tuple(ig.get("include_prefixes", [])),
+        include_map=tuple(
+            (e["from"], e["to"]) for e in ig.get("include_map", [])),
         exclude_targets=set(obj.get("exclude_targets", [])),
         bazel_args=tuple(obj.get("bazel_args", [])),
     )

@@ -106,7 +106,9 @@ files as the durable record of migration decisions:
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
     "flags_prefixes": ["-Wthread-safety"],
-    "include_prefixes": ["third_party/"]
+    "include_prefixes": ["third_party/"],
+    "include_map": [{"from": "external/abseil-cpp+", "to": "@absl"},
+                    {"from": "/opt/absl/include", "to": "@absl"}]
   }
 }
 ```
@@ -120,8 +122,16 @@ files as the durable record of migration decisions:
   third-party Bazel pulls externally, or out-of-scope tooling). The only lever
   for `missing_tu`/`missing_target` on whole subtrees; excluded targets are
   still reported under `excluded.config_excluded`.
-- **`ignore.{defines,flags,flags_prefixes,include_prefixes}`** — reviewer-
-  approved differences (`*_prefixes` match by prefix).
+- **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved flag/define
+  differences (`flags_prefixes` matches by prefix).
+- **`ignore.include_map` vs `ignore.include_prefixes`** — for an include root
+  spelled differently on each side (a dep that's in-tree under CMake, external
+  under Bazel). **`include_map`** rewrites both sides' spellings to a canonical
+  token and keeps verifying the dep is present + ordered (several `from`
+  prefixes can collapse to one `to` token; longest `from` wins). **Prefer it**
+  over **`include_prefixes`**, which merely deletes the path — a blind spot. If
+  the dep's include is genuinely missing on the Bazel side, the map catches it;
+  ignore does not.
 
 Applied at **diff time** to **both sides**, so suppressions can be tuned and
 re-diffed without re-running cmake/bazel. Every entry is an explicit, auditable

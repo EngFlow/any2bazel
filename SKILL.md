@@ -101,7 +101,12 @@ files as the durable record of migration decisions:
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
     "flags_prefixes": ["-Wthread-safety"],
-    "include_prefixes": ["third_party/"]
+    "include_prefixes": ["third_party/"],
+    "include_map": [
+      {"from": "external/abseil-cpp+", "to": "@absl"},
+      {"from": "bazel-out/k8-fastbuild/bin/external/abseil-cpp+", "to": "@absl"},
+      {"from": "/opt/absl/include", "to": "@absl"}
+    ]
   }
 }
 ```
@@ -117,10 +122,21 @@ Fields:
   third-party/vendored code Bazel pulls as an external module, or tooling out
   of scope. The **only** lever for `missing_tu`/`missing_target` on whole
   subtrees. Excluded targets still appear under `excluded.config_excluded`.
-- **`ignore.{defines,flags,flags_prefixes,include_prefixes}`** — reviewer-
-  approved differences. `flags`/`defines` match exact tokens; `*_prefixes`
-  match by prefix. `include_prefixes` drops include search-path roots (e.g.
-  vendored `third_party/` includes that resolve differently under Bazel).
+- **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved flag/define
+  differences. `flags`/`defines` match exact tokens; `flags_prefixes` by prefix.
+- **`ignore.include_prefixes` vs `ignore.include_map`** — two ways to handle an
+  include path that's spelled differently on each side (typically a dependency
+  that's in-tree under CMake but an external module under Bazel). **Prefer
+  `include_map`:**
+  - **`include_map`** rewrites differing spellings of the same root to a
+    canonical token (on both sides) and **keeps checking** — the dependency
+    must still be present and correctly ordered. Several `from` prefixes may map
+    to one `to` token (collapse Bazel's `external/X` and its `bazel-out/.../bin/
+    external/X` twin). Longest `from` wins.
+  - **`include_prefixes`** just **deletes** the path from the comparison — a
+    blind spot. Use only when there's no meaningful counterpart to map to.
+  - The difference matters: if the dependency's include is genuinely missing on
+    the Bazel side, the map **catches it**; ignore stays silent.
 
 The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
@@ -223,7 +239,7 @@ correctness flags).
 | `missing_target` | add the missing `cc_binary`, or `target_map` a renamed exe, or `exclude_targets` if out of scope |
 | `missing_tu`     | add the source to some library's `srcs`, or `exclude_targets` if it's a vendored/out-of-scope subtree |
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
-| `includes_diff`  | add/reorder `includes` to preserve CMake search order, or `ignore.include_prefixes` a vendored root |
+| `includes_diff`  | add/reorder `includes` to preserve CMake search order; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `missing_dep`    | add the external dep to `deps` (resolve via the dep adapter) |
 

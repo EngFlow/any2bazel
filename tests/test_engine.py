@@ -76,13 +76,25 @@ def test_extra_bazel_define_is_warn_not_error():
     assert summarize(discs)["converged"], "extra bazel define must not block parity"
 
 
-def test_include_order_must_be_preserved():
+def test_include_presence_not_order():
+    # Includes are compared by PRESENCE, not order (order enforcement is
+    # deferred pending an on-disk header-collision verifier -- see
+    # FUTURE-include-order-collision-check.md). A pure reorder, all roots
+    # present, must NOT be flagged.
     cmake_raw = ["-I", "/work/proj/a", "-I", "/work/proj/b"]
-    bazel_raw = ["-I", "/work/proj/b", "-I", "/work/proj/a"]  # reordered!
+    bazel_raw = ["-I", "/work/proj/b", "-I", "/work/proj/a"]  # reordered only
     a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
     b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+    assert summarize(diff_models(a, b))["converged"], "pure reorder must not fail"
+
+
+def test_missing_include_root_is_caught():
+    # But a CMake include root genuinely ABSENT on the bazel side is an error.
+    a = _model(tu_from_raw("src/a.cpp", ["-I", "/work/proj/a", "-I", "/work/proj/b"],
+                           is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", ["-I", "/work/proj/a"], is_bazel=True))
     discs = diff_models(a, b)
-    assert any(d.kind == "includes_diff" for d in discs), "reorder must be caught"
+    assert any(d.kind == "includes_diff" for d in discs), "missing root must be caught"
 
 
 def test_missing_external_link_dep_is_error():
@@ -190,6 +202,52 @@ def test_ignore_include_prefixes():
     assert summarize(diff_models(a, b, cfg))["converged"]  # suppressed
 
 
+def test_include_map_canonicalizes_and_converges():
+    # The same dependency root spelled differently on each side converges when
+    # mapped to a canonical token -- WITHOUT ignoring (the check is preserved).
+    a = _model(tu_from_raw(
+        "src/a.cpp", ["-DFOO=1", "-I", "/work/proj/absl-install/include"],
+        is_bazel=False))
+    b = _model(tu_from_raw(
+        "src/a.cpp", ["-DFOO=1", "-I", "/work/proj/external/absl+"],
+        is_bazel=True))
+    cfg = MigrationConfig(include_map=(
+        ("absl-install/include", "@absl"),
+        ("external/absl+", "@absl"),
+    ))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
+def test_include_map_still_catches_a_missing_include():
+    # The crucial difference from ignore: if the mapped dependency is genuinely
+    # ABSENT on the bazel side, the map must still flag it (no blind spot).
+    a = _model(tu_from_raw(
+        "src/a.cpp", ["-DFOO=1", "-I", "/work/proj/absl-install/include"],
+        is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True))  # no absl
+    cfg = MigrationConfig(include_map=(("absl-install/include", "@absl"),))
+    discs = diff_models(a, b, cfg)
+    assert any(d.kind == "includes_diff" for d in discs), \
+        "map must NOT hide a genuinely missing include"
+
+
+def test_include_map_collapses_bazel_duplicate_roots():
+    # Bazel often lists external/X and its bazel-out/.../external/X twin; both
+    # map to one token and collapse, so they don't read as a reordering/extra.
+    a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1", "-I", "/work/proj/dep/include"],
+                           is_bazel=False))
+    b = _model(tu_from_raw(
+        "src/a.cpp",
+        ["-DFOO=1", "-I", "/work/proj/external/dep", "-I",
+         "/work/proj/bazel-out/bin/external/dep"], is_bazel=True))
+    cfg = MigrationConfig(include_map=(
+        ("dep/include", "@dep"),
+        ("bazel-out/bin/external/dep", "@dep"),
+        ("external/dep", "@dep"),
+    ))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
 def test_exclude_targets_suppresses_structural_diffs():
     # A whole target present only in cmake (e.g. vendored third-party) produces
     # missing_tu/missing_target unless excluded. exclude_targets is the only
@@ -231,6 +289,7 @@ def test_config_loads_all_fields_from_json():
             "flags": ["-fvisibility=hidden"],
             "flags_prefixes": ["-Wthread-safety"],
             "include_prefixes": ["third_party/"],
+            "include_map": [{"from": "external/absl+", "to": "@absl"}],
         },
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -245,6 +304,7 @@ def test_config_loads_all_fields_from_json():
     assert cfg.flag_ignored("-fvisibility=hidden")
     assert cfg.flag_ignored("-Wthread-safety-analysis")  # prefix match
     assert cfg.include_ignored("third_party/gtest/include")
+    assert cfg.map_include("external/absl+/base") == "@absl/base"  # rewrite
 
 
 def test_nonparticipating_roles_are_excluded_not_diffed():

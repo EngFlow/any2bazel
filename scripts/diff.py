@@ -69,19 +69,30 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
             bazel_only=sorted(b_def - a_def),
         ))
 
-    # includes: ORDER-SENSITIVE. We require A's sequence to appear as a
-    # subsequence of B's (B may add extra system includes, but must not drop
-    # or reorder A's search order). Reviewer-approved include prefixes (e.g.
-    # vendored third-party roots) are dropped from both sides first.
-    a_inc = tuple(i for i in a.includes if not cfg.include_ignored(i))
-    b_inc = tuple(i for i in b.includes if not cfg.include_ignored(i))
-    if not _is_subsequence(a_inc, b_inc):
-        missing = [i for i in a_inc if i not in set(b_inc)]
+    # includes: PRESENCE check (order currently NOT enforced -- see below).
+    # Two normalizations, applied to both sides first:
+    #   1. include_map: rewrite differing spellings of the same dep root to a
+    #      canonical token, so the check is PRESERVED (the dep must still be
+    #      present). Collapse adjacent dups the rewrite produces (Bazel's
+    #      external/X and bazel-out/.../external/X both -> the token).
+    #   2. include_ignored: drop blind-spot prefixes entirely.
+    #
+    # We require every CMake include root to be PRESENT on the Bazel side, but
+    # do NOT (yet) enforce relative ORDER. Order only changes the build when the
+    # same header name is reachable from two roots whose order differs; proving
+    # that requires enumerating headers on disk (a collision check). Until that
+    # verifier exists, enforcing order produced benign false positives (e.g.
+    # boringssl: project `include` vs vendored gtest roots, disjoint headers,
+    # reordered). See FUTURE-include-order-collision-check.md.
+    a_inc = _norm_includes(a.includes, cfg)
+    b_inc = _norm_includes(b.includes, cfg)
+    missing = [i for i in a_inc if i not in set(b_inc)]
+    if missing:
         out.append(Discrepancy(
             kind=Kind.INCLUDES_DIFF.value,
             severity=Severity.ERROR.value,
             target=target, tu=a.source,
-            detail="include search order not preserved or entries missing",
+            detail="cmake include root missing on bazel side",
             cmake_only=missing,
             bazel_only=[i for i in b_inc if i not in set(a_inc)],
         ))
@@ -102,11 +113,18 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
     return out
 
 
-def _is_subsequence(needle, haystack) -> bool:
-    """Is `needle` an (order-preserving, not necessarily contiguous) subsequence
-    of `haystack`? Used for include-search-order parity."""
-    it = iter(haystack)
-    return all(x in it for x in needle)
+def _norm_includes(includes, cfg) -> tuple:
+    """Apply include_map rewrites then drop ignored prefixes, collapsing the
+    consecutive duplicates a rewrite can create (e.g. external/X and its
+    bazel-out twin both map to the same token). Order preserved."""
+    out = []
+    for inc in includes:
+        mapped = cfg.map_include(inc)
+        if cfg.include_ignored(mapped) or cfg.include_ignored(inc):
+            continue
+        if not out or out[-1] != mapped:
+            out.append(mapped)
+    return tuple(out)
 
 
 # Roles the parity diff actually compares. Everything else (dashboard,
