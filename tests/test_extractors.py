@@ -141,6 +141,33 @@ def test_bazel_infers_kind_and_drops_defaults():
         assert "include" in tu.includes
 
 
+def test_header_processing_actions_are_not_tus():
+    # Bazel's parse_headers/layering_check feature compiles headers standalone
+    # (-xc++-header) to check self-containment. These are NOT translation units
+    # and must not appear in the model (else every header is a spurious extra_tu).
+    aquery = {
+        "artifacts": [{"id": 1, "pathFragmentId": 10}],
+        "pathFragments": [{"id": 10, "label": "re2.h", "parentId": 11},
+                          {"id": 11, "label": "re2"}],
+        "targets": [{"id": 100, "label": "//:re2"}],
+        "actions": [
+            {"mnemonic": "CppCompile", "targetId": 100, "outputIds": [],
+             "arguments": ["clang", "-xc++-header", "-c", "re2/re2.h",
+                           "-o", "re2/re2.h.processed", "-DFOO=1"]},
+            {"mnemonic": "CppCompile", "targetId": 100, "outputIds": [],
+             "arguments": ["clang", "-c", "re2/re2.cc", "-o", "re2.o", "-DFOO=1"]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as root:
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(aquery, f)
+        b = extract_bazel.extract(aq_path, REPO)
+        srcs = [tu.source for t in b.targets.values() for tu in t.tus]
+        assert "re2/re2.cc" in srcs, srcs           # real TU kept
+        assert not any(s.endswith(".h") for s in srcs), srcs  # header dropped
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

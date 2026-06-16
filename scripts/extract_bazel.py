@@ -74,15 +74,34 @@ def _label_index(container: dict) -> Dict[int, str]:
     return {t["id"]: t["label"] for t in container.get("targets", [])}
 
 
+_HEADER_EXTS = (".h", ".hpp", ".hh", ".hxx", ".inc", ".inl")
+
+
+def _is_header_processing(args: List[str]) -> bool:
+    """True for Bazel header self-containment actions (the parse_headers /
+    layering_check features), which compile a HEADER standalone to verify it's
+    self-contained. They carry '-xc++-header' and emit a '.processed' output,
+    not an object file. CMake has no equivalent, so counting them as TUs would
+    show every header as a spurious extra_tu. Skip them."""
+    return "-xc++-header" in args or "-fsyntax-only" in args
+
+
 def _source_from_compile_args(args: List[str]) -> Optional[str]:
-    """The compiled source is the argument to -c (or the lone .cc/.cpp arg)."""
+    """The compiled source is the argument to -c (or the lone source arg).
+    Returns None for header inputs -- those are not translation units."""
+    src = None
     for i, a in enumerate(args):
         if a == "-c" and i + 1 < len(args):
-            return args[i + 1]
-    for a in args:
-        if a.endswith((".cc", ".cpp", ".cxx", ".c", ".C")):
-            return a
-    return None
+            src = args[i + 1]
+            break
+    if src is None:
+        for a in args:
+            if a.endswith((".cc", ".cpp", ".cxx", ".c", ".C")):
+                src = a
+                break
+    if src is None or src.endswith(_HEADER_EXTS):
+        return None
+    return src
 
 
 def _label_to_name(label: str) -> str:
@@ -122,6 +141,8 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
         args = action.get("arguments", [])
 
         if mnem in _COMPILE:
+            if _is_header_processing(args):
+                continue   # header self-containment check, not a real TU
             src = _source_from_compile_args(args)
             if not src:
                 continue
