@@ -187,6 +187,27 @@ def _union_tus(model: CanonicalModel, names) -> Dict[str, TranslationUnit]:
     return out
 
 
+def _all_source_keys(model: CanonicalModel, cfg: "MigrationConfig") -> set:
+    """Every source key compiled ANYWHERE in the participating scope, ignoring
+    role. Used as the presence oracle so a source that's a library TU on one
+    side and a test/exe TU on the other isn't falsely reported missing.
+
+    Scope mirrors what the diff actually compares: all participating-role
+    targets, plus test targets when cfg.include_tests. Config-excluded targets
+    are omitted (they're intentionally out of scope)."""
+    keys = set()
+    for name, t in model.targets.items():
+        if cfg.target_excluded(name):
+            continue
+        in_scope = (t.role in PARTICIPATING_ROLES
+                    or (cfg.include_tests and t.role == TargetRole.TEST))
+        if not in_scope:
+            continue
+        for tu in t.tus:
+            keys.add(tu.key())
+    return keys
+
+
 def diff_models(a: CanonicalModel, b: CanonicalModel,
                 cfg: Optional["MigrationConfig"] = None) -> List[Discrepancy]:
     out: List[Discrepancy] = []
@@ -204,13 +225,23 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     a_exes = a_names - a_libs
     b_exes = b_names - b_libs
 
+    # PRESENCE ORACLE: every source compiled ANYWHERE on each side, across all
+    # participating roles (libraries, executables, and tests when opted in). A
+    # source is only "missing" if compiled nowhere on the other side -- the same
+    # .cc may be a library TU on one side and a test/exe TU on the other (e.g.
+    # Bazel compiling a test helper into a `testonly` cc_library while CMake
+    # builds it straight into the test exe). Role grouping must not manufacture
+    # a false missing/extra. Flag comparison still happens per-union below.
+    a_all = _all_source_keys(a, cfg)
+    b_all = _all_source_keys(b, cfg)
+
     # ---- libraries: project-wide TU-set comparison -------------------------
     a_union = _union_tus(a, a_libs)
     b_union = _union_tus(b, b_libs)
-    for src in sorted(set(a_union) - set(b_union)):
+    for src in sorted(set(a_union) - b_all):
         out.append(Discrepancy(Kind.MISSING_TU.value, Severity.ERROR.value,
                                "<libraries>", "source compiled in cmake but not bazel", tu=src))
-    for src in sorted(set(b_union) - set(a_union)):
+    for src in sorted(set(b_union) - a_all):
         out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                "<libraries>", "source compiled in bazel but not cmake", tu=src))
     for src in sorted(set(a_union) & set(b_union)):
@@ -226,10 +257,15 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     for name in sorted(a_exes & b_exes):
         ta, tb = a.targets[name], b.targets[name]
         amap, bmap = ta.tu_map(), tb.tu_map()
-        for src in sorted(set(amap) - set(bmap)):
+        # Presence is judged against the whole other side (a_all/b_all), not just
+        # this exe's own TUs: a source this exe compiles may live in a library on
+        # the other side (or vice versa) -- that's a grouping difference, not a
+        # missing source. Only a source compiled NOWHERE on the other side is a
+        # real gap.
+        for src in sorted(set(amap) - b_all):
             out.append(Discrepancy(Kind.MISSING_TU.value, Severity.ERROR.value,
                                    name, "source compiled in cmake but not bazel", tu=src))
-        for src in sorted(set(bmap) - set(amap)):
+        for src in sorted(set(bmap) - a_all):
             out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                    name, "source compiled in bazel but not cmake", tu=src))
         for src in sorted(set(amap) & set(bmap)):
@@ -249,18 +285,21 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
 
     # ---- tests (opt-in) ----------------------------------------------------
     if cfg.include_tests:
-        out.extend(_diff_tests(a, b, cfg))
+        out.extend(_diff_tests(a, b, cfg, a_all, b_all))
     return out
 
 
 def _diff_tests(a: CanonicalModel, b: CanonicalModel,
-                cfg: "MigrationConfig") -> List[Discrepancy]:
+                cfg: "MigrationConfig", a_all: set, b_all: set) -> List[Discrepancy]:
     """Compare TEST targets. Two checks (per the agreed first cut):
 
       1. TU-SET union of all test sources (like libraries): same test .cc files
          compiled with equivalent flags, regardless of how they're grouped into
          test binaries or named. This is "union now"; per-binary alignment is a
-         later layer.
+         later layer. Presence is judged against ALL sources on the other side
+         (a_all/b_all), not just its test union: a test source on one side may
+         be compiled into a (testonly) library on the other -- a grouping
+         difference, not a missing source. Only "compiled nowhere" is flagged.
       2. Test-binary EXISTENCE by count: a coarse check that both sides produce
          a comparable number of test executables, catching the case where test
          sources compile but are never linked into runnable tests. Reported as a
@@ -282,10 +321,10 @@ def _diff_tests(a: CanonicalModel, b: CanonicalModel,
     # 1. test-source TU-set union
     a_union = _union_tus(a, a_tests)
     b_union = _union_tus(b, b_tests)
-    for src in sorted(set(a_union) - set(b_union)):
+    for src in sorted(set(a_union) - b_all):
         out.append(Discrepancy(Kind.MISSING_TEST_TU.value, Severity.ERROR.value,
                                "<tests>", "test source compiled in cmake but not bazel", tu=src))
-    for src in sorted(set(b_union) - set(a_union)):
+    for src in sorted(set(b_union) - a_all):
         out.append(Discrepancy(Kind.EXTRA_TEST_TU.value, Severity.WARN.value,
                                "<tests>", "test source compiled in bazel but not cmake", tu=src))
     for src in sorted(set(a_union) & set(b_union)):

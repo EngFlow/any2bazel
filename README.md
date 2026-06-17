@@ -72,6 +72,14 @@ deliverables — stay aligned by name; a `target_map` handles intentional
 executable renames. Only **external** link deps are compared; internal dep names
 are noise once libraries are unioned.
 
+Source **presence** is judged across *all* roles, not within one: a `.cc` is
+only "missing" if it's compiled **nowhere** on the other side. This matters
+because the same source can be grouped differently per build system — e.g. a
+test helper that CMake compiles straight into a test executable while Bazel puts
+it in a `testonly` `cc_library`. Such a source is present on both sides (just
+under different roles) and must not be falsely reported missing; only its
+*flags* are compared, in whatever union it lands in.
+
 ### Canonicalization: hardcoded mechanics vs. configurable judgment
 
 `canonicalize.py` normalizes raw flag lists, splitting noise from signal along a

@@ -340,6 +340,40 @@ def test_test_tu_union_compares_when_opted_in():
     assert summarize(diff_models(a, b, cfg), a, b, cfg)["converged"]
 
 
+def test_cross_role_source_not_falsely_missing():
+    # A source that is a TEST TU on the cmake side but a (testonly) LIBRARY TU
+    # on the bazel side must NOT be reported missing -- it's compiled on both,
+    # just grouped under different roles (abseil per_thread_sem_test pattern).
+    a = CanonicalModel()
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+    a.add(Target("sem_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 tus=[tu_from_raw("t/sem_test.cc", ["-DFOO=1"], is_bazel=False)]))
+    b = CanonicalModel()
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+    # bazel compiles the test source into a testonly LIBRARY, not a test exe
+    b.add(Target("sem_test_common", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("t/sem_test.cc", ["-DFOO=1"], is_bazel=True)]))
+    cfg = MigrationConfig(include_tests=True)
+    discs = diff_models(a, b, cfg)
+    assert not any(d.tu == "t/sem_test.cc" for d in discs), \
+        "cross-role source compiled on both sides must not be flagged"
+
+
+def test_source_compiled_nowhere_still_caught():
+    # The flip side: a test source compiled NOWHERE on the bazel side IS a real
+    # missing_test_tu (must survive the cross-role relaxation).
+    a, b = _test_models(["t/only_in_cmake_test.cc"], [])
+    # give bazel a production lib so the models aren't trivially empty
+    b.add(Target("extra", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("src/z.cpp", ["-DFOO=1"], is_bazel=True)]))
+    cfg = MigrationConfig(include_tests=True)
+    discs = diff_models(a, b, cfg)
+    assert any(d.kind == "missing_test_tu" and d.tu == "t/only_in_cmake_test.cc"
+               for d in discs)
+
+
 def test_missing_test_source_caught_when_opted_in():
     a, b = _test_models(["t/a_test.cc", "t/b_test.cc"], ["t/a_test.cc"])
     cfg = MigrationConfig(include_tests=True)
