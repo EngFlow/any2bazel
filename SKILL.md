@@ -161,6 +161,16 @@ flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
 > you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
 > `BUILD.bazel`/`MODULE.bazel`, and `cmake2bazel.json` — live in or beside the
 > target repo.
+>
+> **Working directory:** run `cmake` and `bazel` from the **target repo root**
+> (the Bazel workspace). Only the `$SKILL_DIR/scripts/*.py` helpers live
+> elsewhere.
+>
+> **`<repo_root>` placeholder:** the project's source/workspace root — normally
+> the same path as `<src>`. It MUST be **identical** in the `extract_cmake.py`
+> and `extract_bazel.py` calls: both key translation units by their path
+> relative to `<repo_root>`, so a mismatch makes every source look
+> missing/extra and the diff becomes meaningless.
 
 ### 1. Confirm scope
 Inspect `CMakeLists.txt`. If you find custom commands, codegen, or
@@ -215,14 +225,21 @@ python3 scripts/diff.py model.cmake.json model.bazel.json \
 `diff.json` has `converged` (⇔ zero `error` discrepancies), a `discrepancies`
 worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
 `bazel_only`), and an `excluded` map of non-participating targets by role.
-Synthetic target names `<libraries>` and `<external>` denote the unioned
-library-TU and external-dep comparisons.
+Synthetic target names `<libraries>`, `<external>` (and `<tests>` when
+`include_tests`) denote the unioned library-TU, external-dep, and test-TU
+comparisons.
 
 The diff reports both parity stages at once: **compile-parity** kinds
 (`missing_tu`, `defines_diff`, `includes_diff`, `flags_diff`, `missing_dep`,
 `missing_target`) and the **link-consistency** kind (`link_flags_diff`, one per
 name-aligned executable/shared library). Fix compile parity first — link flags
 are easiest to reason about once the TUs underneath agree.
+
+`error`-severity kinds (above) block convergence and are what you fix. The diff
+also emits **WARN-only** kinds that don't block `converged` — `extra_tu` /
+`extra_target` (compiled/built on the Bazel side but not CMake) and
+`extra_test_tu` — note them but they need no action unless they point to
+something you didn't intend to add.
 
 ### 6. Triage
 ```bash
