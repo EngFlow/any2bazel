@@ -265,6 +265,13 @@ def _diff_tests(a: CanonicalModel, b: CanonicalModel,
          a comparable number of test executables, catching the case where test
          sources compile but are never linked into runnable tests. Reported as a
          warning (not a per-binary identity check yet -- naming is deferred).
+
+    LIMITATION: this does NOT check test LINK CLOSURE (external/system deps of
+    test binaries). The production external-dep check covers PRODUCTION targets
+    only, so a test that links e.g. abseil or gtest is verified to *compile*
+    equivalently but not to *link* the same deps. That's part of the deferred
+    "per-binary" layer. So "tests converged" == test sources compile
+    equivalently, NOT test binaries link identically.
     """
     out: List[Discrepancy] = []
     a_tests = {n for n, t in a.targets.items()
