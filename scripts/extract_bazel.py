@@ -1,9 +1,9 @@
 """Extract a CanonicalModel from `bazel aquery --output=jsonproto`.
 
-aquery is the Bazel-side oracle that matches the CMake File API: it exposes
-the actual actions the build would run -- CppCompile actions (one per TU, with
-the full argv) AND CppLink/CppArchive actions (the link closure). compile
-commands alone would miss the link half, so we use aquery.
+aquery is the Bazel-side counterpart to the CMake File API: it exposes the
+actual actions the build would run -- CppCompile actions (one per TU, with the
+full argv) AND CppLink/CppArchive actions (the link closure). compile commands
+alone would miss the link half, so we use aquery.
 
 Usage:
     bazel aquery 'mnemonic("CppCompile|CppLink|CppArchive", //...)' \

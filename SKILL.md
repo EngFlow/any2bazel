@@ -1,6 +1,6 @@
 ---
 name: cmake2bazel
-description: Migrate a C/C++ project from CMake to Bazel by iterating until Bazel's build matches a CMake oracle. Use when asked to convert/port a CMake project to Bazel, generate BUILD.bazel files from CMakeLists, or verify Bazel build parity against CMake. MVP scope — no codegen/custom commands.
+description: Migrate a C/C++ project from CMake to Bazel by iterating until Bazel's build matches the CMake reference build. Use when asked to convert/port a CMake project to Bazel, generate BUILD.bazel files from CMakeLists, or verify Bazel build parity against CMake. MVP scope — no codegen/custom commands.
 user-invocable: true
 allowed-tools:
   - Read
@@ -12,10 +12,10 @@ allowed-tools:
 # /cmake2bazel — CMake → Bazel migration via parity iteration
 
 Migrate a C/C++ project from CMake to Bazel by generating `BUILD.bazel` files,
-then **iterating until Bazel's actual build actions match a CMake oracle**. The
-loop is driven by a deterministic diff, so each round is cheap and the LLM only
-does the creative work (generating and fixing BUILD files), never the
-mechanical comparison.
+then **iterating until Bazel's actual build actions match the CMake reference
+build**. The loop is driven by a deterministic diff, so each round is cheap and
+the LLM only does the creative work (generating and fixing BUILD files), never
+the mechanical comparison.
 
 ## Core idea
 
@@ -30,62 +30,43 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘    ▲
                           cmake2bazel.json (migration decisions)
 ```
 
-- **Oracle = CMake File API codemodel-v2**, not `compile_commands.json`.
-  compile_commands has no link information; the codemodel gives per-target
-  type, source→flags mapping, AND link deps — both halves of compile+link.
-- **Bazel side = `bazel aquery`**, which exposes compile *and* link actions.
-- **"Done" = per-TU compile-flag equivalence + link closure** (the current
-  oracle strength). No artifact/symbol diff, no test execution yet.
+- **CMake side = File API codemodel-v2** (not `compile_commands.json`, which
+  lacks link info). **Bazel side = `bazel aquery`**. Both expose compile *and*
+  link actions.
+- **Parity has two stages**, both reported by one diff run ("steps" below = the
+  numbered procedure; these are the *stages* of what's checked):
+  - **Compile parity** — every TU compiled with equivalent flags/defines/
+    includes (project-wide TU-set), and the external link-dependency closure
+    matches.
+  - **Link consistency** — every name-aligned executable/shared-lib links with
+    equivalent link flags. The per-binary stage: the *artifacts* agree, not just
+    the TUs.
 
-The comparison is **asymmetric**: every correctness-relevant CMake flag must be
-present on the Bazel side; extra Bazel flags are tolerated. This is what lets a
-textually-different-but-equivalent build converge to zero errors.
+  Done when both stages converge. The comparison is **asymmetric**: every
+  correctness-relevant CMake flag must be present on the Bazel side; extra Bazel
+  flags are tolerated. No artifact/symbol diff or test execution yet.
 
-## Two ideas that make the diff robust
+## How targets are matched
 
-### Roles, not just kinds
-Every target is tagged with an inferred **role** (orthogonal to its mechanical
-`kind`): `production`, `test`, `dashboard`, `aggregate`, `codegen`, `unknown`.
-Only `production` targets participate in the parity diff (see
-`PARTICIPATING_ROLES` in `diff.py`). Everything else is **kept in the model and
-reported** under `excluded` in the diff output — visible for inspection, never
-silently dropped. Turning tests on later is a one-line policy change, not a
-re-extraction.
+- **Roles:** each target gets a `role` (`production`, `test`, `dashboard`,
+  `aggregate`, `codegen`, `unknown`). Only `production` is diffed; the rest are
+  reported under `excluded` (never silently dropped). Tests are opt-in
+  (`include_tests`).
+- **Libraries** are compared as a project-wide **union of TUs keyed by source
+  path**, so names and grouping don't matter — a rename or object-library
+  fold-in converges with no mapping. Only **external** link deps are checked;
+  internal dep names are noise.
+- **Executables** align by **name** (a missing exe is a real gap); use
+  `target_map` for renames.
 
-### Libraries compared as a TU-set; executables by identity
-Library targets are **dissolved into a project-wide union of translation units
-keyed by source path**, then compared. This makes target *names* and *grouping*
-irrelevant for libraries: a rename (`crypto` → `crypto_internal`) or an
-object-library fold-in (CMake's `fipsmodule` merged into Bazel's
-`crypto_internal`) converges automatically with no mapping needed.
+## Canonicalization
 
-Executables — the real link deliverables — are still aligned by name (a missing
-executable is a genuine gap). Use `target_map` in the config to align renamed
-executables. Only **external** link deps (system libs) are checked; internal
-dep names are noise once libraries are unioned.
-
-## Canonicalization: hardcoded mechanics vs. configurable judgment
-
-`canonicalize.py` normalizes raw flag lists. The split is deliberate:
-
-**Hardcoded (universal facts — never a migration decision):**
-- Compiler-driver mechanics: the compiler/wrapper path, `-c`, `-o`, source/`.o`
-  positional args
-- Toolchain/sysroot selection: `-isysroot`, `-arch`, `--sysroot`,
-  `-mmacosx-version-min=`
-- Reproducibility injections: `__DATE__`/`__TIME__`/`__TIMESTAMP__` defines,
-  `-frandom-seed=`, `-ffile-compilation-dir=`
-- Optimization/debug level (`-O*`, `-g*`) and dep-file bookkeeping (`-M*`)
-
-**Configurable (judgment calls — recorded in `cmake2bazel.json`):**
-- Warning-flag set differences (`-Wctad-maybe-unsupported`, …)
-- Cosmetic/intentional define differences
-These go in the `ignore` section so each suppression is an explicit, reviewable,
-checked-in record of a decision made during migration.
-
-**Never ignored (correctness):** `-std=*`, `-fno-exceptions`, `-fno-rtti`,
-`-fvisibility=*` and the like surface as hard errors. Do not add these to
-`ignore`.
+`canonicalize.py` strips noise before comparing flags. Universal mechanics
+(driver/wrapper paths, `-c`/`-o`, sysroot, reproducibility defines, `-O*`/`-g*`)
+are dropped in code — never your concern. Judgment calls (warning-set or cosmetic
+differences) go in `cmake2bazel.json`'s `ignore`. Correctness flags (`-std=*`,
+`-fno-exceptions`, `-fno-rtti`, …) must never be ignored — they surface as hard
+errors by design.
 
 ## The migration config: `cmake2bazel.json`
 
@@ -130,7 +111,7 @@ Fields:
   tests enabled and the **same** test scope (symmetric configure + aquery);
   turning it on against a tests-off extraction fabricates findings. When on,
   test sources are compared as their own project-wide TU-set union (like
-  libraries) and a coarse test-binary count check runs. See step 4b / step 7.
+  libraries) and a coarse test-binary count check runs. See step 8.
 - **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved compile
   flag/define differences. `flags`/`defines` match exact tokens; `flags_prefixes`
   by prefix.
@@ -139,21 +120,13 @@ Fields:
   compile flags). Common case: CMake repeats compile/codegen flags
   (`-fvisibility=hidden`, `-fno-common`) on the link line where they're benign,
   while Bazel doesn't.
-- **`ignore.include_prefixes` vs `ignore.include_map`** — two ways to handle an
-  include path that's spelled differently on each side (typically a dependency
-  that's in-tree under CMake but an external module under Bazel). **Prefer
-  `include_map`:**
-  - **`include_map`** rewrites differing spellings of the same root to a
-    canonical token (on both sides) and **keeps checking** — the dependency
-    must still be present. Several `from` prefixes may map to one `to` token
-    (collapse Bazel's `external/X` and its `bazel-out/.../bin/external/X` twin).
-    Longest `from` wins.
-  - **`include_prefixes`** just **deletes** the path from the comparison — a
-    blind spot. Use only when there's no meaningful counterpart to map to.
-  - The difference matters: if the dependency's include is genuinely missing on
-    the Bazel side, the map **catches it**; ignore stays silent.
-  - Note: include **search order** is currently not enforced (presence only) —
-    see `FUTURE-include-order-collision-check.md`.
+- **`ignore.include_map` / `ignore.include_prefixes`** — for an include root
+  spelled differently per side (a dep in-tree under CMake, external under Bazel).
+  **Prefer `include_map`**: it rewrites both sides' spellings to a canonical
+  token and still verifies presence (several `from`s may map to one `to`; longest
+  wins). `include_prefixes` just deletes the path (a blind spot) — use only when
+  there's no counterpart to map to. Search **order** is not enforced (presence
+  only) — see `FUTURE-include-order-collision-check.md`.
 
 The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
@@ -161,10 +134,11 @@ cmake/bazel.
 
 ## Scope (MVP — check before running)
 
-Supported: static/shared/object libraries and executables; plain C/C++ sources,
-compile flags, defines, include presence; external deps recorded as abstract
-identities. Tests are opt-in (`include_tests`) at TU-set + binary-count level
-(step 8).
+Supported: static/shared/object libraries and executables. Compile-parity stage:
+plain C/C++ sources, compile flags, defines, include presence; external deps as
+abstract identities. Link-consistency stage: per-executable/shared-lib link
+flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
+(procedure step 8).
 
 **NOT yet supported — stop and tell the user if the project has these:**
 - Custom commands / generated code (`configure_file`, protoc, `add_custom_command`)
@@ -178,11 +152,21 @@ identities. Tests are opt-in (`include_tests`) at TU-set + binary-count level
 
 ## Procedure
 
+> **Script paths vs. project paths.** The `scripts/…` and `tests/…` paths below
+> are relative to **this skill's own directory** (where this `SKILL.md` lives) —
+> NOT the project being migrated. When running inside a target repo, invoke them
+> by absolute path, e.g.
+> `python3 "$SKILL_DIR/scripts/extract_cmake.py" …` where `$SKILL_DIR` is this
+> skill's install location (e.g. `~/.claude/skills/cmake2bazel`). The artifacts
+> you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
+> `BUILD.bazel`/`MODULE.bazel`, and `cmake2bazel.json` — live in or beside the
+> target repo.
+
 ### 1. Confirm scope
 Inspect `CMakeLists.txt`. If you find custom commands, codegen, or
 `find_package` of non-system libs, surface them and confirm before proceeding.
 
-### 2. Extract the CMake oracle
+### 2. Extract the CMake reference model
 ```bash
 mkdir -p <build>/.cmake/api/v1/query
 touch     <build>/.cmake/api/v1/query/codemodel-v2
@@ -234,6 +218,12 @@ worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
 Synthetic target names `<libraries>` and `<external>` denote the unioned
 library-TU and external-dep comparisons.
 
+The diff reports both parity stages at once: **compile-parity** kinds
+(`missing_tu`, `defines_diff`, `includes_diff`, `flags_diff`, `missing_dep`,
+`missing_target`) and the **link-consistency** kind (`link_flags_diff`, one per
+name-aligned executable/shared library). Fix compile parity first — link flags
+are easiest to reason about once the TUs underneath agree.
+
 ### 6. Triage
 ```bash
 python3 scripts/triage.py diff.json                 # grouped summary
@@ -261,19 +251,23 @@ correctness flags).
 | `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag CMake repeats at link) |
-| `missing_dep`    | add the external dep to `deps` (resolve via the dep adapter) |
+| `missing_dep`    | add the external/system dep to the target's `deps`/`linkopts` (resolve the CMake dep name to its Bazel label by hand — there is no automatic resolver yet) |
 | `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
-| `test_binary_count` | (tests on, warning) note the differing test-binary count; per-binary alignment is not yet enforced |
+| `test_binary_count` | (tests on, warning) differing number of test executables — investigate which side has the extra/missing binary |
 
-Re-run steps 4–6 (or just 5–6 if only the config changed). Repeat until
-`converged: true`. Report remaining `warn` items and the `excluded` roles.
+Then re-diff: if you edited `BUILD.bazel`/`MODULE.bazel`, re-run from step 4
+(re-extract the Bazel side); if you only edited `cmake2bazel.json`, re-run from
+step 5. Repeat until `converged: true`. Report remaining `warn` items and the
+`excluded` roles.
 
 ### 8. (Optional) Diff tests
 Once production parity is reached, opt into test diffing:
 - Re-extract **both** sides with tests enabled and the **same** scope: CMake
   configured without `-D..._BUILD_TESTING=OFF`; aquery over `//...` (not a
   single target). Asymmetric scope fabricates findings.
-- Set `"include_tests": true` in `cmake2bazel.json` and re-run steps 5–7.
+- Set `"include_tests": true` in `cmake2bazel.json`, re-extract both models
+  (steps 2 and 4) with the test-inclusive configure/aquery, then re-run the
+  diff/triage/fix loop (steps 5–7).
 - Test sources are compared as a project-wide TU-set union (grouping/naming
   agnostic); a `test_binary_count` warning flags differing numbers of test
   executables. Per-binary identity alignment is a later layer — for now,
@@ -286,23 +280,11 @@ Summarize: production targets reconciled, rounds taken, suppressions recorded in
 human follow-up, and — if `include_tests` was on — test-source parity and any
 test-binary count gap.
 
-## Files
+## What you edit
 
-| path | role | who edits |
-|------|------|-----------|
-| `scripts/model.py`        | canonical model + `TargetRole` | — |
-| `scripts/canonicalize.py` | flag-policy normalizer (hardcoded mechanics) | — |
-| `scripts/config.py`       | `cmake2bazel.json` loader (judgment calls) | — |
-| `scripts/extract_cmake.py`| File API → model, role classification | — |
-| `scripts/extract_bazel.py`| aquery → model, role classification | — |
-| `scripts/diff.py`         | role-filtered, TU-set parity diff | — |
-| `scripts/triage.py`       | groups diff.json into a systematic-cause worklist | — |
-| `scripts/serialize.py`    | model ↔ JSON | — |
-| `<repo>/cmake2bazel.json` | migration decisions (renames + ignores) | **LLM, reviewed** |
-| BUILD.bazel / MODULE.bazel| generated build files | **LLM, each round** |
-
-The `scripts/` are deterministic and must not be edited per-run. Per-iteration
-judgment goes into the generated BUILD files and `cmake2bazel.json`.
+`$SKILL_DIR/scripts/` are deterministic and must **not** be edited per-run. All
+per-iteration judgment goes into the generated `BUILD.bazel`/`MODULE.bazel` and
+`cmake2bazel.json` (reviewed).
 
 ## Tests
 

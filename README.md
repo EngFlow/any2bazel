@@ -1,9 +1,9 @@
 # cmake2bazel
 
 Migrate a C/C++ project from **CMake to Bazel** by generating `BUILD.bazel`
-files and then *iterating until Bazel's actual build actions match a CMake
-oracle*. The migration loop is driven by a **deterministic diff**, so each
-round is cheap and reproducible — an LLM does only the creative work
+files and then *iterating until Bazel's actual build actions match the CMake
+reference build*. The migration loop is driven by a **deterministic diff**, so
+each round is cheap and reproducible — an LLM does only the creative work
 (generating and fixing build files), never the mechanical comparison.
 
 This repo is packaged as a [Claude Code skill](#skill); see [`SKILL.md`](SKILL.md)
@@ -53,7 +53,7 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘    ▲
                           cmake2bazel.json (migration decisions)
 ```
 
-### Why these oracles
+### Why these data sources
 
 - **CMake side: File API codemodel-v2**, *not* `compile_commands.json`.
   compile_commands describes only compilation — it has no link information.
@@ -108,6 +108,18 @@ test helper that CMake compiles straight into a test executable while Bazel puts
 it in a `testonly` `cc_library`. Such a source is present on both sides (just
 under different roles) and must not be falsely reported missing; only its
 *flags* are compared, in whatever union it lands in.
+
+### Two stages: compile parity, then link consistency
+
+The TU-set comparison above is the **compile-parity stage**: it proves the same
+translation units are compiled with equivalent flags, plus the project-wide
+external-dependency closure. But equivalent TUs don't guarantee equivalent
+*binaries* — the link step has its own flags (`-pthread`, `-rdynamic`,
+`-Wl,--gc-sections`, …). So the **link-consistency stage** compares, per
+name-aligned executable and shared library, the link flags each side passes
+(asymmetric subset; toolchain link noise stripped). A single diff run reports
+both stages; fix compile parity first, since link flags are easiest to reason
+about once the TUs underneath agree.
 
 ### Canonicalization: hardcoded mechanics vs. configurable judgment
 
@@ -189,14 +201,24 @@ record of a difference a reviewer chose to accept.
 
 ## "Done" criterion
 
-The current oracle strength is **per-TU compile-flag equivalence + link
-closure**: the same sources compiled with canonically-equal flags, the same
-external link-dependency closure, and — per name-aligned executable/shared-lib —
-equivalent **link flags** (asymmetric subset, toolchain link noise stripped).
-There is (deliberately, for now) no output-artifact or symbol diff and no test
-execution — those are candidate future oracles. Note: link flags and link deps
-are checked for PRODUCTION executables only; test-binary link closure is part
-of the deferred per-binary test layer.
+Parity is reached in **two stages**, both reported by a single diff run:
+
+- **Compile parity** — every translation unit compiles with canonically-equal
+  flags/defines/includes (project-wide TU-set), and the project-wide external
+  link-dependency closure matches.
+- **Link consistency** — each name-aligned executable / shared library links
+  with equivalent link flags (asymmetric subset, toolchain link noise
+  stripped). This confirms the build *artifacts* agree, not just their TUs.
+
+A migration is done when both stages converge. There is (deliberately, for now) no
+output-artifact or symbol diff and no test execution — those are candidate
+future parity checks.
+
+Test targets (opt-in) get the compile-parity stage: their sources are checked
+for compile parity. The link-consistency stage runs for production executables/
+shared libs — tests align by source-set union rather than binary identity, so
+per-test-binary link consistency is a natural future increment rather than part
+of today's "done".
 
 ## Scope
 
@@ -240,7 +262,7 @@ SKILL.md            Claude Code skill: the migrate-iterate procedure
 ## Usage (by hand)
 
 ```bash
-# 1. CMake oracle
+# 1. CMake reference model
 mkdir -p build/.cmake/api/v1/query
 touch     build/.cmake/api/v1/query/codemodel-v2
 cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON

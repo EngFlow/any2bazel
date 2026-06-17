@@ -1,8 +1,12 @@
-"""Asymmetric parity diff: CMake model (oracle A) vs Bazel model (B).
+"""Asymmetric parity diff: CMake reference model (A) vs Bazel model (B).
 
 Produces a worklist of discrepancies for the fix loop. Each iteration of the
-migrate loop calls this; an empty worklist (for a full round) means "done" at
-the current oracle strength (per-TU compile-flag equivalence + link closure).
+migrate loop calls this; an empty worklist (for a full round) means "done".
+Parity has two stages, both reported here:
+  COMPILE PARITY    -- per-TU flag/define/include equivalence (project-wide
+                       TU-set) + external link-dependency closure.
+  LINK CONSISTENCY  -- per name-aligned executable/shared-lib, equivalent link
+                       flags (link_flags_diff).
 
 ASYMMETRY: a flag present in CMake but missing in Bazel is a discrepancy
 (under-specified Bazel target -> likely wrong build). A flag present only in
@@ -210,7 +214,7 @@ def _union_tus(model: CanonicalModel, names) -> Dict[str, TranslationUnit]:
 
 def _all_source_keys(model: CanonicalModel, cfg: "MigrationConfig") -> set:
     """Every source key compiled ANYWHERE in the participating scope, ignoring
-    role. Used as the presence oracle so a source that's a library TU on one
+    role. Used as the presence reference so a source that's a library TU on one
     side and a test/exe TU on the other isn't falsely reported missing.
 
     Scope mirrors what the diff actually compares: all participating-role
@@ -246,7 +250,7 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     a_exes = a_names - a_libs
     b_exes = b_names - b_libs
 
-    # PRESENCE ORACLE: every source compiled ANYWHERE on each side, across all
+    # PRESENCE REFERENCE: every source compiled ANYWHERE on each side, across all
     # participating roles (libraries, executables, and tests when opted in). A
     # source is only "missing" if compiled nowhere on the other side -- the same
     # .cc may be a library TU on one side and a test/exe TU on the other (e.g.
@@ -317,27 +321,26 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
 
 def _diff_tests(a: CanonicalModel, b: CanonicalModel,
                 cfg: "MigrationConfig", a_all: set, b_all: set) -> List[Discrepancy]:
-    """Compare TEST targets. Two checks (per the agreed first cut):
+    """Apply the COMPILE-PARITY stage to TEST targets. Two checks:
 
       1. TU-SET union of all test sources (like libraries): same test .cc files
          compiled with equivalent flags, regardless of how they're grouped into
-         test binaries or named. This is "union now"; per-binary alignment is a
-         later layer. Presence is judged against ALL sources on the other side
-         (a_all/b_all), not just its test union: a test source on one side may
-         be compiled into a (testonly) library on the other -- a grouping
-         difference, not a missing source. Only "compiled nowhere" is flagged.
+         test binaries or named. Presence is judged against ALL sources on the
+         other side (a_all/b_all), not just its test union: a test source on one
+         side may be compiled into a (testonly) library on the other -- a
+         grouping difference, not a missing source. Only "compiled nowhere" is
+         flagged.
       2. Test-binary EXISTENCE by count: a coarse check that both sides produce
          a comparable number of test executables, catching the case where test
-         sources compile but are never linked into runnable tests. Reported as a
-         warning (not a per-binary identity check yet -- naming is deferred).
+         sources compile but are never linked into runnable tests.
 
-    LIMITATION: this does NOT check test LINK CLOSURE -- neither external/system
-    deps nor LINK FLAGS of test binaries. The external-dep and per-executable
-    link-flag checks cover PRODUCTION targets only, so a test that links e.g.
-    abseil/gtest, or passes a specific link flag, is verified to *compile*
-    equivalently but not to *link* the same deps/flags. That's part of the
-    deferred "per-binary" layer. So "tests converged" == test sources compile
-    equivalently, NOT test binaries link identically.
+    SCOPE: tests get the COMPILE-PARITY stage only. LINK CONSISTENCY (per-binary
+    link flags and link-dep closure) runs for PRODUCTION executables/shared
+    libs, not for test binaries: tests align by source-set union, not by binary
+    identity, so there's no per-binary link command to compare. So with tests
+    on, "converged" means production artifacts are link-consistent AND all test
+    SOURCES compile equivalently -- not that each test binary links identically.
+    Extending link consistency to per-test-binary is a natural future increment.
     """
     out: List[Discrepancy] = []
     a_tests = {n for n, t in a.targets.items()
