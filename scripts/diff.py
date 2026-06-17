@@ -37,6 +37,7 @@ class Kind(str, Enum):
     DEFINES_DIFF = "defines_diff"
     INCLUDES_DIFF = "includes_diff"
     FLAGS_DIFF = "flags_diff"
+    LINK_FLAGS_DIFF = "link_flags_diff"   # executable/shared-lib link flags
     MISSING_DEP = "missing_dep"
     # test-specific (only emitted when cfg.include_tests):
     MISSING_TEST_TU = "missing_test_tu"     # test source compiled in cmake, not bazel
@@ -115,6 +116,26 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
             bazel_only=sorted(b_fl - a_fl),
         ))
     return out
+
+
+def _diff_link_flags(name: str, ta: Target, tb: Target,
+                     cfg: "MigrationConfig") -> List[Discrepancy]:
+    """Asymmetric link-flag subset for one aligned executable/shared-lib: every
+    CMake link flag must be present on the Bazel side; extra Bazel link flags
+    are tolerated. Reviewer-approved differences (cfg.link_flag_ignored) are
+    dropped from both sides first. Mirrors the compile-flag check."""
+    a_lf = {f for f in ta.link_flags if not cfg.link_flag_ignored(f)}
+    b_lf = {f for f in tb.link_flags if not cfg.link_flag_ignored(f)}
+    if a_lf - b_lf:
+        return [Discrepancy(
+            kind=Kind.LINK_FLAGS_DIFF.value,
+            severity=Severity.ERROR.value,
+            target=name,
+            detail="cmake link flags missing on bazel side",
+            cmake_only=sorted(a_lf - b_lf),
+            bazel_only=sorted(b_lf - a_lf),
+        )]
+    return []
 
 
 def _norm_includes(includes, cfg) -> tuple:
@@ -270,6 +291,11 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
                                    name, "source compiled in bazel but not cmake", tu=src))
         for src in sorted(set(amap) & set(bmap)):
             out.extend(_diff_tu(name, amap[src], bmap[src], cfg))
+        # link flags: asymmetric subset, same policy as compile flags -- every
+        # CMake link flag must be present on the Bazel side; extra Bazel link
+        # flags tolerated (toolchain link noise already stripped). Reviewer
+        # ignores applied to both sides.
+        out.extend(_diff_link_flags(name, ta, tb, cfg))
 
     # ---- link closure: EXTERNAL deps only ----------------------------------
     # Internal (in-project) dep names are meaningless once libraries are
@@ -305,11 +331,12 @@ def _diff_tests(a: CanonicalModel, b: CanonicalModel,
          sources compile but are never linked into runnable tests. Reported as a
          warning (not a per-binary identity check yet -- naming is deferred).
 
-    LIMITATION: this does NOT check test LINK CLOSURE (external/system deps of
-    test binaries). The production external-dep check covers PRODUCTION targets
-    only, so a test that links e.g. abseil or gtest is verified to *compile*
-    equivalently but not to *link* the same deps. That's part of the deferred
-    "per-binary" layer. So "tests converged" == test sources compile
+    LIMITATION: this does NOT check test LINK CLOSURE -- neither external/system
+    deps nor LINK FLAGS of test binaries. The external-dep and per-executable
+    link-flag checks cover PRODUCTION targets only, so a test that links e.g.
+    abseil/gtest, or passes a specific link flag, is verified to *compile*
+    equivalently but not to *link* the same deps/flags. That's part of the
+    deferred "per-binary" layer. So "tests converged" == test sources compile
     equivalently, NOT test binaries link identically.
     """
     out: List[Discrepancy] = []

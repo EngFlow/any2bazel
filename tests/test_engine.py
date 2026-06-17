@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from canonicalize import canonicalize_flags
+from canonicalize import canonicalize_flags, canonicalize_link_flags
 from config import MigrationConfig
 from diff import Severity, diff_models, summarize
 from model import (CanonicalModel, Dependency, Target, TargetKind,
@@ -188,6 +188,51 @@ def test_executables_still_aligned_by_identity():
     assert any(d.kind == "missing_target" for d in discs)
 
 
+def _exe(name, link_raw, is_bazel, src="tool/m.cpp"):
+    t = Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+               tus=[tu_from_raw(src, ["-DFOO=1"], is_bazel=is_bazel)])
+    t.link_flags = canonicalize_link_flags(link_raw, is_bazel=is_bazel)
+    return t
+
+
+def test_missing_link_flag_is_caught():
+    # A CMake link flag absent on the bazel side is a link_flags_diff error.
+    a = CanonicalModel(); a.add(_exe("app", ["-pthread", "-rdynamic"], False))
+    b = CanonicalModel(); b.add(_exe("app", ["-pthread"], True))
+    discs = diff_models(a, b)
+    lf = [d for d in discs if d.kind == "link_flags_diff"]
+    assert lf and lf[0].target == "app"
+    assert "-rdynamic" in lf[0].cmake_only
+
+
+def test_extra_bazel_link_flag_tolerated():
+    # Asymmetric: an extra link flag only on the bazel side must NOT fail.
+    a = CanonicalModel(); a.add(_exe("app", ["-pthread"], False))
+    b = CanonicalModel(); b.add(_exe("app", ["-pthread", "-Wl,--gc-sections"], True))
+    assert summarize(diff_models(a, b))["converged"]
+
+
+def test_link_toolchain_noise_stripped():
+    # Bazel link noise (macOS/objc/sysroot mechanics + -o/output) must not show
+    # up as a diff against a clean CMake link line.
+    a = CanonicalModel(); a.add(_exe("app", ["-pthread"], False))
+    b = CanonicalModel(); b.add(_exe("app", [
+        "external/.../cc_wrapper.sh", "-o", "bazel-out/bin/app",
+        "bazel-out/bin/_objs/app/m.o", "bazel-out/bin/libfoo.a",
+        "-pthread", "-Wl,-oso_prefix,.", "-headerpad_max_install_names",
+        "-fobjc-link-runtime", "-mmacosx-version-min=15.2", "-lc++", "-lm",
+    ], True))
+    assert summarize(diff_models(a, b))["converged"], "link noise must be stripped"
+
+
+def test_ignore_link_flags_suppresses():
+    a = CanonicalModel(); a.add(_exe("app", ["-fvisibility=hidden", "-pthread"], False))
+    b = CanonicalModel(); b.add(_exe("app", ["-pthread"], True))
+    assert not summarize(diff_models(a, b))["converged"]
+    cfg = MigrationConfig(ignore_link_flags={"-fvisibility=hidden"})
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
 def test_ignore_include_prefixes():
     # A vendored third-party include root that differs by path (in-tree under
     # CMake, external under Bazel) is suppressed via include_prefixes.
@@ -288,6 +333,8 @@ def test_config_loads_all_fields_from_json():
             "defines": ["BORINGSSL_DISPATCH_TEST"],
             "flags": ["-fvisibility=hidden"],
             "flags_prefixes": ["-Wthread-safety"],
+            "link_flags": ["-rdynamic"],
+            "link_flags_prefixes": ["-Wl,--gc"],
             "include_prefixes": ["third_party/"],
             "include_map": [{"from": "external/absl+", "to": "@absl"}],
         },
@@ -303,6 +350,8 @@ def test_config_loads_all_fields_from_json():
     assert cfg.define_ignored("BORINGSSL_DISPATCH_TEST")
     assert cfg.flag_ignored("-fvisibility=hidden")
     assert cfg.flag_ignored("-Wthread-safety-analysis")  # prefix match
+    assert cfg.link_flag_ignored("-rdynamic")
+    assert cfg.link_flag_ignored("-Wl,--gc-sections")  # prefix match
     assert cfg.include_ignored("third_party/gtest/include")
     assert cfg.map_include("external/absl+/base") == "@absl/base"  # rewrite
 

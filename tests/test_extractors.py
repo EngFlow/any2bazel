@@ -168,6 +168,39 @@ def test_header_processing_actions_are_not_tus():
         assert not any(s.endswith(".h") for s in srcs), srcs  # header dropped
 
 
+def test_bazel_extracts_link_flags_from_cpplink():
+    # A CppLink action: link flags must be extracted; driver mechanics (wrapper,
+    # -o/output), object/archive inputs and -l libs must be dropped.
+    aquery = {
+        "artifacts": [{"id": 1, "pathFragmentId": 10}],
+        "pathFragments": [{"id": 10, "label": "app", "parentId": 11},
+                          {"id": 11, "label": "bazel-out"}],
+        "targets": [{"id": 100, "label": "//:app"}],
+        "actions": [
+            {"mnemonic": "CppCompile", "targetId": 100, "outputIds": [],
+             "arguments": ["clang", "-c", "main.cc", "-o", "main.o", "-DFOO=1"]},
+            {"mnemonic": "CppLink", "targetId": 100, "outputIds": [1],
+             "arguments": ["cc_wrapper.sh", "-o", "bazel-out/app",
+                           "bazel-out/_objs/app/main.o", "bazel-out/libfoo.a",
+                           "-pthread", "-Wl,--gc-sections", "-lm",
+                           "-headerpad_max_install_names"]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as root:
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(aquery, f)
+        b = extract_bazel.extract(aq_path, REPO)
+        t = b.targets[":app"]
+        assert t.kind.value == "executable"
+        assert "-pthread" in t.link_flags
+        assert "-Wl,--gc-sections" in t.link_flags
+        # inputs / -l / driver / toolchain noise must NOT be link flags
+        for junk in ("-o", "-lm", "-headerpad_max_install_names"):
+            assert junk not in t.link_flags, (junk, t.link_flags)
+        assert not any(f.endswith((".o", ".a")) for f in t.link_flags)
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

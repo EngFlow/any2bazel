@@ -102,6 +102,8 @@ files as the durable record of migration decisions:
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
     "flags_prefixes": ["-Wthread-safety"],
+    "link_flags": ["-fno-common"],
+    "link_flags_prefixes": ["-Wl,-dead_strip"],
     "include_prefixes": ["third_party/"],
     "include_map": [
       {"from": "external/abseil-cpp+", "to": "@absl"},
@@ -129,8 +131,14 @@ Fields:
   turning it on against a tests-off extraction fabricates findings. When on,
   test sources are compared as their own project-wide TU-set union (like
   libraries) and a coarse test-binary count check runs. See step 4b / step 7.
-- **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved flag/define
-  differences. `flags`/`defines` match exact tokens; `flags_prefixes` by prefix.
+- **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved compile
+  flag/define differences. `flags`/`defines` match exact tokens; `flags_prefixes`
+  by prefix.
+- **`ignore.{link_flags,link_flags_prefixes}`** — reviewer-approved LINK flag
+  differences (per-executable link-flag diff, same asymmetric-subset policy as
+  compile flags). Common case: CMake repeats compile/codegen flags
+  (`-fvisibility=hidden`, `-fno-common`) on the link line where they're benign,
+  while Bazel doesn't.
 - **`ignore.include_prefixes` vs `ignore.include_map`** — two ways to handle an
   include path that's spelled differently on each side (typically a dependency
   that's in-tree under CMake but an external module under Bazel). **Prefer
@@ -252,6 +260,7 @@ correctness flags).
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
 | `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
+| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag CMake repeats at link) |
 | `missing_dep`    | add the external dep to `deps` (resolve via the dep adapter) |
 | `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
 | `test_binary_count` | (tests on, warning) note the differing test-binary count; per-binary alignment is not yet enforced |

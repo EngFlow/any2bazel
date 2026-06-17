@@ -60,6 +60,50 @@ _DRIVER_PAIR_FLAGS = {"-o", "-c", "-isysroot", "--sysroot", "-arch", "-target",
 # KEY="..." after -D splitting). Matched by KEY before '='. Hardcoded fact.
 _DROP_DEFINE_KEYS = {"__DATE__", "__TIME__", "__TIMESTAMP__"}
 
+# --- LINK-flag noise (hardcoded mechanics, dropped at canonicalization) -------
+# Linker flags the Bazel toolchain / platform injects that have no migration
+# meaning. Same philosophy as BAZEL_DEFAULT_FLAG_PREFIXES but for the link step.
+# Conservative; extend per toolchain. Reviewer-judgment link flags go in the
+# config's ignore.link_flags instead.
+BAZEL_DEFAULT_LINK_PREFIXES = (
+    "-Wl,-oso_prefix",          # macOS: strips build-dir prefix from debug map
+    "-Wl,-S",                   # strip debug; build-type driven
+    "-headerpad_max_install_names",  # macOS install-name padding
+    "-fobjc-link-runtime",      # macOS objc runtime; toolchain default
+    "-no-canonical-prefixes",
+    "-mmacosx-version-min=",    # sysroot/version selection (also in compile)
+    "-fexperimental-",
+    "-Wl,-install_name",
+    "-Wl,-rpath,__BAZEL",       # bazel sandbox rpaths
+)
+
+# Link flags with no correctness meaning on either side (build-type / debug).
+IGNORABLE_LINK_PREFIXES = (
+    "-g",
+    "-O",
+    "-fdebug-prefix-map=",
+    "-ffile-prefix-map=",
+)
+
+# Link-driver flags that consume the FOLLOWING token (drop both).
+_LINK_PAIR_FLAGS = {"-o", "-isysroot", "--sysroot", "-arch", "-target"}
+
+
+def _is_link_input(tok: str) -> bool:
+    """A link INPUT (object, archive, or lib reference) rather than a link FLAG.
+    These are the deps/objects being linked, compared separately as the link
+    closure -- not link flags. -l<name> and -L<path> are lib search refs; .o/.a/
+    .lo/.obj/.dylib/.so are concrete inputs; bare positional tokens are the
+    linker/wrapper path or output."""
+    if tok.startswith(("-l", "-L")):
+        return True
+    if tok.startswith("-"):
+        return False
+    return (tok.endswith((".o", ".obj", ".a", ".lo", ".lib", ".so", ".dylib",
+                          ".sh", ".framework"))
+            or ".so." in tok
+            or ("/" in tok and not tok.startswith("/")))  # relative paths/objs
+
 
 def _is_driver_token(tok: str) -> bool:
     """A bare positional argv token on the Bazel side: the compiler path, a
@@ -176,3 +220,36 @@ def canonicalize_flags(
     canon_other = tuple(sorted(set(other)))
 
     return canon_defines, tuple(canon_includes), canon_other
+
+
+def canonicalize_link_flags(raw: List[str], *, is_bazel: bool) -> Tuple[str, ...]:
+    """Extract correctness-relevant LINK flags from a link command.
+
+    Input is either CMake's link.commandFragments of role 'flags' (already just
+    flags) or a Bazel CppLink argv (flags mixed with the linker path, -o output,
+    object/archive inputs, and -l/-L lib refs). We drop:
+      - the linker/wrapper path and -o output (driver mechanics)
+      - object/archive/lib INPUTS and -l/-L refs (that's the link closure, diffed
+        separately as deps -- not link flags)
+      - hardcoded toolchain/platform link noise (BAZEL_DEFAULT_LINK_PREFIXES) on
+        the bazel side, and build-type-ish flags (IGNORABLE_LINK_PREFIXES) on both
+    What remains are genuine link flags (-pthread, -Wl,--gc-sections,
+    -static-libstdc++, -rdynamic, ...). Returned sorted+deduped (order-insensitive).
+    """
+    out: List[str] = []
+    i = 0
+    n = len(raw)
+    if is_bazel and n and _is_link_input(raw[0]):
+        i = 1  # leading linker/wrapper path
+    while i < n:
+        tok = raw[i]
+        if tok in _LINK_PAIR_FLAGS and i + 1 < n:
+            i += 2; continue
+        if _is_link_input(tok):
+            i += 1; continue
+        if is_bazel and _matches_any(tok, BAZEL_DEFAULT_LINK_PREFIXES):
+            i += 1; continue
+        if _matches_any(tok, IGNORABLE_LINK_PREFIXES):
+            i += 1; continue
+        out.append(tok); i += 1
+    return tuple(sorted(set(out)))

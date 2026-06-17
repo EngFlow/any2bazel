@@ -24,7 +24,7 @@ import os
 import sys
 from typing import Dict, List, Optional
 
-from canonicalize import canonicalize_flags
+from canonicalize import canonicalize_flags, canonicalize_link_flags
 from model import (CanonicalModel, Dependency, Target, TargetKind,
                    TargetRole, TranslationUnit)
 from serialize import dump_model
@@ -163,6 +163,10 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
                     dep = a[2:]
                     if dep and not any(d.name == dep for d in t.deps):
                         t.deps.append(Dependency(dep, external=True))
+            # link FLAGS (everything that isn't an input/dep/driver-mechanic).
+            # CppArchive (static lib) has no meaningful link flags; only CppLink.
+            if mnem == "CppLink":
+                t.link_flags = canonicalize_link_flags(args, is_bazel=True)
 
     for t in by_target.values():
         t.role = _classify_bazel(t)

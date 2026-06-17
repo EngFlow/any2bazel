@@ -44,6 +44,10 @@ class MigrationConfig:
     ignore_defines: Set[str] = field(default_factory=set)
     ignore_flags: Set[str] = field(default_factory=set)
     ignore_flag_prefixes: tuple = ()
+    # Reviewer-approved LINK flag differences (per-executable link-flag diff).
+    # Same shape as ignore_flags/flag_prefixes but for the link step.
+    ignore_link_flags: Set[str] = field(default_factory=set)
+    ignore_link_flag_prefixes: tuple = ()
     # Include paths to drop from the search-order comparison -- typically
     # third-party/vendored include roots that resolve differently because the
     # dep is in-tree under CMake but an external module under Bazel.
@@ -76,6 +80,10 @@ class MigrationConfig:
     def flag_ignored(self, flag: str) -> bool:
         return (flag in self.ignore_flags
                 or any(flag.startswith(p) for p in self.ignore_flag_prefixes))
+
+    def link_flag_ignored(self, flag: str) -> bool:
+        return (flag in self.ignore_link_flags
+                or any(flag.startswith(p) for p in self.ignore_link_flag_prefixes))
 
     def define_ignored(self, define: str) -> bool:
         # match on full token or KEY (before '=')
@@ -113,6 +121,8 @@ def load(path: str) -> MigrationConfig:
         ignore_defines=set(ig.get("defines", [])),
         ignore_flags=set(ig.get("flags", [])),
         ignore_flag_prefixes=tuple(ig.get("flags_prefixes", [])),
+        ignore_link_flags=set(ig.get("link_flags", [])),
+        ignore_link_flag_prefixes=tuple(ig.get("link_flags_prefixes", [])),
         ignore_include_prefixes=tuple(ig.get("include_prefixes", [])),
         include_map=tuple(
             (e["from"], e["to"]) for e in ig.get("include_map", [])),

@@ -10,6 +10,35 @@ This repo is packaged as a [Claude Code skill](#skill); see [`SKILL.md`](SKILL.m
 for the agent-facing procedure. The Python core under `scripts/` is a plain
 library you can also run by hand.
 
+## Installing the skill
+
+The skill must be discoverable for a Claude Code process to invoke `/cmake2bazel`.
+Two ways:
+
+**A. Install for auto-discovery** (any session sees `/cmake2bazel`). The skill
+directory needs to contain `SKILL.md`; symlink the whole repo into the user
+skills dir:
+
+```bash
+ln -s "$PWD" ~/.claude/skills/cmake2bazel
+# or copy if you prefer a snapshot:  cp -R "$PWD" ~/.claude/skills/cmake2bazel
+```
+
+Restart/begin a Claude Code session in any project; `/cmake2bazel` is then
+available. The skill's `scripts/` are referenced by absolute path from the
+install location.
+
+**B. Point a session at the repo** (no install). Start Claude Code and tell it:
+
+> Read `~/GitHub/cmake2bazel/SKILL.md` and follow it to migrate this project.
+
+This works for a one-off but isn't auto-discovered as a `/`-command.
+
+> Note: the **generation** step (writing `BUILD.bazel` from a CMake-only
+> project) is the least-exercised part of the procedure — the engine has been
+> validated against projects that already had Bazel files. Expect the first
+> from-scratch conversion to surface rough edges in step 3.
+
 ## How it works
 
 Both build systems are made to emit a structured description of what they
@@ -115,6 +144,8 @@ files as the durable record of migration decisions:
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
     "flags_prefixes": ["-Wthread-safety"],
+    "link_flags": ["-fno-common"],
+    "link_flags_prefixes": ["-Wl,-dead_strip"],
     "include_prefixes": ["third_party/"],
     "include_map": [{"from": "external/abseil-cpp+", "to": "@absl"},
                     {"from": "/opt/absl/include", "to": "@absl"}]
@@ -136,8 +167,12 @@ files as the durable record of migration decisions:
   (symmetric configure + `//...` aquery). Test sources are compared as a
   project-wide TU-set union; a `test_binary_count` warning flags differing
   numbers of test executables. Per-binary identity alignment is a later layer.
-- **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved flag/define
-  differences (`flags_prefixes` matches by prefix).
+- **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved compile
+  flag/define differences (`flags_prefixes` matches by prefix).
+- **`ignore.{link_flags,link_flags_prefixes}`** — reviewer-approved LINK flag
+  differences (per-executable, same asymmetric-subset policy). Typical case:
+  CMake repeats compile/codegen flags on the link line where they're benign and
+  Bazel doesn't.
 - **`ignore.include_map` vs `ignore.include_prefixes`** — for an include root
   spelled differently on each side (a dep that's in-tree under CMake, external
   under Bazel). **`include_map`** rewrites both sides' spellings to a canonical
@@ -155,10 +190,13 @@ record of a difference a reviewer chose to accept.
 ## "Done" criterion
 
 The current oracle strength is **per-TU compile-flag equivalence + link
-closure**: the same sources compiled with canonically-equal flags, and the same
-external link-dependency closure. There is (deliberately, for now) no
-output-artifact or symbol diff and no test execution — those are candidate
-future oracles.
+closure**: the same sources compiled with canonically-equal flags, the same
+external link-dependency closure, and — per name-aligned executable/shared-lib —
+equivalent **link flags** (asymmetric subset, toolchain link noise stripped).
+There is (deliberately, for now) no output-artifact or symbol diff and no test
+execution — those are candidate future oracles. Note: link flags and link deps
+are checked for PRODUCTION executables only; test-binary link closure is part
+of the deferred per-binary test layer.
 
 ## Scope
 

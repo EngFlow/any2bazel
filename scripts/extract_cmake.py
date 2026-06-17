@@ -26,7 +26,7 @@ import os
 import sys
 from typing import Dict, List, Optional
 
-from canonicalize import canonicalize_flags
+from canonicalize import canonicalize_flags, canonicalize_link_flags
 from model import (CanonicalModel, Dependency, Target, TargetKind,
                    TargetRole, TranslationUnit)
 from serialize import dump_model
@@ -160,12 +160,19 @@ def _attach_deps(target: Target, tobj: dict, id_to_name: Dict[str, str]) -> None
             target.deps.append(Dependency(dep_name, external=False))
     # link fragments of role "libraries" that are NOT internal targets are
     # external deps (system libs / find_package results). Record them abstractly.
+    # Fragments of role "flags" are link flags (compared per-executable).
     link = tobj.get("link") or {}
+    flag_tokens: List[str] = []
     for frag in link.get("commandFragments", []):
-        if frag.get("role") == "libraries":
-            ext = _library_identity(frag.get("fragment", ""))
+        role = frag.get("role")
+        fragment = frag.get("fragment", "")
+        if role == "libraries":
+            ext = _library_identity(fragment)
             if ext and not any(d.name == ext for d in target.deps):
                 target.deps.append(Dependency(ext, external=True))
+        elif role == "flags":
+            flag_tokens.extend(_split_fragment(fragment))
+    target.link_flags = canonicalize_link_flags(flag_tokens, is_bazel=False)
 
 
 def _library_identity(fragment: str) -> Optional[str]:
