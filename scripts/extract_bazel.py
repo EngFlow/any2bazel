@@ -48,6 +48,31 @@ def _kind_from_link(mnemonic: str, path: str) -> TargetKind:
     return TargetKind.EXECUTABLE
 
 
+_ARCHIVE_EXTS = (".a", ".lo", ".lib")
+
+
+def _archive_identity(arg):
+    """Abstract dep name for an archive FILE link input, or None if `arg` isn't
+    one (it's a flag, object, or the output). Mirrors the CMake side's
+    _library_identity: 'libcatch2_main.a' -> 'catch2_main'. Cross-build name
+    differences (vs CMake's 'Catch2Main') are aligned by an explicit dep_map
+    config entry at diff time, not a fuzzy match."""
+    if arg.startswith("-") or not arg.endswith(_ARCHIVE_EXTS):
+        return None
+    base = os.path.basename(arg)
+    stem = base.split(".")[0]
+    if stem.startswith("lib"):
+        stem = stem[3:]
+    return stem or None
+
+
+def _is_external_path(arg):
+    """True if an archive path is an external/third-party dependency (a bzlmod
+    module) rather than an in-project library. Bazel puts external repos under
+    'external/<repo>' (and a 'bazel-out/.../bin/external/<repo>' mirror)."""
+    return "external/" in arg
+
+
 def _build_path_index(container: dict) -> Dict[int, str]:
     """Reconstruct full paths from the pathFragments linked list."""
     frags = {pf["id"]: pf for pf in container.get("pathFragments", [])}
@@ -156,13 +181,23 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
             outs = [artifacts.get(o, "") for o in action.get("outputIds", [])]
             primary = outs[0] if outs else ""
             t = target_for(name, _kind_from_link(mnem, primary))
-            # link inputs that are other targets' archives -> deps; system libs
-            # appear as -l flags in the argv
+            # Link deps come in two argv shapes:
+            #   1. -l<name>  -> system lib (external)
+            #   2. an archive FILE input (libfoo.a / .lo) -- Bazel links its deps
+            #      by path, not -l. Archives under external/ (or bazel-out's
+            #      external/ mirror) are external deps (bzlmod modules, e.g.
+            #      catch2); archives elsewhere are internal in-project libs that
+            #      the TU-set union already covers, so they're recorded internal
+            #      and ignored by the external-dep check.
             for a in args:
                 if a.startswith("-l"):
                     dep = a[2:]
                     if dep and not any(d.name == dep for d in t.deps):
                         t.deps.append(Dependency(dep, external=True))
+                    continue
+                ident = _archive_identity(a)
+                if ident and not any(d.name == ident for d in t.deps):
+                    t.deps.append(Dependency(ident, external=_is_external_path(a)))
             # link FLAGS (everything that isn't an input/dep/driver-mechanic).
             # CppArchive (static lib) has no meaningful link flags; only CppLink.
             if mnem == "CppLink":

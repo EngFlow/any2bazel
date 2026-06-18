@@ -306,7 +306,11 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # dissolved into a TU union, but external/system libs (-lpthread, -lz, ...)
     # must still be present for the binary to link. Compare the project-wide
     # set of external deps; require every CMake external dep on the Bazel side.
-    a_ext = _external_deps(a, a_names)
+    # A dep spelled differently per build (CMake's archive basename 'Catch2Main'
+    # vs Bazel's 'catch2_main', or 'OpenSSL::SSL' vs 'ssl') is aligned by an
+    # explicit, recorded cfg.dep_map entry -- not a fuzzy match -- so a residual
+    # missing_dep is a genuinely-absent dep, not a naming artifact.
+    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a, a_names)}
     b_ext = _external_deps(b, b_names)
     for dep in sorted(a_ext - b_ext):
         out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,

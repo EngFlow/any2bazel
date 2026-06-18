@@ -199,6 +199,38 @@ def test_bazel_extracts_link_flags_from_cpplink():
         for junk in ("-o", "-lm", "-headerpad_max_install_names"):
             assert junk not in t.link_flags, (junk, t.link_flags)
         assert not any(f.endswith((".o", ".a")) for f in t.link_flags)
+        # the in-project archive becomes an INTERNAL dep (not external, not a flag)
+        foo = next((d for d in t.deps if d.name == "foo"), None)
+        assert foo is not None and not foo.external, t.deps
+
+
+def test_bazel_external_archive_is_external_dep():
+    # An archive linked by PATH from external/ (a bzlmod module, e.g. catch2)
+    # must be captured as an EXTERNAL dep -- previously dropped (only -l deps
+    # were captured), which is the spdlog Catch2Main gap.
+    aquery = {
+        "artifacts": [{"id": 1, "pathFragmentId": 10}],
+        "pathFragments": [{"id": 10, "label": "app", "parentId": 11},
+                          {"id": 11, "label": "bazel-out"}],
+        "targets": [{"id": 100, "label": "//:app"}],
+        "actions": [
+            {"mnemonic": "CppCompile", "targetId": 100, "outputIds": [],
+             "arguments": ["clang", "-c", "main.cc", "-o", "main.o"]},
+            {"mnemonic": "CppLink", "targetId": 100, "outputIds": [1],
+             "arguments": ["cc_wrapper.sh", "-o", "bazel-out/app",
+                           "bazel-out/_objs/app/main.o",
+                           "bazel-out/bin/libmylib.a",                     # internal
+                           "bazel-out/bin/external/catch2+/libcatch2_main.a"]},  # external
+        ],
+    }
+    with tempfile.TemporaryDirectory() as root:
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(aquery, f)
+        b = extract_bazel.extract(aq_path, REPO)
+        deps = {d.name: d.external for d in b.targets[":app"].deps}
+        assert deps.get("catch2_main") is True, deps   # external archive captured
+        assert deps.get("mylib") is False, deps         # internal archive captured
 
 
 if __name__ == "__main__":

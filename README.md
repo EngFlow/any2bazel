@@ -150,6 +150,7 @@ files as the durable record of migration decisions:
 {
   "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
   "target_map": { "some_cmake_exe": ":some_bazel_exe" },
+  "dep_map": { "Catch2Main": "catch2_main" },
   "exclude_targets": ["benchmark", "some_tool"],
   "include_tests": false,
   "ignore": {
@@ -170,6 +171,9 @@ files as the durable record of migration decisions:
 - **`target_map`** — `cmake_name → bazel_name` for renamed **executables**
   (Bazel targets are keyed by full label, so values look like `:name`).
   Libraries need no mapping — they're compared by source-path TU-set.
+- **`dep_map`** — `cmake_dep_name → bazel_dep_name` for an external link dep
+  spelled differently per build (`Catch2Main` ↔ `catch2_main`, `OpenSSL::SSL` ↔
+  `ssl`). Explicit and recorded, not a fuzzy match.
 - **`exclude_targets`** — CMake targets dropped from the diff (vendored
   third-party Bazel pulls externally, or out-of-scope tooling). The only lever
   for `missing_tu`/`missing_target` on whole subtrees; excluded targets are

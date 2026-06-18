@@ -111,6 +111,41 @@ def test_missing_external_link_dep_is_error():
     assert any(d.kind == "missing_dep" and d.severity == "error" for d in discs)
 
 
+def test_external_dep_name_aligned_by_dep_map():
+    # CMake records the archive basename ('Catch2Main'); Bazel the target/file
+    # name ('catch2_main'). An explicit dep_map aligns them -> converges.
+    a = CanonicalModel()
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("Catch2Main", external=True)]))
+    b = CanonicalModel()
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True)],
+                 deps=[Dependency("catch2_main", external=True)]))
+    # without the map, the name mismatch is a real (reported) gap
+    assert not summarize(diff_models(a, b))["converged"]
+    # with it, they align
+    cfg = MigrationConfig(dep_map={"Catch2Main": "catch2_main"})
+    assert summarize(diff_models(a, b, cfg))["converged"], diff_models(a, b, cfg)
+
+
+def test_dep_map_does_not_swallow_a_real_gap():
+    # dep_map only renames the entries it lists; an unrelated absent dep still
+    # surfaces.
+    a = CanonicalModel()
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("Catch2Main", external=True),
+                       Dependency("ssl", external=True)]))
+    b = CanonicalModel()
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True)],
+                 deps=[Dependency("catch2_main", external=True)]))
+    cfg = MigrationConfig(dep_map={"Catch2Main": "catch2_main"})
+    discs = diff_models(a, b, cfg)
+    assert any(d.kind == "missing_dep" and d.cmake_only == ["ssl"] for d in discs)
+
+
 def test_internal_dep_rename_is_not_flagged():
     # internal (non-external) deps are no longer compared -- a rename mismatch
     # on an internal dep must NOT produce a discrepancy.
@@ -328,6 +363,7 @@ def test_config_loads_all_fields_from_json():
     obj = {
         "bazel_args": ["--config=macos", "--copt=-fno-rtti"],
         "target_map": {"a": "b"},
+        "dep_map": {"Catch2Main": "catch2_main"},
         "exclude_targets": ["benchmark"],
         "ignore": {
             "defines": ["BORINGSSL_DISPATCH_TEST"],
@@ -346,6 +382,7 @@ def test_config_loads_all_fields_from_json():
     os.unlink(path)
     assert cfg.bazel_args == ("--config=macos", "--copt=-fno-rtti")
     assert cfg.target_map == {"a": "b"}
+    assert cfg.dep_map == {"Catch2Main": "catch2_main"}
     assert cfg.target_excluded("benchmark")
     assert cfg.define_ignored("BORINGSSL_DISPATCH_TEST")
     assert cfg.flag_ignored("-fvisibility=hidden")

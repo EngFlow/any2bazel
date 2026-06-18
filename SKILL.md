@@ -77,6 +77,7 @@ files as the durable record of migration decisions:
 {
   "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
   "target_map": { "some_cmake_exe": ":some_bazel_exe" },
+  "dep_map": { "Catch2Main": "catch2_main" },
   "exclude_targets": ["benchmark", "some_tool"],
   "include_tests": false,
   "ignore": {
@@ -102,6 +103,10 @@ Fields:
 - **`target_map`** — `cmake_name → bazel_name` for intentionally renamed
   **executables**. Bazel targets are keyed by full label, so the value is
   usually `:name` (e.g. `"bssl": ":bssl"`). Libraries need no mapping.
+- **`dep_map`** — `cmake_dep_name → bazel_dep_name` for an **external link
+  dep** spelled differently per build (CMake's archive basename `Catch2Main`
+  vs Bazel's `catch2_main`, or `OpenSSL::SSL` vs `ssl`). An explicit, recorded
+  rename — not a fuzzy match — so a residual `missing_dep` is a genuine gap.
 - **`exclude_targets`** — CMake target names dropped entirely from the diff:
   third-party/vendored code Bazel pulls as an external module, or tooling out
   of scope. The **only** lever for `missing_tu`/`missing_target` on whole
@@ -268,7 +273,7 @@ correctness flags).
 | `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag CMake repeats at link) |
-| `missing_dep`    | add the external/system dep to the target's `deps`/`linkopts` (resolve the CMake dep name to its Bazel label by hand — there is no automatic resolver yet) |
+| `missing_dep`    | add the missing external/system dep to the target's `deps`/`linkopts`; if it's just a name spelled differently per build (`Catch2Main` vs `catch2_main`, `OpenSSL::SSL` vs `ssl`), add a `dep_map` entry. External deps are captured from both `-l` flags and archive-file inputs (e.g. `external/catch2+/libcatch2_main.a`) |
 | `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
 | `test_binary_count` | (tests on, warning) differing number of test executables — investigate which side has the extra/missing binary |
 

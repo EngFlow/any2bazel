@@ -41,6 +41,13 @@ CONFIG_FILENAME = "cmake2bazel.json"
 @dataclass
 class MigrationConfig:
     target_map: Dict[str, str] = field(default_factory=dict)
+    # Explicit external-dependency name map, cmake_dep_name -> bazel_dep_name,
+    # for deps spelled differently per build (CMake's archive basename
+    # 'Catch2Main' vs Bazel's 'catch2_main', or 'OpenSSL::SSL' vs 'ssl'). Like
+    # target_map but for the link-closure comparison: a reviewed, recorded
+    # decision rather than a fuzzy match, so a residual missing_dep is a real
+    # gap. Applied to the CMake side before comparing.
+    dep_map: Dict[str, str] = field(default_factory=dict)
     ignore_defines: Set[str] = field(default_factory=set)
     ignore_flags: Set[str] = field(default_factory=set)
     ignore_flag_prefixes: tuple = ()
@@ -118,6 +125,7 @@ def load(path: str) -> MigrationConfig:
     ig = obj.get("ignore", {})
     return MigrationConfig(
         target_map=obj.get("target_map", {}) or {},
+        dep_map=obj.get("dep_map", {}) or {},
         ignore_defines=set(ig.get("defines", [])),
         ignore_flags=set(ig.get("flags", [])),
         ignore_flag_prefixes=tuple(ig.get("flags_prefixes", [])),
