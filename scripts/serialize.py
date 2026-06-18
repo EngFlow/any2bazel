@@ -1,9 +1,9 @@
-"""JSON (de)serialization for the canonical model.
+"""JSON (de)serialization for the canonical (action-based) model.
 
-The on-disk model JSON is the contract between the three deterministic stages:
-  extract_cmake.py  -> model.cmake.json
+The on-disk model JSON is the contract between the deterministic stages:
+  extract_cmake.py  -> model.cmake.json   (targets as ACTIONS + annotations)
   extract_bazel.py  -> model.bazel.json
-  diff.py           reads both
+  diff.py           reads both, reconstructs views, compares
 This keeps extraction and diffing as separate, independently-testable processes.
 """
 
@@ -12,12 +12,17 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
-from model import (CanonicalModel, ConfiguredFile, Dependency, Target,
-                   TargetKind, TargetRole, TranslationUnit)
+from model import (Action, BuildSystem, CanonicalModel, ConfiguredFile,
+                   Dependency, Target, TargetKind, TargetRole)
 
 
 def dump_model(m: CanonicalModel, path: str) -> None:
-    obj: Dict[str, Any] = {"targets": {}, "configured_files": {}}
+    obj: Dict[str, Any] = {
+        "build_system": m.build_system.value,
+        "repo_root": m.repo_root,
+        "targets": {},
+        "configured_files": {},
+    }
     for cname, c in m.configured_files.items():
         obj["configured_files"][cname] = {
             "name": c.name,
@@ -30,17 +35,15 @@ def dump_model(m: CanonicalModel, path: str) -> None:
         obj["targets"][name] = {
             "kind": t.kind.value,
             "role": t.role.value,
-            "link_flags": list(t.link_flags),
             "deps": [{"name": d.name, "external": d.external} for d in t.deps],
-            "tus": [
+            "actions": [
                 {
-                    "source": tu.source,
-                    "defines": list(tu.defines),
-                    "includes": list(tu.includes),
-                    "flags": list(tu.flags),
-                    "language": tu.language,
+                    "mnemonic": a.mnemonic,
+                    "arguments": list(a.arguments),
+                    "inputs": list(a.inputs),
+                    "outputs": list(a.outputs),
                 }
-                for tu in t.tus
+                for a in t.actions
             ],
         }
     with open(path, "w") as f:
@@ -50,23 +53,25 @@ def dump_model(m: CanonicalModel, path: str) -> None:
 def load_model(path: str) -> CanonicalModel:
     with open(path) as f:
         obj = json.load(f)
-    m = CanonicalModel()
+    m = CanonicalModel(
+        build_system=BuildSystem(obj.get("build_system", "unknown")),
+        repo_root=obj.get("repo_root", ""),
+    )
     for name, t in obj["targets"].items():
         target = Target(
             name=name,
             kind=TargetKind(t["kind"]),
             role=TargetRole(t.get("role", "unknown")),
-            link_flags=tuple(t.get("link_flags", [])),
-            deps=[Dependency(d["name"], d.get("external", False)) for d in t.get("deps", [])],
-            tus=[
-                TranslationUnit(
-                    source=tu["source"],
-                    defines=tuple(tu.get("defines", [])),
-                    includes=tuple(tu.get("includes", [])),
-                    flags=tuple(tu.get("flags", [])),
-                    language=tu.get("language", "CXX"),
+            deps=[Dependency(d["name"], d.get("external", False))
+                  for d in t.get("deps", [])],
+            actions=[
+                Action(
+                    mnemonic=a["mnemonic"],
+                    arguments=tuple(a.get("arguments", [])),
+                    inputs=tuple(a.get("inputs", [])),
+                    outputs=tuple(a.get("outputs", [])),
                 )
-                for tu in t.get("tus", [])
+                for a in t.get("actions", [])
             ],
         )
         m.add(target)

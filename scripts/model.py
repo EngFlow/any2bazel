@@ -1,27 +1,38 @@
-"""Canonical build model shared by both extractors.
+"""Canonical build model — an ACTION-based IR shared by all extractors.
 
-Both the CMake File-API extractor and the Bazel aquery extractor normalize
-into THIS model. The diff operates only on this model, never on raw command
-strings. The LLM never touches this file's logic -- extraction and diffing are
-deterministic so each migrate-iterate round is cheap and reproducible.
+Each build system extracts into THIS model. The model is a faithful, dumb record
+of build ACTIONS; it does NOT canonicalize. All interpretation (parsing argv into
+translation units / link flags, stripping build-system noise, grouping per
+language) happens in the DIFFER (see reconstruct.py + diff.py). This keeps the
+model language- and build-system-neutral: the neutral floor of an action is its
+raw argv (a list of strings), which every build system can produce -- Bazel
+aquery emits it natively; CMake and Maven synthesize it from structured config.
 
-Design decisions baked in here (from the design discussion):
-  * A dependency is recorded as an ABSTRACT identity (a name), not a resolved
-    path. Resolution (find_package / vcpkg / bzlmod / rules_foreign_cc / ...)
-    is pluggable and lives outside this model. This keeps the model agnostic
-    to how either side found the lib.
-  * Flag comparison is ASYMMETRIC: we require every correctness-relevant CMake
-    flag to be present on the Bazel side. Extra Bazel flags (toolchain
-    defaults, sandbox include prefixes) are NOT discrepancies.
-  * "Done" for a target = per-TU compile-flag equivalence + link closure.
+Design decisions baked in here:
+  * The neutral floor is RAW ARGV. Structured semantics (a target's deps, an
+    action's inputs/outputs) are RESOLVED ANNOTATIONS a frontend fills when it
+    knows them, and the differ infers from argv when it doesn't. This is the
+    `resolved | raw | unknown` idea: argv is the raw floor (always present),
+    annotations are the resolved overlay (when known). Never lossy.
+  * Canonicalization is NOT here -- it is in the differ, keyed on the model's
+    `build_system` tag (for noise) and each action's mnemonic (for grouping).
+  * Dependency is an ABSTRACT identity (a name), not a resolved path/label.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
+
+
+class BuildSystem(str, Enum):
+    """Which build system produced a model. Drives build-system-specific noise
+    stripping in the differ (Bazel sandbox paths, CMake build dirs, ...)."""
+    CMAKE = "cmake"
+    BAZEL = "bazel"
+    MAVEN = "maven"
+    UNKNOWN = "unknown"
 
 
 class TargetKind(str, Enum):
@@ -40,32 +51,57 @@ class TargetRole(str, Enum):
     Classification is a heuristic guess, so UNKNOWN is a first-class outcome
     that stays visible rather than being silently dropped. The diff compares
     only roles in PARTICIPATING_ROLES (see diff.py); the rest are retained in
-    the model for separate inspection. Turning tests on later is a one-line
-    policy change here, not a re-extraction.
+    the model for separate inspection.
     """
     PRODUCTION = "production"   # shippable library or binary -> diffed
-    TEST = "test"              # test executable -> tracked, deferred phase
+    TEST = "test"              # test executable -> tracked, opt-in
     DASHBOARD = "dashboard"    # CTest/CDash UTILITY automation, no artifact
     AGGREGATE = "aggregate"    # meta target: only deps, no own sources
-    CODEGEN = "codegen"        # generated-code / custom-command target (out of MVP)
+    CODEGEN = "codegen"        # generated-code / custom-command target
     UNKNOWN = "unknown"        # could not classify -- surfaced, not diffed
 
 
 @dataclass(frozen=True)
 class Dependency:
-    """Resolution-agnostic dependency identity.
+    """Resolution-agnostic dependency identity (a resolved annotation).
 
-    `name` is the abstract library name (e.g. 'zlib', 'fmt'). `external` marks
-    deps that came from outside the project tree (find_package / system / fetched).
-    How this maps to a Bazel label is the resolver adapter's job, not ours.
+    `name` is the abstract library name (e.g. 'zlib', 'fmt', or a coordinate
+    like 'com.google.guava:guava'). `external` marks deps from outside the
+    project tree. How this maps to a target build label is the backend's job.
     """
     name: str
     external: bool = False
 
 
 @dataclass
+class Action:
+    """One build action. The neutral floor is `arguments` (raw argv); the rest
+    are resolved annotations a frontend fills when it can.
+
+      mnemonic   action kind: CppCompile / CppLink / CppArchive / JavaCompile /
+                 ... The differ groups and interprets per mnemonic.
+      arguments  RAW ARGV (the faithful floor). Bazel: the literal command line.
+                 CMake/Maven: synthesized from structured config (no real argv).
+      inputs     declared input paths (annotation; e.g. a CMake compile group's
+                 source list, or a link action's object/archive inputs). May be
+                 empty -- the differ then infers sources from argv.
+      outputs    declared output paths (annotation).
+    """
+    mnemonic: str
+    arguments: Tuple[str, ...] = ()
+    inputs: Tuple[str, ...] = ()
+    outputs: Tuple[str, ...] = ()
+
+
+@dataclass
 class TranslationUnit:
-    """One compiled source file with its canonicalized compile flags."""
+    """A reconstruction VIEW: one compiled source + its canonicalized flags.
+
+    NOT extracted directly anymore -- the differ's reconstruct step derives TUs
+    from compile Actions (one per source). Kept here because it's the shared
+    shape the comparison layer operates on. For C/C++ a TU is one .cc; other
+    languages reconstruct into their own comparable units.
+    """
     source: str                      # repo-relative POSIX path
     defines: Tuple[str, ...] = ()    # canonicalized, sorted -- order never matters
     includes: Tuple[str, ...] = ()   # repo-relative, ORDER PRESERVED (search order)
@@ -78,63 +114,46 @@ class TranslationUnit:
 
 @dataclass(frozen=True)
 class ConfiguredFile:
-    """A CONFIGURE-TIME generated file: the output of CMake `configure_file()`,
-    which runs during `cmake` configure (string templating), leaving NO node in
-    the build/action graph. This is a DISTINCT concept from build-time
-    generation (add_custom_command outputs / codegen tools, which live in the
-    action graph and map to Bazel genrules). Do not merge the two: configure-time
-    generation maps to a Bazel repository/workspace rule (or expand_template),
-    runs once at workspace setup, and is recovered only from the cmake --trace
-    (Tier-2 intent), never from the codemodel.
+    """A CONFIGURE-TIME generated file: output of CMake `configure_file()`,
+    which runs at configure time (string templating) leaving NO action-graph
+    node. DISTINCT from build-time generation (add_custom_command/codegen, which
+    lives in the action graph as Actions and maps to Bazel genrules). Recovered
+    only from the cmake --trace; maps to a Bazel repository/workspace rule.
 
-    Captured with BOTH the output and the generation inputs so the Bazel side can
-    reproduce it and equivalence can be proved by CONTENT (we store the output
-    PATH, not bytes -- read + compared at diff time):
-      name             canonical output name, relative to the build/gen root, so
-                       it lines up with the Bazel counterpart despite divergent
-                       absolute locations.
-      output_path      absolute on-disk output (read for content comparison).
-      template         the source .in/.cmakein the output was configured from.
-      options          configure_file options, e.g. ('@ONLY',).
-      is_compile_input True when the output lands on an include/compile path
-                       (so it affects compilation and must match by content);
-                       False for benign outputs (.pc, install .cmake, fixtures).
+    Captured with output + generation inputs so equivalence can be proved by
+    CONTENT (store the output PATH, not bytes; read + compared at diff time).
     """
-    name: str
-    output_path: str
-    template: Optional[str] = None
-    options: Tuple[str, ...] = ()
-    is_compile_input: bool = False
+    name: str                        # canonical output name, build-root-relative
+    output_path: str                 # absolute on-disk output (read for content)
+    template: Optional[str] = None   # source .in/.cmakein
+    options: Tuple[str, ...] = ()    # e.g. ('@ONLY',)
+    is_compile_input: bool = False   # output lands on an include/compile path
 
 
 @dataclass
 class Target:
+    """A build target. Holds raw ACTIONS plus resolved annotations
+    (kind/role/deps). Compile flags and link flags are NOT stored -- they are
+    reconstructed from `actions` by the differ."""
     name: str
     kind: TargetKind
-    tus: List[TranslationUnit] = field(default_factory=list)
-    deps: List[Dependency] = field(default_factory=list)   # link closure (direct)
-    link_flags: Tuple[str, ...] = ()
-    # Inferred FUNCTION of the target (see TargetRole). Orthogonal to `kind`,
-    # which is the mechanical artifact type. The diff compares only targets
-    # whose role is in PARTICIPATING_ROLES; everything else is kept in the
-    # model for inspection but skipped, with the role explaining why.
+    actions: List[Action] = field(default_factory=list)
+    deps: List[Dependency] = field(default_factory=list)   # link closure (annotation)
     role: "TargetRole" = None  # set in __post_init__ if left unspecified
 
     def __post_init__(self):
         if self.role is None:
             self.role = TargetRole.UNKNOWN
 
-    def tu_map(self) -> Dict[str, TranslationUnit]:
-        return {tu.key(): tu for tu in self.tus}
-
 
 @dataclass
 class CanonicalModel:
-    """The whole project, normalized. Source of truth for the diff."""
+    """A whole project's extracted build, as actions. Source of truth for the
+    differ, which reconstructs + canonicalizes from here."""
+    build_system: BuildSystem = BuildSystem.UNKNOWN
+    repo_root: str = ""              # used by reconstruct to make paths relative
     targets: Dict[str, Target] = field(default_factory=dict)
-    # Project-wide CONFIGURE-TIME generated files (configure_file outputs),
-    # keyed by canonical name. A distinct concept from build-time/action-graph
-    # generation (not yet modeled). Compared across builds by CONTENT.
+    # Project-wide CONFIGURE-TIME generated files (configure_file outputs).
     configured_files: Dict[str, "ConfiguredFile"] = field(default_factory=dict)
 
     def add(self, t: Target) -> None:

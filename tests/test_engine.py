@@ -14,23 +14,38 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from canonicalize import canonicalize_flags, canonicalize_link_flags
 from config import MigrationConfig
 from diff import Severity, diff_models, summarize
-from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TargetRole, TranslationUnit)
+from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
+                   TargetKind, TargetRole)
 
 REPO = "/work/proj"
 
 
 def tu_from_raw(source, raw, is_bazel):
-    d, i, f = canonicalize_flags(raw, REPO, is_bazel=is_bazel)
-    return TranslationUnit(source=source, defines=d, includes=i, flags=f)
+    """Build a synthesized CppCompile Action from raw argv (the differ
+    canonicalizes it). `is_bazel` is accepted for call-site compatibility but
+    the actual side comes from the model's build_system tag set in _bs()."""
+    return Action(mnemonic="CppCompile", arguments=tuple(list(raw) + ["-c", source]))
 
 
-def _model(tu, deps=()):
-    m = CanonicalModel()
-    m.add(Target("lib", TargetKind.STATIC, tus=[tu], role=TargetRole.PRODUCTION,
+def _link(raw):
+    """A CppLink Action carrying link-flag argv."""
+    return Action(mnemonic="CppLink", arguments=tuple(raw))
+
+
+def _bs(model, is_bazel):
+    """Tag a hand-built model with its build system (drives reconstruct's
+    noise-stripping). Tests build the CMake side with is_bazel=False."""
+    model.build_system = BuildSystem.BAZEL if is_bazel else BuildSystem.CMAKE
+    model.repo_root = REPO
+    return model
+
+
+def _model(action, deps=(), is_bazel=False):
+    m = _bs(CanonicalModel(), is_bazel)
+    m.add(Target("lib", TargetKind.STATIC, actions=[action],
+                 role=TargetRole.PRODUCTION,
                  deps=[Dependency(n) for n in deps]))
     return m
 
@@ -42,8 +57,8 @@ def test_toolchain_defaults_do_not_break_convergence():
                  "-DFOO=1", "-std=c++17", "-Wall",
                  "-fno-canonical-system-headers", "-frandom-seed=abc",
                  "-g0", "-O2"]
-    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
     res = summarize(diff_models(a, b))
     assert res["converged"], res
     assert res["errors"] == 0, res
@@ -52,8 +67,8 @@ def test_toolchain_defaults_do_not_break_convergence():
 def test_missing_cmake_flag_is_caught():
     cmake_raw = ["-DFOO=1", "-DNEEDED=1", "-std=c++17", "-fno-exceptions"]
     bazel_raw = ["-DFOO=1", "-std=c++17"]  # dropped NEEDED and -fno-exceptions
-    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
     discs = diff_models(a, b)
     res = summarize(discs)
     assert not res["converged"], res
@@ -68,8 +83,8 @@ def test_missing_cmake_flag_is_caught():
 def test_extra_bazel_define_is_warn_not_error():
     cmake_raw = ["-DFOO=1"]
     bazel_raw = ["-DFOO=1", "-DEXTRA=1"]
-    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
     discs = diff_models(a, b)
     dd = next(d for d in discs if d.kind == "defines_diff")
     assert dd.severity == Severity.WARN.value
@@ -83,8 +98,8 @@ def test_include_presence_not_order():
     # present, must NOT be flagged.
     cmake_raw = ["-I", "/work/proj/a", "-I", "/work/proj/b"]
     bazel_raw = ["-I", "/work/proj/b", "-I", "/work/proj/a"]  # reordered only
-    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
     assert summarize(diff_models(a, b))["converged"], "pure reorder must not fail"
 
 
@@ -92,7 +107,7 @@ def test_missing_include_root_is_caught():
     # But a CMake include root genuinely ABSENT on the bazel side is an error.
     a = _model(tu_from_raw("src/a.cpp", ["-I", "/work/proj/a", "-I", "/work/proj/b"],
                            is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", ["-I", "/work/proj/a"], is_bazel=True))
+    b = _model(tu_from_raw("src/a.cpp", ["-I", "/work/proj/a"], is_bazel=True), is_bazel=True)
     discs = diff_models(a, b)
     assert any(d.kind == "includes_diff" for d in discs), "missing root must be caught"
 
@@ -100,13 +115,13 @@ def test_missing_include_root_is_caught():
 def test_missing_external_link_dep_is_error():
     # Only EXTERNAL deps are checked post-union (internal dep names are noise
     # once libraries are compared as a TU-set). A missing system lib is an error.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)],
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)],
                  deps=[Dependency("z", external=True)]))
-    b = CanonicalModel()
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
     discs = diff_models(a, b)
     assert any(d.kind == "missing_dep" and d.severity == "error" for d in discs)
 
@@ -114,13 +129,13 @@ def test_missing_external_link_dep_is_error():
 def test_external_dep_name_aligned_by_dep_map():
     # CMake records the archive basename ('Catch2Main'); Bazel the target/file
     # name ('catch2_main'). An explicit dep_map aligns them -> converges.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
                  deps=[Dependency("Catch2Main", external=True)]))
-    b = CanonicalModel()
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True)],
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True)],
                  deps=[Dependency("catch2_main", external=True)]))
     # without the map, the name mismatch is a real (reported) gap
     assert not summarize(diff_models(a, b))["converged"]
@@ -132,14 +147,14 @@ def test_external_dep_name_aligned_by_dep_map():
 def test_dep_map_does_not_swallow_a_real_gap():
     # dep_map only renames the entries it lists; an unrelated absent dep still
     # surfaces.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
                  deps=[Dependency("Catch2Main", external=True),
                        Dependency("ssl", external=True)]))
-    b = CanonicalModel()
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True)],
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True)],
                  deps=[Dependency("catch2_main", external=True)]))
     cfg = MigrationConfig(dep_map={"Catch2Main": "catch2_main"})
     discs = diff_models(a, b, cfg)
@@ -149,13 +164,13 @@ def test_dep_map_does_not_swallow_a_real_gap():
 def test_internal_dep_rename_is_not_flagged():
     # internal (non-external) deps are no longer compared -- a rename mismatch
     # on an internal dep must NOT produce a discrepancy.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)],
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)],
                  deps=[Dependency("crypto", external=False)]))
-    b = CanonicalModel()
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)],
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)],
                  deps=[Dependency("crypto_internal", external=False)]))
     assert summarize(diff_models(a, b))["converged"]
 
@@ -163,26 +178,26 @@ def test_internal_dep_rename_is_not_flagged():
 def test_renamed_library_converges_without_a_map():
     # TU-set comparison: libraries align by source path, so a library rename
     # (crypto -> crypto_internal) needs NO target map to converge.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("crypto", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=False)]))
-    b = CanonicalModel()
+                 actions=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("crypto_internal", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=True)]))
     assert summarize(diff_models(a, b))["converged"]
 
 
 def test_object_library_foldin_converges():
     # CMake keeps fipsmodule as a separate object lib; Bazel folds its sources
     # into crypto_internal. TU-set union makes this a non-issue.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("crypto", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+                 actions=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=False)]))
     a.add(Target("fipsmodule", TargetKind.OBJECT, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("crypto/fips/b.cpp", ["-DFOO=1"], is_bazel=False)]))
-    b = CanonicalModel()
+                 actions=[tu_from_raw("crypto/fips/b.cpp", ["-DFOO=1"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("crypto_internal", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=True),
+                 actions=[tu_from_raw("crypto/a.cpp", ["-DFOO=1"], is_bazel=True),
                       tu_from_raw("crypto/fips/b.cpp", ["-DFOO=1"], is_bazel=True)]))
     assert summarize(diff_models(a, b))["converged"]
 
@@ -193,8 +208,8 @@ def test_ignore_flags_and_defines_suppress_diffs():
     cmake_raw = ["-DFOO=1", "-DBORINGSSL_DISPATCH_TEST", "-Wall",
                  "-Wctad-maybe-unsupported"]
     bazel_raw = ["-DFOO=1", "-Wall"]
-    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True))
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
 
     assert not summarize(diff_models(a, b))["converged"]  # un-suppressed: errors
 
@@ -208,32 +223,31 @@ def test_ignore_flags_and_defines_suppress_diffs():
 def test_ignore_flag_prefixes():
     a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1", "-Wthread-safety-analysis"],
                            is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True))
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True), is_bazel=True)
     cfg = MigrationConfig(ignore_flag_prefixes=("-Wthread-safety",))
     assert summarize(diff_models(a, b, cfg))["converged"]
 
 
 def test_executables_still_aligned_by_identity():
     # executables are the link deliverables: a missing exe IS a real gap.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("bssl", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("tool/m.cpp", ["-DFOO=1"], is_bazel=False)]))
-    b = CanonicalModel()
+                 actions=[tu_from_raw("tool/m.cpp", ["-DFOO=1"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
     discs = diff_models(a, b)
     assert any(d.kind == "missing_target" for d in discs)
 
 
 def _exe(name, link_raw, is_bazel, src="tool/m.cpp"):
-    t = Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
-               tus=[tu_from_raw(src, ["-DFOO=1"], is_bazel=is_bazel)])
-    t.link_flags = canonicalize_link_flags(link_raw, is_bazel=is_bazel)
-    return t
+    return Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                  actions=[tu_from_raw(src, ["-DFOO=1"], is_bazel=is_bazel),
+                           _link(link_raw)])
 
 
 def test_missing_link_flag_is_caught():
     # A CMake link flag absent on the bazel side is a link_flags_diff error.
-    a = CanonicalModel(); a.add(_exe("app", ["-pthread", "-rdynamic"], False))
-    b = CanonicalModel(); b.add(_exe("app", ["-pthread"], True))
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-pthread", "-rdynamic"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-pthread"], True))
     discs = diff_models(a, b)
     lf = [d for d in discs if d.kind == "link_flags_diff"]
     assert lf and lf[0].target == "app"
@@ -242,16 +256,16 @@ def test_missing_link_flag_is_caught():
 
 def test_extra_bazel_link_flag_tolerated():
     # Asymmetric: an extra link flag only on the bazel side must NOT fail.
-    a = CanonicalModel(); a.add(_exe("app", ["-pthread"], False))
-    b = CanonicalModel(); b.add(_exe("app", ["-pthread", "-Wl,--gc-sections"], True))
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-pthread"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-pthread", "-Wl,--gc-sections"], True))
     assert summarize(diff_models(a, b))["converged"]
 
 
 def test_link_toolchain_noise_stripped():
     # Bazel link noise (macOS/objc/sysroot mechanics + -o/output) must not show
     # up as a diff against a clean CMake link line.
-    a = CanonicalModel(); a.add(_exe("app", ["-pthread"], False))
-    b = CanonicalModel(); b.add(_exe("app", [
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-pthread"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", [
         "external/.../cc_wrapper.sh", "-o", "bazel-out/bin/app",
         "bazel-out/bin/_objs/app/m.o", "bazel-out/bin/libfoo.a",
         "-pthread", "-Wl,-oso_prefix,.", "-headerpad_max_install_names",
@@ -261,8 +275,8 @@ def test_link_toolchain_noise_stripped():
 
 
 def test_ignore_link_flags_suppresses():
-    a = CanonicalModel(); a.add(_exe("app", ["-fvisibility=hidden", "-pthread"], False))
-    b = CanonicalModel(); b.add(_exe("app", ["-pthread"], True))
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-fvisibility=hidden", "-pthread"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-pthread"], True))
     assert not summarize(diff_models(a, b))["converged"]
     cfg = MigrationConfig(ignore_link_flags={"-fvisibility=hidden"})
     assert summarize(diff_models(a, b, cfg))["converged"]
@@ -274,7 +288,7 @@ def test_ignore_include_prefixes():
     a = _model(tu_from_raw(
         "src/a.cpp", ["-DFOO=1", "-I", "/work/proj/third_party/gtest/include"],
         is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True))
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True), is_bazel=True)
 
     assert not summarize(diff_models(a, b))["converged"]  # un-suppressed
 
@@ -304,7 +318,7 @@ def test_include_map_still_catches_a_missing_include():
     a = _model(tu_from_raw(
         "src/a.cpp", ["-DFOO=1", "-I", "/work/proj/absl-install/include"],
         is_bazel=False))
-    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True))  # no absl
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True), is_bazel=True)  # no absl
     cfg = MigrationConfig(include_map=(("absl-install/include", "@absl"),))
     discs = diff_models(a, b, cfg)
     assert any(d.kind == "includes_diff" for d in discs), \
@@ -332,15 +346,15 @@ def test_exclude_targets_suppresses_structural_diffs():
     # A whole target present only in cmake (e.g. vendored third-party) produces
     # missing_tu/missing_target unless excluded. exclude_targets is the only
     # lever for that (ignore only covers flags/defines/includes).
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
     a.add(Target("benchmark", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("third_party/benchmark/b.cpp", ["-DFOO=1"],
+                 actions=[tu_from_raw("third_party/benchmark/b.cpp", ["-DFOO=1"],
                                   is_bazel=False)]))
-    b = CanonicalModel()
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
 
     # without exclusion: benchmark's TU is a missing_tu error
     assert not summarize(diff_models(a, b))["converged"]
@@ -397,13 +411,13 @@ def _test_models(cmake_test_srcs, bazel_test_srcs, n_cmake_bins=1, n_bazel_bins=
     """Build a/b models with a shared production lib plus test targets carrying
     the given sources, split across n_*_bins test executables."""
     def build(srcs, nbins, is_bazel):
-        m = CanonicalModel()
+        m = _bs(CanonicalModel(), is_bazel=False)
         m.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                     tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=is_bazel)]))
+                     actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=is_bazel)]))
         for i in range(nbins):
             chunk = srcs[i::nbins]
             m.add(Target(f"test{i}", TargetKind.EXECUTABLE, role=TargetRole.TEST,
-                         tus=[tu_from_raw(s, ["-DFOO=1"], is_bazel=is_bazel) for s in chunk]))
+                         actions=[tu_from_raw(s, ["-DFOO=1"], is_bazel=is_bazel) for s in chunk]))
         return m
     return (build(cmake_test_srcs, n_cmake_bins, False),
             build(bazel_test_srcs, n_bazel_bins, True))
@@ -430,17 +444,17 @@ def test_cross_role_source_not_falsely_missing():
     # A source that is a TEST TU on the cmake side but a (testonly) LIBRARY TU
     # on the bazel side must NOT be reported missing -- it's compiled on both,
     # just grouped under different roles (abseil per_thread_sem_test pattern).
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
     a.add(Target("sem_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
-                 tus=[tu_from_raw("t/sem_test.cc", ["-DFOO=1"], is_bazel=False)]))
-    b = CanonicalModel()
+                 actions=[tu_from_raw("t/sem_test.cc", ["-DFOO=1"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
     # bazel compiles the test source into a testonly LIBRARY, not a test exe
     b.add(Target("sem_test_common", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("t/sem_test.cc", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("t/sem_test.cc", ["-DFOO=1"], is_bazel=True)]))
     cfg = MigrationConfig(include_tests=True)
     discs = diff_models(a, b, cfg)
     assert not any(d.tu == "t/sem_test.cc" for d in discs), \
@@ -453,7 +467,7 @@ def test_source_compiled_nowhere_still_caught():
     a, b = _test_models(["t/only_in_cmake_test.cc"], [])
     # give bazel a production lib so the models aren't trivially empty
     b.add(Target("extra", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/z.cpp", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("src/z.cpp", ["-DFOO=1"], is_bazel=True)]))
     cfg = MigrationConfig(include_tests=True)
     discs = diff_models(a, b, cfg)
     assert any(d.kind == "missing_test_tu" and d.tu == "t/only_in_cmake_test.cc"
@@ -482,13 +496,13 @@ def test_test_binary_count_mismatch_is_warned():
 def test_nonparticipating_roles_are_excluded_not_diffed():
     # A dashboard target present only in cmake must NOT create a missing_target
     # discrepancy; it must appear in the excluded summary instead.
-    a = CanonicalModel()
+    a = _bs(CanonicalModel(), is_bazel=False)
     a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False)]))
     a.add(Target("Nightly", TargetKind.UNKNOWN, role=TargetRole.DASHBOARD))
-    b = CanonicalModel()
+    b = _bs(CanonicalModel(), is_bazel=True)
     b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
-                 tus=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+                 actions=[tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True)]))
     discs = diff_models(a, b)
     res = summarize(discs, a, b)
     assert res["converged"], res

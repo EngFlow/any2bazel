@@ -21,8 +21,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import extract_bazel
 import extract_cmake
 from diff import diff_models, summarize
+from reconstruct import reconstruct
 
 REPO = "/work/proj"
+
+
+def _view(model, name):
+    """Reconstruct a target into its comparison view (TUs/link_flags/deps).
+    Extractors now emit raw actions; the differ reconstructs -- tests assert on
+    the reconstructed view, the same shape the diff compares."""
+    return reconstruct(model)[name]
 
 # ---- CMake File API codemodel reply (minimal but real-shaped) ----------------
 CODEMODEL = {
@@ -121,7 +129,7 @@ def test_cmake_extracts_canonical_flags():
     with tempfile.TemporaryDirectory() as root:
         build = _write_cmake_fixture(root)
         a = extract_cmake.extract(build, REPO)
-        tu = a.targets["mylib"].tus[0]
+        tu = _view(a, "mylib").tus[0]
         assert tu.source == "src/a.cpp"
         assert "FOO=1" in tu.defines
         assert "include" in tu.includes          # made repo-relative
@@ -134,7 +142,7 @@ def test_bazel_infers_kind_and_drops_defaults():
         with open(aq_path, "w") as f:
             json.dump(AQUERY, f)
         b = extract_bazel.extract(aq_path, REPO)
-        tu = b.targets[":mylib"].tus[0]   # full-label key
+        tu = _view(b, ":mylib").tus[0]   # full-label key
         # toolchain defaults must be gone after canonicalization
         assert not any("random-seed" in fl for fl in tu.flags)
         assert "-fno-canonical-system-headers" not in tu.flags
@@ -163,7 +171,8 @@ def test_header_processing_actions_are_not_tus():
         with open(aq_path, "w") as f:
             json.dump(aquery, f)
         b = extract_bazel.extract(aq_path, REPO)
-        srcs = [tu.source for t in b.targets.values() for tu in t.tus]
+        views = reconstruct(b)
+        srcs = [tu.source for v in views.values() for tu in v.tus]
         assert "re2/re2.cc" in srcs, srcs           # real TU kept
         assert not any(s.endswith(".h") for s in srcs), srcs  # header dropped
 
@@ -191,7 +200,7 @@ def test_bazel_extracts_link_flags_from_cpplink():
         with open(aq_path, "w") as f:
             json.dump(aquery, f)
         b = extract_bazel.extract(aq_path, REPO)
-        t = b.targets[":app"]
+        t = _view(b, ":app")
         assert t.kind.value == "executable"
         assert "-pthread" in t.link_flags
         assert "-Wl,--gc-sections" in t.link_flags
@@ -228,7 +237,7 @@ def test_bazel_external_archive_is_external_dep():
         with open(aq_path, "w") as f:
             json.dump(aquery, f)
         b = extract_bazel.extract(aq_path, REPO)
-        deps = {d.name: d.external for d in b.targets[":app"].deps}
+        deps = {d.name: d.external for d in _view(b, ":app").deps}
         assert deps.get("catch2_main") is True, deps   # external archive captured
         assert deps.get("mylib") is False, deps         # internal archive captured
 

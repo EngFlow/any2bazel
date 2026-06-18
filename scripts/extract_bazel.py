@@ -14,7 +14,9 @@ The jsonproto shape (ActionGraphContainer):
     { "artifacts": [{id, pathFragmentId}], "actions": [{mnemonic, arguments[],
       targetId, outputIds[]}], "targets": [{id, label}], "pathFragments": [...] }
 We reconstruct artifact paths from pathFragments, map actions -> targets, and
-canonicalize each CppCompile's argv into a TranslationUnit.
+store each action's RAW ARGV as an Action. Interpretation (argv -> TUs / link
+flags / inferred deps) is the differ's job (reconstruct.py); the extractor only
+records the faithful action graph plus the kind/role annotations it can resolve.
 """
 
 from __future__ import annotations
@@ -24,9 +26,8 @@ import os
 import sys
 from typing import Dict, List, Optional
 
-from canonicalize import canonicalize_flags, canonicalize_link_flags
-from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TargetRole, TranslationUnit)
+from model import (Action, BuildSystem, CanonicalModel, Target, TargetKind,
+                   TargetRole)
 from serialize import dump_model
 
 _COMPILE = {"CppCompile"}
@@ -46,31 +47,6 @@ def _kind_from_link(mnemonic: str, path: str) -> TargetKind:
             or path.endswith(".dll")):
         return TargetKind.SHARED
     return TargetKind.EXECUTABLE
-
-
-_ARCHIVE_EXTS = (".a", ".lo", ".lib")
-
-
-def _archive_identity(arg):
-    """Abstract dep name for an archive FILE link input, or None if `arg` isn't
-    one (it's a flag, object, or the output). Mirrors the CMake side's
-    _library_identity: 'libcatch2_main.a' -> 'catch2_main'. Cross-build name
-    differences (vs CMake's 'Catch2Main') are aligned by an explicit dep_map
-    config entry at diff time, not a fuzzy match."""
-    if arg.startswith("-") or not arg.endswith(_ARCHIVE_EXTS):
-        return None
-    base = os.path.basename(arg)
-    stem = base.split(".")[0]
-    if stem.startswith("lib"):
-        stem = stem[3:]
-    return stem or None
-
-
-def _is_external_path(arg):
-    """True if an archive path is an external/third-party dependency (a bzlmod
-    module) rather than an in-project library. Bazel puts external repos under
-    'external/<repo>' (and a 'bazel-out/.../bin/external/<repo>' mirror)."""
-    return "external/" in arg
 
 
 def _build_path_index(container: dict) -> Dict[int, str]:
@@ -99,36 +75,6 @@ def _label_index(container: dict) -> Dict[int, str]:
     return {t["id"]: t["label"] for t in container.get("targets", [])}
 
 
-_HEADER_EXTS = (".h", ".hpp", ".hh", ".hxx", ".inc", ".inl")
-
-
-def _is_header_processing(args: List[str]) -> bool:
-    """True for Bazel header self-containment actions (the parse_headers /
-    layering_check features), which compile a HEADER standalone to verify it's
-    self-contained. They carry '-xc++-header' and emit a '.processed' output,
-    not an object file. CMake has no equivalent, so counting them as TUs would
-    show every header as a spurious extra_tu. Skip them."""
-    return "-xc++-header" in args or "-fsyntax-only" in args
-
-
-def _source_from_compile_args(args: List[str]) -> Optional[str]:
-    """The compiled source is the argument to -c (or the lone source arg).
-    Returns None for header inputs -- those are not translation units."""
-    src = None
-    for i, a in enumerate(args):
-        if a == "-c" and i + 1 < len(args):
-            src = args[i + 1]
-            break
-    if src is None:
-        for a in args:
-            if a.endswith((".cc", ".cpp", ".cxx", ".c", ".C")):
-                src = a
-                break
-    if src is None or src.endswith(_HEADER_EXTS):
-        return None
-    return src
-
-
 def _label_to_name(label: str) -> str:
     """Full-label-derived name, e.g. //absl/log:flags -> 'absl/log:flags'.
 
@@ -141,6 +87,22 @@ def _label_to_name(label: str) -> str:
     return label[2:] if label.startswith("//") else label
 
 
+_HEADER_PROCESSING_MARKERS = ("-xc++-header", "-fsyntax-only")
+_REAL_SOURCE_EXTS = (".cc", ".cpp", ".cxx", ".c", ".C")
+
+
+def _is_real_compile(args) -> bool:
+    """A compile action that produces an object from a real source (not a Bazel
+    header self-containment check). Used only for ROLE classification here; the
+    differ re-derives the same judgment when reconstructing TUs."""
+    if any(m in args for m in _HEADER_PROCESSING_MARKERS):
+        return False
+    for i, a in enumerate(args):
+        if a == "-c" and i + 1 < len(args) and args[i + 1].endswith(_REAL_SOURCE_EXTS):
+            return True
+    return any(a.endswith(_REAL_SOURCE_EXTS) for a in args)
+
+
 def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
     with open(aquery_path) as f:
         container = json.load(f)
@@ -148,8 +110,7 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
     artifacts = _build_path_index(container)
     labels = _label_index(container)
 
-    # group actions by target
-    model = CanonicalModel()
+    model = CanonicalModel(build_system=BuildSystem.BAZEL, repo_root=repo_root)
     by_target: Dict[str, Target] = {}
 
     def target_for(label_name: str, kind: TargetKind) -> Target:
@@ -159,49 +120,21 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
             by_target[label_name].kind = kind
         return by_target[label_name]
 
+    # Store raw actions; interpretation (TUs, flags, deps) is the differ's job.
     for action in container.get("actions", []):
         mnem = action.get("mnemonic", "")
-        label = labels.get(action.get("targetId"), "")
-        name = _label_to_name(label)
-        args = action.get("arguments", [])
+        name = _label_to_name(labels.get(action.get("targetId"), ""))
+        args = tuple(action.get("arguments", []))
+        outs = tuple(artifacts.get(o, "") for o in action.get("outputIds", []))
 
         if mnem in _COMPILE:
-            if _is_header_processing(args):
-                continue   # header self-containment check, not a real TU
-            src = _source_from_compile_args(args)
-            if not src:
-                continue
-            cdef, cinc, cfl = canonicalize_flags(args, repo_root, is_bazel=True)
             t = target_for(name, TargetKind.UNKNOWN)
-            t.tus.append(TranslationUnit(
-                source=_rel(src, repo_root), defines=cdef,
-                includes=cinc, flags=cfl))
-
         elif mnem in _LINK:
-            outs = [artifacts.get(o, "") for o in action.get("outputIds", [])]
             primary = outs[0] if outs else ""
             t = target_for(name, _kind_from_link(mnem, primary))
-            # Link deps come in two argv shapes:
-            #   1. -l<name>  -> system lib (external)
-            #   2. an archive FILE input (libfoo.a / .lo) -- Bazel links its deps
-            #      by path, not -l. Archives under external/ (or bazel-out's
-            #      external/ mirror) are external deps (bzlmod modules, e.g.
-            #      catch2); archives elsewhere are internal in-project libs that
-            #      the TU-set union already covers, so they're recorded internal
-            #      and ignored by the external-dep check.
-            for a in args:
-                if a.startswith("-l"):
-                    dep = a[2:]
-                    if dep and not any(d.name == dep for d in t.deps):
-                        t.deps.append(Dependency(dep, external=True))
-                    continue
-                ident = _archive_identity(a)
-                if ident and not any(d.name == ident for d in t.deps):
-                    t.deps.append(Dependency(ident, external=_is_external_path(a)))
-            # link FLAGS (everything that isn't an input/dep/driver-mechanic).
-            # CppArchive (static lib) has no meaningful link flags; only CppLink.
-            if mnem == "CppLink":
-                t.link_flags = canonicalize_link_flags(args, is_bazel=True)
+        else:
+            continue
+        t.actions.append(Action(mnemonic=mnem, arguments=args, outputs=outs))
 
     for t in by_target.values():
         t.role = _classify_bazel(t)
@@ -210,24 +143,17 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
 
 
 def _classify_bazel(t: Target) -> TargetRole:
-    """Infer role on the Bazel side from kind + name conventions. aquery has no
-    UTILITY/dashboard concept, so roles here are PRODUCTION/TEST/AGGREGATE."""
-    if not t.tus and t.kind != TargetKind.INTERFACE:
+    """Infer role from kind + name + presence of real compile actions. aquery
+    has no UTILITY/dashboard concept, so roles here are PRODUCTION/TEST/AGGREGATE.
+    A target with no real compile action (only links other libs) is AGGREGATE."""
+    has_compile = any(a.mnemonic in _COMPILE and _is_real_compile(a.arguments)
+                      for a in t.actions)
+    if not has_compile and t.kind != TargetKind.INTERFACE:
         return TargetRole.AGGREGATE
-    if t.kind == TargetKind.EXECUTABLE and (
-            t.name.endswith(("_test", "_tests", "_shim"))):
+    if t.kind == TargetKind.EXECUTABLE and \
+            t.name.endswith(("_test", "_tests", "_shim")):
         return TargetRole.TEST
     return TargetRole.PRODUCTION
-
-
-def _rel(path: str, repo_root: str) -> str:
-    # bazel paths are already workspace-relative-ish (bazel-out/..., or the
-    # source path); strip a leading repo_root if present, normalize separators.
-    p = path.replace(os.sep, "/")
-    rr = repo_root.replace(os.sep, "/").rstrip("/")
-    if p.startswith(rr + "/"):
-        p = p[len(rr) + 1:]
-    return p
 
 
 if __name__ == "__main__":

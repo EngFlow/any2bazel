@@ -26,10 +26,9 @@ import os
 import sys
 from typing import Dict, List, Optional
 
-from canonicalize import canonicalize_flags, canonicalize_link_flags
 from extract_configure import parse_configure_trace
-from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TargetRole, TranslationUnit)
+from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
+                   TargetKind, TargetRole)
 from serialize import dump_model
 
 # CMake target type string -> our TargetKind
@@ -131,37 +130,37 @@ def _parse_target(tobj: dict, repo_root: str) -> Target:
     kind = _KIND.get(tobj.get("type", ""), TargetKind.UNKNOWN)
     sources = [s["path"] for s in tobj.get("sources", [])]
 
-    tus: List[TranslationUnit] = []
+    # Synthesize one CppCompile Action per source: an argv the differ parses the
+    # same way it parses Bazel's. CMake has no real command line, so we build the
+    # canonical compiler view: [<flag fragments>, -D..., -I/-isystem ..., -c src].
+    actions: List[Action] = []
     for cg in tobj.get("compileGroups", []):
-        lang = cg.get("language", "CXX")
-        # reconstruct a raw flag list for the canonicalizer, mirroring how the
-        # compiler would see it: fragments + -D defines + -I includes
-        raw: List[str] = []
+        base: List[str] = []
         for frag in cg.get("compileCommandFragments", []):
-            raw.extend(_split_fragment(frag.get("fragment", "")))
+            base.extend(_split_fragment(frag.get("fragment", "")))
         for d in cg.get("defines", []):
-            raw.append("-D" + d["define"])
+            base.append("-D" + d["define"])
         for inc in cg.get("includes", []):
-            raw.append("-isystem" if inc.get("isSystem") else "-I")
-            raw.append(inc["path"])
-
-        cdef, cinc, cfl = canonicalize_flags(raw, repo_root, is_bazel=False)
+            base.append("-isystem" if inc.get("isSystem") else "-I")
+            base.append(inc["path"])
         for idx in cg.get("sourceIndexes", []):
-            src = _rel(sources[idx], repo_root)
-            tus.append(TranslationUnit(source=src, defines=cdef,
-                                       includes=cinc, flags=cfl, language=lang))
+            src = sources[idx]
+            argv = tuple(base + ["-c", src])
+            actions.append(Action(mnemonic="CppCompile", arguments=argv,
+                                  inputs=(src,)))
 
-    return Target(name=name, kind=kind, tus=tus, role=_classify(tobj))
+    return Target(name=name, kind=kind, actions=actions, role=_classify(tobj))
 
 
 def _attach_deps(target: Target, tobj: dict, id_to_name: Dict[str, str]) -> None:
+    """Deps are a RESOLVED annotation (CMake knows them structurally). Link flags
+    become the argv of a synthesized CppLink Action, parsed by the differ."""
     for dep in tobj.get("dependencies", []):
         dep_name = id_to_name.get(dep["id"])
         if dep_name:
             target.deps.append(Dependency(dep_name, external=False))
-    # link fragments of role "libraries" that are NOT internal targets are
-    # external deps (system libs / find_package results). Record them abstractly.
-    # Fragments of role "flags" are link flags (compared per-executable).
+    # link fragments: role "libraries" -> external deps (annotation); role
+    # "flags" -> a CppLink Action's argv (the differ canonicalizes them).
     link = tobj.get("link") or {}
     flag_tokens: List[str] = []
     for frag in link.get("commandFragments", []):
@@ -173,7 +172,9 @@ def _attach_deps(target: Target, tobj: dict, id_to_name: Dict[str, str]) -> None
                 target.deps.append(Dependency(ext, external=True))
         elif role == "flags":
             flag_tokens.extend(_split_fragment(fragment))
-    target.link_flags = canonicalize_link_flags(flag_tokens, is_bazel=False)
+    if flag_tokens:
+        target.actions.append(Action(mnemonic="CppLink",
+                                     arguments=tuple(flag_tokens)))
 
 
 def _library_identity(fragment: str) -> Optional[str]:
@@ -202,17 +203,6 @@ def _split_fragment(fragment: str) -> List[str]:
     return [tok for tok in fragment.strip().split() if tok]
 
 
-def _rel(path: str, repo_root: str) -> str:
-    if os.path.isabs(path):
-        try:
-            r = os.path.relpath(path, repo_root)
-            if not r.startswith(".."):
-                return r.replace(os.sep, "/")
-        except ValueError:
-            pass
-    return path.replace(os.sep, "/")
-
-
 def extract(build_dir: str, repo_root: str,
             trace_path: Optional[str] = None) -> CanonicalModel:
     """Build the canonical model from one CMake configuration's File API reply.
@@ -227,7 +217,7 @@ def extract(build_dir: str, repo_root: str,
     codemodel = _find_codemodel(reply_dir)
     id_to_name = _target_id_to_name(codemodel)
 
-    model = CanonicalModel()
+    model = CanonicalModel(build_system=BuildSystem.CMAKE, repo_root=repo_root)
     include_dirs = set()
     cfg = codemodel["configurations"][0]
     for tref in cfg["targets"]:

@@ -23,8 +23,8 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 from config import MigrationConfig
-from model import (CanonicalModel, Target, TargetKind, TargetRole,
-                   TranslationUnit)
+from model import (CanonicalModel, TargetKind, TargetRole, TranslationUnit)
+from reconstruct import TargetView, reconstruct
 
 
 class Severity(str, Enum):
@@ -122,7 +122,7 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
     return out
 
 
-def _diff_link_flags(name: str, ta: Target, tb: Target,
+def _diff_link_flags(name: str, ta: "TargetView", tb: "TargetView",
                      cfg: "MigrationConfig") -> List[Discrepancy]:
     """Asymmetric link-flag subset for one aligned executable/shared-lib: every
     CMake link flag must be present on the Bazel side; extra Bazel link flags
@@ -163,31 +163,29 @@ def _norm_includes(includes, cfg) -> tuple:
 PARTICIPATING_ROLES = {TargetRole.PRODUCTION}
 
 
-def _participating(model: CanonicalModel, cfg: "MigrationConfig") -> set:
-    return {n for n, t in model.targets.items()
+def _participating(views: Dict[str, TargetView], cfg: "MigrationConfig") -> set:
+    return {n for n, t in views.items()
             if t.role in PARTICIPATING_ROLES and not cfg.target_excluded(n)}
 
 
-def _apply_target_map(b: CanonicalModel, target_map: Dict[str, str]) -> CanonicalModel:
-    """Rename Bazel-side targets into the CMake namespace using a declared
-    map (cmake_name -> bazel_name), so targets that were intentionally renamed
-    during generation (e.g. crypto -> crypto_internal) align in the diff.
+def _apply_target_map(views: Dict[str, TargetView],
+                      target_map: Dict[str, str]) -> Dict[str, TargetView]:
+    """Rename Bazel-side target VIEWS into the CMake namespace using a declared
+    map (cmake_name -> bazel_name), so intentionally-renamed targets align.
 
-    The map is authored by whoever generates the BUILD files -- they KNOW the
-    rename, so it's an explicit input rather than a fuzzy-match guess here.
-    Returns a shallow-renamed copy; the original model is untouched.
+    The map is authored by whoever generates the BUILD files -- an explicit
+    input, not a fuzzy guess. Returns a re-keyed dict; deps (which reference
+    target names) are renamed too so link-closure comparison lines up.
     """
     if not target_map:
-        return b
+        return views
     from dataclasses import replace
     b2cmake = {bazel: cmake for cmake, bazel in target_map.items()}
-    renamed = CanonicalModel()
-    for name, t in b.targets.items():
+    renamed: Dict[str, TargetView] = {}
+    for name, t in views.items():
         t.name = b2cmake.get(name, name)
-        # deps reference target names too -- rename them into CMake's namespace
-        # so link-closure comparison lines up. (Dependency is frozen.)
         t.deps = [replace(d, name=b2cmake.get(d.name, d.name)) for d in t.deps]
-        renamed.targets[t.name] = t
+        renamed[t.name] = t
     return renamed
 
 
@@ -195,24 +193,18 @@ _LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
                   TargetKind.INTERFACE}
 
 
-def _union_tus(model: CanonicalModel, names) -> Dict[str, TranslationUnit]:
-    """Pool TUs of the given targets into one source-keyed map.
-
-    This is how libraries are compared at TU-SET level: regardless of how
-    sources are grouped into targets (and regardless of target renames or
-    object-library fold-ins), every source compiled on each side lands in one
-    flat map keyed by repo-relative path. If the same source appears in two
-    targets with conflicting flags we keep the first and flag it -- rare, and a
-    real smell worth surfacing.
-    """
+def _union_tus(views: Dict[str, TargetView], names) -> Dict[str, TranslationUnit]:
+    """Pool TUs of the given target views into one source-keyed map (the TU-SET
+    comparison): grouping/renames/fold-ins don't matter -- every compiled source
+    lands in one flat map keyed by repo-relative path."""
     out: Dict[str, TranslationUnit] = {}
     for n in names:
-        for tu in model.targets[n].tus:
+        for tu in views[n].tus:
             out.setdefault(tu.key(), tu)
     return out
 
 
-def _all_source_keys(model: CanonicalModel, cfg: "MigrationConfig") -> set:
+def _all_source_keys(views: Dict[str, TargetView], cfg: "MigrationConfig") -> set:
     """Every source key compiled ANYWHERE in the participating scope, ignoring
     role. Used as the presence reference so a source that's a library TU on one
     side and a test/exe TU on the other isn't falsely reported missing.
@@ -221,7 +213,7 @@ def _all_source_keys(model: CanonicalModel, cfg: "MigrationConfig") -> set:
     targets, plus test targets when cfg.include_tests. Config-excluded targets
     are omitted (they're intentionally out of scope)."""
     keys = set()
-    for name, t in model.targets.items():
+    for name, t in views.items():
         if cfg.target_excluded(name):
             continue
         in_scope = (t.role in PARTICIPATING_ROLES
@@ -238,15 +230,18 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     out: List[Discrepancy] = []
     if cfg is None:
         cfg = MigrationConfig()
-    b = _apply_target_map(b, cfg.target_map)
-    a_names = _participating(a, cfg)
-    b_names = _participating(b, cfg)
+    # Reconstruct raw actions into comparable views (TUs + link flags + deps),
+    # build-system-specific interpretation keyed on each model's tag.
+    a_views = reconstruct(a)
+    b_views = _apply_target_map(reconstruct(b), cfg.target_map)
+    a_names = _participating(a_views, cfg)
+    b_names = _participating(b_views, cfg)
 
     # Split production targets into libraries (compared as a TU-set union, so
     # grouping/naming is irrelevant) and executables (the real link
     # deliverables, compared by identity).
-    a_libs = {n for n in a_names if a.targets[n].kind in _LIBRARY_KINDS}
-    b_libs = {n for n in b_names if b.targets[n].kind in _LIBRARY_KINDS}
+    a_libs = {n for n in a_names if a_views[n].kind in _LIBRARY_KINDS}
+    b_libs = {n for n in b_names if b_views[n].kind in _LIBRARY_KINDS}
     a_exes = a_names - a_libs
     b_exes = b_names - b_libs
 
@@ -257,12 +252,12 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # Bazel compiling a test helper into a `testonly` cc_library while CMake
     # builds it straight into the test exe). Role grouping must not manufacture
     # a false missing/extra. Flag comparison still happens per-union below.
-    a_all = _all_source_keys(a, cfg)
-    b_all = _all_source_keys(b, cfg)
+    a_all = _all_source_keys(a_views, cfg)
+    b_all = _all_source_keys(b_views, cfg)
 
     # ---- libraries: project-wide TU-set comparison -------------------------
-    a_union = _union_tus(a, a_libs)
-    b_union = _union_tus(b, b_libs)
+    a_union = _union_tus(a_views, a_libs)
+    b_union = _union_tus(b_views, b_libs)
     for src in sorted(set(a_union) - b_all):
         out.append(Discrepancy(Kind.MISSING_TU.value, Severity.ERROR.value,
                                "<libraries>", "source compiled in cmake but not bazel", tu=src))
@@ -280,7 +275,7 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
         out.append(Discrepancy(Kind.EXTRA_TARGET.value, Severity.WARN.value,
                                name, "executable in bazel but not cmake"))
     for name in sorted(a_exes & b_exes):
-        ta, tb = a.targets[name], b.targets[name]
+        ta, tb = a_views[name], b_views[name]
         amap, bmap = ta.tu_map(), tb.tu_map()
         # Presence is judged against the whole other side (a_all/b_all), not just
         # this exe's own TUs: a source this exe compiles may live in a library on
@@ -310,8 +305,8 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # vs Bazel's 'catch2_main', or 'OpenSSL::SSL' vs 'ssl') is aligned by an
     # explicit, recorded cfg.dep_map entry -- not a fuzzy match -- so a residual
     # missing_dep is a genuinely-absent dep, not a naming artifact.
-    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a, a_names)}
-    b_ext = _external_deps(b, b_names)
+    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a_views, a_names)}
+    b_ext = _external_deps(b_views, b_names)
     for dep in sorted(a_ext - b_ext):
         out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,
                                "<external>", "external link dependency missing on bazel side",
@@ -319,11 +314,11 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
 
     # ---- tests (opt-in) ----------------------------------------------------
     if cfg.include_tests:
-        out.extend(_diff_tests(a, b, cfg, a_all, b_all))
+        out.extend(_diff_tests(a_views, b_views, cfg, a_all, b_all))
     return out
 
 
-def _diff_tests(a: CanonicalModel, b: CanonicalModel,
+def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
                 cfg: "MigrationConfig", a_all: set, b_all: set) -> List[Discrepancy]:
     """Apply the COMPILE-PARITY stage to TEST targets. Two checks:
 
@@ -347,14 +342,14 @@ def _diff_tests(a: CanonicalModel, b: CanonicalModel,
     Extending link consistency to per-test-binary is a natural future increment.
     """
     out: List[Discrepancy] = []
-    a_tests = {n for n, t in a.targets.items()
+    a_tests = {n for n, t in a_views.items()
                if t.role == TargetRole.TEST and not cfg.target_excluded(n)}
-    b_tests = {n for n, t in b.targets.items()
+    b_tests = {n for n, t in b_views.items()
                if t.role == TargetRole.TEST and not cfg.target_excluded(n)}
 
     # 1. test-source TU-set union
-    a_union = _union_tus(a, a_tests)
-    b_union = _union_tus(b, b_tests)
+    a_union = _union_tus(a_views, a_tests)
+    b_union = _union_tus(b_views, b_tests)
     for src in sorted(set(a_union) - b_all):
         out.append(Discrepancy(Kind.MISSING_TEST_TU.value, Severity.ERROR.value,
                                "<tests>", "test source compiled in cmake but not bazel", tu=src))
@@ -373,8 +368,8 @@ def _diff_tests(a: CanonicalModel, b: CanonicalModel,
     return out
 
 
-def _external_deps(model: CanonicalModel, names) -> set:
-    return {d.name for n in names for d in model.targets[n].deps if d.external}
+def _external_deps(views: Dict[str, TargetView], names) -> set:
+    return {d.name for n in names for d in views[n].deps if d.external}
 
 
 def excluded_summary(a: CanonicalModel, b: CanonicalModel,
@@ -392,7 +387,7 @@ def excluded_summary(a: CanonicalModel, b: CanonicalModel,
 
     def by_reason(model: CanonicalModel) -> dict:
         out: Dict[str, List[str]] = {}
-        for name, t in sorted(model.targets.items()):
+        for name, t in sorted(reconstruct(model).items()):
             if cfg.target_excluded(name):
                 out.setdefault("config_excluded", []).append(name)
             elif t.role not in participating:
