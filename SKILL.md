@@ -131,7 +131,7 @@ Fields:
   token and still verifies presence (several `from`s may map to one `to`; longest
   wins). `include_prefixes` just deletes the path (a blind spot) — use only when
   there's no counterpart to map to. Search **order** is not enforced (presence
-  only) — see `FUTURE-include-order-collision-check.md`.
+  only) — see `docs/FUTURE-include-order-collision-check.md`.
 
 The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
@@ -182,12 +182,21 @@ Inspect `CMakeLists.txt`. If you find custom commands, codegen, or
 `find_package` of non-system libs, surface them and confirm before proceeding.
 
 ### 2. Extract the CMake reference model
+Single CMake pass emits both the File API reply and a `--trace` (the latter is
+the only place `configure_file()` outputs are visible — they leave no node in
+the build graph). The optional 4th arg feeds the trace to the extractor, which
+records configure-time generated files in `configured_files`.
 ```bash
 mkdir -p <build>/.cmake/api/v1/query
 touch     <build>/.cmake/api/v1/query/codemodel-v2
-cmake -S <src> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   # + project flags
-python3 scripts/extract_cmake.py <build> <repo_root> model.cmake.json
+cmake -S <src> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    --trace-expand --trace-format=json-v1 2> <build>/trace.jsonl   # + project flags
+python3 scripts/extract_cmake.py <build> <repo_root> model.cmake.json <build>/trace.jsonl
 ```
+> Configure-time generated compile inputs (e.g. CMake's `configure_file` output
+> `zconf.h`) are recorded but **not yet diffed** — the Bazel-side extraction and
+> the content differ are TODO (see `docs/TODO-configure-time-generation.md`).
+> This is distinct from build-time codegen (genrules), which is also unmodeled.
 
 ### 3. Generate initial BUILD.bazel files  *(LLM step)*
 Read `model.cmake.json`. For each production target emit a `cc_library` /
@@ -312,7 +321,7 @@ per-iteration judgment goes into the generated `BUILD.bazel`/`MODULE.bazel` and
 
 ```bash
 python3 tests/test_engine.py && python3 tests/test_extractors.py \
-    && python3 tests/test_triage.py
+    && python3 tests/test_triage.py && python3 tests/test_configure.py
 ```
 
 Extractor tests run against fixtures that mirror the documented File API and

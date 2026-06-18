@@ -12,12 +12,20 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
-from model import (CanonicalModel, Dependency, Target, TargetKind,
-                   TargetRole, TranslationUnit)
+from model import (CanonicalModel, ConfiguredFile, Dependency, Target,
+                   TargetKind, TargetRole, TranslationUnit)
 
 
 def dump_model(m: CanonicalModel, path: str) -> None:
-    obj: Dict[str, Any] = {"targets": {}}
+    obj: Dict[str, Any] = {"targets": {}, "configured_files": {}}
+    for cname, c in m.configured_files.items():
+        obj["configured_files"][cname] = {
+            "name": c.name,
+            "output_path": c.output_path,
+            "template": c.template,
+            "options": list(c.options),
+            "is_compile_input": c.is_compile_input,
+        }
     for name, t in m.targets.items():
         obj["targets"][name] = {
             "kind": t.kind.value,
@@ -62,4 +70,12 @@ def load_model(path: str) -> CanonicalModel:
             ],
         )
         m.add(target)
+    for cname, c in obj.get("configured_files", {}).items():
+        m.add_configured_file(ConfiguredFile(
+            name=c["name"],
+            output_path=c["output_path"],
+            template=c.get("template"),
+            options=tuple(c.get("options", [])),
+            is_compile_input=c.get("is_compile_input", False),
+        ))
     return m

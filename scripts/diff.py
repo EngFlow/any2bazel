@@ -92,7 +92,7 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
     # that requires enumerating headers on disk (a collision check). Until that
     # verifier exists, enforcing order produced benign false positives (e.g.
     # boringssl: project `include` vs vendored gtest roots, disjoint headers,
-    # reordered). See FUTURE-include-order-collision-check.md.
+    # reordered). See docs/FUTURE-include-order-collision-check.md.
     a_inc = _norm_includes(a.includes, cfg)
     b_inc = _norm_includes(b.includes, cfg)
     missing = [i for i in a_inc if i not in set(b_inc)]

@@ -27,6 +27,7 @@ import sys
 from typing import Dict, List, Optional
 
 from canonicalize import canonicalize_flags, canonicalize_link_flags
+from extract_configure import parse_configure_trace
 from model import (CanonicalModel, Dependency, Target, TargetKind,
                    TargetRole, TranslationUnit)
 from serialize import dump_model
@@ -212,12 +213,22 @@ def _rel(path: str, repo_root: str) -> str:
     return path.replace(os.sep, "/")
 
 
-def extract(build_dir: str, repo_root: str) -> CanonicalModel:
+def extract(build_dir: str, repo_root: str,
+            trace_path: Optional[str] = None) -> CanonicalModel:
+    """Build the canonical model from one CMake configuration's File API reply.
+
+    If `trace_path` (a `cmake --trace-format=json-v1` stream from the SAME
+    configure) is given, configure-time generated files (configure_file outputs)
+    are also extracted and recorded in model.configured_files. Single pass: the
+    codemodel and the trace both come from one `cmake` invocation; nothing here
+    re-runs cmake.
+    """
     reply_dir = os.path.join(build_dir, ".cmake", "api", "v1", "reply")
     codemodel = _find_codemodel(reply_dir)
     id_to_name = _target_id_to_name(codemodel)
 
     model = CanonicalModel()
+    include_dirs = set()
     cfg = codemodel["configurations"][0]
     for tref in cfg["targets"]:
         with open(os.path.join(reply_dir, tref["jsonFile"])) as f:
@@ -225,12 +236,23 @@ def extract(build_dir: str, repo_root: str) -> CanonicalModel:
         target = _parse_target(tobj, repo_root)
         _attach_deps(target, tobj, id_to_name)
         model.add(target)
+        for cg in tobj.get("compileGroups", []):
+            for incd in cg.get("includes", []):
+                include_dirs.add(incd["path"])
+
+    if trace_path:
+        for cfile in parse_configure_trace(
+                trace_path, source_root=repo_root, build_root=build_dir,
+                include_dirs=include_dirs):
+            model.add_configured_file(cfile)
     return model
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        sys.exit("usage: extract_cmake.py <build_dir> <repo_root> <out.json>")
+    if len(sys.argv) not in (4, 5):
+        sys.exit("usage: extract_cmake.py <build_dir> <repo_root> <out.json> "
+                 "[trace.jsonl]")
     build_dir, repo_root, out = sys.argv[1], os.path.abspath(sys.argv[2]), sys.argv[3]
-    dump_model(extract(build_dir, repo_root), out)
+    trace = sys.argv[4] if len(sys.argv) == 5 else None
+    dump_model(extract(build_dir, repo_root, trace), out)
     print(f"wrote {out}")

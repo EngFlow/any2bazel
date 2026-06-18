@@ -76,6 +76,37 @@ class TranslationUnit:
         return self.source
 
 
+@dataclass(frozen=True)
+class ConfiguredFile:
+    """A CONFIGURE-TIME generated file: the output of CMake `configure_file()`,
+    which runs during `cmake` configure (string templating), leaving NO node in
+    the build/action graph. This is a DISTINCT concept from build-time
+    generation (add_custom_command outputs / codegen tools, which live in the
+    action graph and map to Bazel genrules). Do not merge the two: configure-time
+    generation maps to a Bazel repository/workspace rule (or expand_template),
+    runs once at workspace setup, and is recovered only from the cmake --trace
+    (Tier-2 intent), never from the codemodel.
+
+    Captured with BOTH the output and the generation inputs so the Bazel side can
+    reproduce it and equivalence can be proved by CONTENT (we store the output
+    PATH, not bytes -- read + compared at diff time):
+      name             canonical output name, relative to the build/gen root, so
+                       it lines up with the Bazel counterpart despite divergent
+                       absolute locations.
+      output_path      absolute on-disk output (read for content comparison).
+      template         the source .in/.cmakein the output was configured from.
+      options          configure_file options, e.g. ('@ONLY',).
+      is_compile_input True when the output lands on an include/compile path
+                       (so it affects compilation and must match by content);
+                       False for benign outputs (.pc, install .cmake, fixtures).
+    """
+    name: str
+    output_path: str
+    template: Optional[str] = None
+    options: Tuple[str, ...] = ()
+    is_compile_input: bool = False
+
+
 @dataclass
 class Target:
     name: str
@@ -101,6 +132,13 @@ class Target:
 class CanonicalModel:
     """The whole project, normalized. Source of truth for the diff."""
     targets: Dict[str, Target] = field(default_factory=dict)
+    # Project-wide CONFIGURE-TIME generated files (configure_file outputs),
+    # keyed by canonical name. A distinct concept from build-time/action-graph
+    # generation (not yet modeled). Compared across builds by CONTENT.
+    configured_files: Dict[str, "ConfiguredFile"] = field(default_factory=dict)
 
     def add(self, t: Target) -> None:
         self.targets[t.name] = t
+
+    def add_configured_file(self, c: "ConfiguredFile") -> None:
+        self.configured_files[c.name] = c

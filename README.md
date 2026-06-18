@@ -197,7 +197,7 @@ files as the durable record of migration decisions:
   **`include_prefixes`**, which merely deletes the path — a blind spot. If the
   dep's include is genuinely missing on the Bazel side, the map catches it;
   ignore does not. (Include search **order** is not currently enforced — see
-  `FUTURE-include-order-collision-check.md`.)
+  `docs/FUTURE-include-order-collision-check.md`.)
 
 Applied at **diff time** to **both sides**, so suppressions can be tuned and
 re-diffed without re-running cmake/bazel. Every entry is an explicit, auditable
@@ -238,7 +238,7 @@ of today's "done".
 - Custom commands / generated code (`configure_file`, protoc, `add_custom_command`)
 - Per-test-binary identity alignment (tests compare at TU-set level for now)
 - Include search **order** (presence only — see
-  `FUTURE-include-order-collision-check.md`)
+  `docs/FUTURE-include-order-collision-check.md`)
 - Packaging / install rules
 - Automatic external-dependency resolution (find_package → bzlmod /
   rules_foreign_cc). External deps surface as a discrepancy class; the model is
@@ -251,7 +251,8 @@ scripts/
   model.py          canonical model: targets, TUs, TargetRole, deps
   canonicalize.py   flag normalizer — hardcoded mechanics  ← core IP
   config.py         cmake2bazel.json loader — configurable judgment calls
-  extract_cmake.py  CMake File API codemodel → model.json (+ role classify)
+  extract_cmake.py     CMake File API codemodel → model.json (+ role classify)
+  extract_configure.py cmake --trace → configure_file outputs (configure-time gen)
   extract_bazel.py  bazel aquery jsonproto  → model.json (+ role classify)
   diff.py           role-filtered, TU-set parity diff → worklist + converged
   triage.py         groups diff.json into a systematic-cause worklist
@@ -260,6 +261,7 @@ tests/
   test_engine.py      diff/canonicalize/roles/config/TU-set behavior
   test_extractors.py  full pipeline on synthetic File-API + aquery fixtures
   test_triage.py      triage grouping/histogram/cap behavior
+  test_configure.py   configure_file trace extraction
 SKILL.md            Claude Code skill: the migrate-iterate procedure
 ```
 
@@ -296,6 +298,7 @@ Run as a skill, Claude drives step 2 and the triage/fix loop automatically.
 python3 tests/test_engine.py
 python3 tests/test_extractors.py
 python3 tests/test_triage.py
+python3 tests/test_configure.py
 ```
 
 The extractor tests run against fixtures under `tests/` that mirror the
