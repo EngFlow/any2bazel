@@ -32,6 +32,10 @@ from serialize import dump_model
 
 _COMPILE = {"CppCompile"}
 _LINK = {"CppLink", "CppArchive"}
+# Bazel Java compile. (Turbine = header/ijar compile, JavaSourceJar = packaging:
+# both Bazel-specific, not real compilations -- skipped, like C++ header
+# processing.) Mapped to the neutral 'JavaCompile' mnemonic the differ groups on.
+_JAVAC = {"Javac"}
 
 # Infer target kind from the link ACTION, not just the output extension.
 # Mnemonic is authoritative for archives: CppArchive always produces a static
@@ -132,6 +136,13 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
         elif mnem in _LINK:
             primary = outs[0] if outs else ""
             t = target_for(name, _kind_from_link(mnem, primary))
+        elif mnem in _JAVAC:
+            # a java_library produces a jar (an archive of classes) -> STATIC.
+            # Record under the neutral 'JavaCompile' mnemonic the differ groups on.
+            t = target_for(name, TargetKind.STATIC)
+            t.actions.append(Action(mnemonic="JavaCompile", arguments=args,
+                                    outputs=outs))
+            continue
         else:
             continue
         t.actions.append(Action(mnemonic=mnem, arguments=args, outputs=outs))
@@ -146,8 +157,10 @@ def _classify_bazel(t: Target) -> TargetRole:
     """Infer role from kind + name + presence of real compile actions. aquery
     has no UTILITY/dashboard concept, so roles here are PRODUCTION/TEST/AGGREGATE.
     A target with no real compile action (only links other libs) is AGGREGATE."""
-    has_compile = any(a.mnemonic in _COMPILE and _is_real_compile(a.arguments)
-                      for a in t.actions)
+    has_compile = any(
+        (a.mnemonic in _COMPILE and _is_real_compile(a.arguments))
+        or a.mnemonic == "JavaCompile"
+        for a in t.actions)
     if not has_compile and t.kind != TargetKind.INTERFACE:
         return TargetRole.AGGREGATE
     if t.kind == TargetKind.EXECUTABLE and \

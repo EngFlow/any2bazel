@@ -242,6 +242,41 @@ def test_bazel_external_archive_is_external_dep():
         assert deps.get("mylib") is False, deps         # internal archive captured
 
 
+def test_bazel_recovers_javac_as_javacompile():
+    # Bazel's Java compile mnemonic is 'Javac'; the extractor maps it to the
+    # neutral 'JavaCompile' so it reconstructs into a CompileGroup, same as
+    # Maven. Turbine (header/ijar) and JavaSourceJar (packaging) are skipped.
+    aquery = {
+        "artifacts": [{"id": 1, "pathFragmentId": 10}],
+        "pathFragments": [{"id": 10, "label": "libguava.jar", "parentId": 11},
+                          {"id": 11, "label": "bazel-out"}],
+        "targets": [{"id": 100, "label": "//guava:guava"}],
+        "actions": [
+            {"mnemonic": "Javac", "targetId": 100, "outputIds": [1],
+             "arguments": ["java", "-jar", "JavaBuilder.jar",
+                           "guava/src/com/x/A.java", "guava/src/com/x/B.java"]},
+            {"mnemonic": "Turbine", "targetId": 100, "outputIds": [],
+             "arguments": ["turbine", "guava/src/com/x/A.java"]},
+            {"mnemonic": "JavaSourceJar", "targetId": 100, "outputIds": [],
+             "arguments": ["zip", "src.jar"]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as root:
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(aquery, f)
+        b = extract_bazel.extract(aq_path, "/repo")
+        t = b.targets["guava:guava"]
+        # exactly one action, the Javac mapped to JavaCompile (Turbine/SourceJar
+        # dropped)
+        mnems = [a.mnemonic for a in t.actions]
+        assert mnems == ["JavaCompile"], mnems
+        v = _view(b, "guava:guava")
+        assert len(v.compile_groups) == 1
+        assert v.compile_groups[0].sources == ("guava/src/com/x/A.java",
+                                               "guava/src/com/x/B.java")
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -28,21 +28,40 @@ from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
 
 _COMPILE_MNEMONICS = {"CppCompile"}
 _LINK_MNEMONICS = {"CppLink", "CppArchive"}
+_JAVA_COMPILE_MNEMONICS = {"JavaCompile"}
 
 _HEADER_EXTS = (".h", ".hpp", ".hh", ".hxx", ".inc", ".inl")
 _SOURCE_EXTS = (".cc", ".cpp", ".cxx", ".c", ".C")
 _ARCHIVE_EXTS = (".a", ".lo", ".lib")
+_JAVA_EXT = ".java"
+
+
+@dataclass
+class CompileGroup:
+    """A whole-source-set compile unit (e.g. one javac invocation): N sources +
+    shared flags, compared as a unit. This is the Java analog of a C++ TU -- C++
+    compiles per-file (one TU each), Java compiles a source set at once, so its
+    comparable unit is the (sources, flags) group, not a per-file TU.
+
+    `key` identifies the group across builds (the output dir, made repo-relative)
+    so the same logical compile aligns. Flags are NOT yet canonicalized -- that
+    policy is deferred until a real Java-vs-Java diff shows what noise to strip.
+    """
+    key: str
+    sources: Tuple[str, ...] = ()      # sorted, repo-relative
+    flags: Tuple[str, ...] = ()        # the action's non-source argv (raw, for now)
 
 
 @dataclass
 class TargetView:
-    """Reconstructed, comparison-ready view of a Target: TUs + link flags + the
-    (resolved or inferred) external/internal dep set. diff.py operates on these,
-    not on raw actions."""
+    """Reconstructed, comparison-ready view of a Target: TUs (C/C++) and/or
+    CompileGroups (Java) + link flags + the (resolved or inferred) dep set.
+    diff.py operates on these, not on raw actions."""
     name: str
     kind: TargetKind
     role: object                       # TargetRole (avoid import churn)
     tus: List[TranslationUnit] = field(default_factory=list)
+    compile_groups: List[CompileGroup] = field(default_factory=list)
     link_flags: Tuple[str, ...] = ()
     deps: List[Dependency] = field(default_factory=list)
 
@@ -94,6 +113,26 @@ def _rel(path: str, repo_root: str) -> str:
     if rr and p.startswith(rr + "/"):
         p = p[len(rr) + 1:]
     return p
+
+
+def _java_compile_group(args, repo_root: str) -> "CompileGroup":
+    """Split a JavaCompile argv into (sources, flags) and key the group by its
+    output dir (`-d`). Sources are the .java args, made repo-relative + sorted;
+    flags are everything else (incl. -classpath/-sourcepath paths) kept RAW for
+    now -- Java flag canonicalization is deferred until a real diff needs it."""
+    sources, flags = [], []
+    out_key = ""
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a == "-d" and i + 1 < n:
+            out_key = _rel(args[i + 1], repo_root)
+            flags.append(a); flags.append(args[i + 1]); i += 2; continue
+        if a.endswith(_JAVA_EXT):
+            sources.append(_rel(a, repo_root)); i += 1; continue
+        flags.append(a); i += 1
+    return CompileGroup(key=out_key or "<javac>",
+                        sources=tuple(sorted(sources)), flags=tuple(flags))
 
 
 def _archive_identity(arg) -> Optional[str]:
@@ -159,6 +198,10 @@ def reconstruct_target(t: Target, build_system: BuildSystem,
             if act.mnemonic == "CppLink":
                 view.link_flags = canonicalize_link_flags(
                     list(act.arguments), is_bazel=is_bazel)
+        elif act.mnemonic in _JAVA_COMPILE_MNEMONICS:
+            # Java compiles a whole source set per action -> one CompileGroup.
+            view.compile_groups.append(
+                _java_compile_group(act.arguments, repo_root))
 
     # deps: trust the frontend's resolved annotation (CMake); else infer from
     # link argv (Bazel).

@@ -43,6 +43,9 @@ class Kind(str, Enum):
     FLAGS_DIFF = "flags_diff"
     LINK_FLAGS_DIFF = "link_flags_diff"   # executable/shared-lib link flags
     MISSING_DEP = "missing_dep"
+    # Java (CompileGroup) source-set comparison:
+    MISSING_JAVA_SRC = "missing_java_src"  # .java compiled in A but not B
+    EXTRA_JAVA_SRC = "extra_java_src"      # .java compiled in B but not A
     # test-specific (only emitted when cfg.include_tests):
     MISSING_TEST_TU = "missing_test_tu"     # test source compiled in cmake, not bazel
     EXTRA_TEST_TU = "extra_test_tu"         # test source compiled in bazel, not cmake
@@ -204,6 +207,37 @@ def _union_tus(views: Dict[str, TargetView], names) -> Dict[str, TranslationUnit
     return out
 
 
+# Java source roots: a .java path is keyed by its PACKAGE-rooted form (the path
+# below the source root), which is invariant across build systems that disagree
+# on the repo prefix / source-root layout (Bazel 'guava/src/...' vs Maven
+# 'src/...' vs 'src/main/java/...'). We strip the longest matching root marker.
+_JAVA_SRC_ROOTS = ("src/main/java/", "src/test/java/", "javatests/", "java/", "src/")
+
+
+def _java_src_key(path: str) -> str:
+    """Package-rooted key for a .java source, robust to differing repo/source-root
+    prefixes. 'guava/src/com/x/A.java' and 'src/com/x/A.java' both -> 'com/x/A.java'.
+    Falls back to the basename if no known root marker is present."""
+    for root in _JAVA_SRC_ROOTS:
+        i = path.find(root)
+        if i != -1:
+            return path[i + len(root):]
+    return path
+
+
+def _union_java_sources(views: Dict[str, TargetView], names) -> Dict[str, str]:
+    """Pool every Java source across all compile groups of the given targets into
+    one map: package-rooted key -> original path. Mirrors _union_tus: grouping
+    (Maven's 2 groups vs Bazel's 1) is irrelevant; the SOURCE SET is what must
+    match. First occurrence wins for the displayed original path."""
+    out: Dict[str, str] = {}
+    for n in names:
+        for g in views[n].compile_groups:
+            for src in g.sources:
+                out.setdefault(_java_src_key(src), src)
+    return out
+
+
 def _all_source_keys(views: Dict[str, TargetView], cfg: "MigrationConfig") -> set:
     """Every source key compiled ANYWHERE in the participating scope, ignoring
     role. Used as the presence reference so a source that's a library TU on one
@@ -295,6 +329,26 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
         # flags tolerated (toolchain link noise already stripped). Reviewer
         # ignores applied to both sides.
         out.extend(_diff_link_flags(name, ta, tb, cfg))
+
+    # ---- Java: project-wide source-SET comparison --------------------------
+    # Java compiles a whole source set per action; how those sources are grouped
+    # into compile actions differs across builds (Maven 2 groups -- main +
+    # multi-release -- vs Bazel 1). So, exactly like C++ libraries, we pool every
+    # Java source across all groups into one set keyed by package-rooted path
+    # (robust to repo/source-root prefix differences) and compare the sets.
+    # NOTE: javac FLAG comparison is deferred (the Bazel side is a JavaBuilder
+    # wrapper argv whose real javac flags are nested -- needs canonicalization
+    # designed against this real data). Source-set parity is what's checked now.
+    a_java = _union_java_sources(a_views, a_names)
+    b_java = _union_java_sources(b_views, b_names)
+    for key in sorted(set(a_java) - set(b_java)):
+        out.append(Discrepancy(Kind.MISSING_JAVA_SRC.value, Severity.ERROR.value,
+                               "<java>", "java source compiled in A but not B",
+                               tu=a_java[key]))
+    for key in sorted(set(b_java) - set(a_java)):
+        out.append(Discrepancy(Kind.EXTRA_JAVA_SRC.value, Severity.WARN.value,
+                               "<java>", "java source compiled in B but not A",
+                               tu=b_java[key]))
 
     # ---- link closure: EXTERNAL deps only ----------------------------------
     # Internal (in-project) dep names are meaningless once libraries are
