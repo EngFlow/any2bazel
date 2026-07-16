@@ -64,4 +64,11 @@ if (OUT) {
 	// NOT wrap them here -- attempts to do so via Module._cache.exports
 	// replacement or Proxy don't reach ESM consumers in Node 24 (the CJS->ESM
 	// translator snapshots named bindings at first import).
+
+	// typescript.createLanguageService -- wrapped by loader.mjs (see above),
+	// which redirects `'typescript'` to typescript-shim.mjs. Same reasoning
+	// as esbuild: Module._cache.exports swapping and direct mutation BOTH
+	// fail in Node 24 (snapshot at synth + non-configurable getter-only
+	// properties), so the only path to a live wrapper is a shim with real
+	// ESM exports.
 }

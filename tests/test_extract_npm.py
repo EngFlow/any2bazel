@@ -57,6 +57,35 @@ def test_esbuild_bundle_action_captured():
         assert act.outputs == ("out/vs/workbench/workbench.desktop.main.js",)
 
 
+def test_bundle_target_name_uses_entry_point_not_first_output():
+    # vscode's workbench bundle includes ~20 static assets (svg, ttf, etc.) in
+    # its esbuild metafile alongside the entry-point .js. Sorted lexically the
+    # SVGs come first, so naming the target after outputs[0] used to label the
+    # whole bundle "media/apple-dark.svg". The entryPoints `out` field is what
+    # the build system was asked to produce -- use that.
+    entry_arg = (
+        '--entryPoints=[{"in":"/repo/out-build/vs/workbench/'
+        'workbench.desktop.main.js","out":"vs/workbench/workbench.desktop.main"}]'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, [
+            {"mnemonic": "EsbuildBundle",
+             "arguments": [entry_arg,
+                           "--outdir=/repo/out-build"],
+             "inputs": [],
+             "outputs": [
+                "/repo/out-build/media/apple-dark.svg",
+                "/repo/out-build/media/apple-light.svg",
+                "/repo/out-build/vs/workbench/workbench.desktop.main.js",
+             ]},
+        ])
+        m = extract_npm.extract(path, "/repo")
+        expected = "vs/workbench/workbench.desktop.main.js"
+        assert expected in m.targets, list(m.targets.keys())
+        # asset path must not have become its own target
+        assert "out-build/media/apple-dark.svg" not in m.targets
+
+
 def test_esbuild_transform_pools_into_one_synthetic_target():
     # The per-file transpile pass is N esbuild.transform calls. They group
     # under a single <transform> target -- the Java-compile-group analog --
@@ -111,6 +140,32 @@ def test_test_role_inferred_from_output_path():
         m = extract_npm.extract(path, "/repo")
         t = m.targets["out/vs/base/test/common/buffer.test.js"]
         assert t.role == TargetRole.TEST
+
+
+def test_tscompile_pools_into_one_synthetic_target():
+    # gulp-tsb's full TS compile fires getEmitOutput once per source file; the
+    # preload wraps it and emits a TsCompile per call. They aggregate under
+    # <tscompile> the same way EsbuildTransform calls aggregate under
+    # <transform>.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, [
+            {"mnemonic": "TsCompile",
+             "arguments": ["--target=99", "--module=99", "--outDir=out"],
+             "inputs": ["/repo/src/a.ts"],
+             "outputs": ["/repo/out/a.js", "/repo/out/a.d.ts"]},
+            {"mnemonic": "TsCompile",
+             "arguments": ["--target=99", "--module=99", "--outDir=out"],
+             "inputs": ["/repo/src/b.ts"],
+             "outputs": ["/repo/out/b.js", "/repo/out/b.d.ts"]},
+        ])
+        m = extract_npm.extract(path, "/repo")
+        assert "<tscompile>" in m.targets, list(m.targets.keys())
+        t = m.targets["<tscompile>"]
+        assert t.role == TargetRole.PRODUCTION
+        assert len(t.actions) == 2
+        # Paths still get normalized against repo_root.
+        assert t.actions[0].inputs == ("src/a.ts",)
+        assert t.actions[0].outputs == ("out/a.js", "out/a.d.ts")
 
 
 def test_paths_are_made_repo_relative():

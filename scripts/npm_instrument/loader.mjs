@@ -1,37 +1,49 @@
 // Node ESM loader hook. Registered by preload.mjs via module.register().
 //
-// We redirect `import * as esbuild from 'esbuild'` (and `import 'esbuild'`)
-// to esbuild-shim.mjs. The shim is real ESM that uses createRequire to load
-// the actual esbuild module and re-exports wrapped `build` / `transform`,
-// passing everything else through unchanged.
+// We redirect bare specifiers `'esbuild'` and `'typescript'` to ESM shims that
+// re-export wrapped methods. Each shim:
+//   - createRequire()s the real CJS module via the ?real= search param,
+//   - wraps the methods we want to capture (esbuild.build/transform,
+//     ts.createLanguageService),
+//   - exports the wrappers as live ESM bindings so importers see them.
 //
-// Why a redirect-to-ESM-shim instead of patching the CJS source:
+// Why a redirect-to-ESM-shim instead of patching the CJS source / module
+// cache:
 //   * Source-append doesn't compose with Node's CJS-of-ESM translator -- the
-//     wrapper code lands in a scope that can't see esbuild's module-level
-//     `var build` (ReferenceError).
-//   * module.exports replacement / Proxy don't propagate to ESM consumers
-//     because the CJS-to-ESM translator snapshots named bindings at the
-//     first import, not live.
+//     wrapper code lands in a scope that can't see the CJS module's
+//     module-level `var` (ReferenceError).
+//   * Mutating require.cache[id].exports doesn't reach ESM consumers in
+//     Node 24: the CJS-to-ESM translator snapshots the value once at
+//     synthesis time, not live (verified via createLanguageService.name
+//     check after a cache-swap proxy install).
+//   * Object.defineProperty / direct assignment to the real module fail
+//     because esbuild-style `__export(target, all)` defines non-configurable
+//     getter-only properties.
 //   * Genuine ESM exports from the shim ARE live-bound to the importer.
-//     `esbuild.transform` in user code reads the shim's export, which is OUR
-//     wrapper.
 
-const SHIM_URL = new URL('./esbuild-shim.mjs', import.meta.url).href;
-const ESBUILD_REAL_SUFFIX = '?esbuild-real=1';
+const ESBUILD_SHIM_URL = new URL('./esbuild-shim.mjs', import.meta.url).href;
+const TYPESCRIPT_SHIM_URL = new URL('./typescript-shim.mjs', import.meta.url).href;
+
+function isShimImporter(parentURL, shimURL) {
+	// The shim URL has a `?real=` query string; the importer URL Node passes
+	// includes the query string too, so startsWith(shimURL) matches both the
+	// bare shim and its query-decorated form.
+	return parentURL && (parentURL === shimURL || parentURL.startsWith(shimURL));
+}
 
 export async function resolve(specifier, context, nextResolve) {
-	// Only redirect the bare specifier, and skip if the importer is the shim
-	// itself (which loads the real module via a marked URL below).
-	if (specifier === 'esbuild' && !context.parentURL?.includes(ESBUILD_REAL_SUFFIX)) {
-		// Resolve the REAL esbuild path relative to the original importer, so
-		// monorepo-style installs (esbuild in build/node_modules but not at
-		// repo root) still find the right copy.
+	// esbuild: redirect bare specifier, skip if importer is the esbuild shim.
+	if (specifier === 'esbuild' && !isShimImporter(context.parentURL, ESBUILD_SHIM_URL)) {
 		const real = await nextResolve(specifier, context);
-		// Encode the real URL as a search param so the shim can read it
-		// without env vars or globals (and so different consumers can in
-		// principle resolve different esbuild copies, though we don't expect
-		// that here).
-		const url = `${SHIM_URL}?real=${encodeURIComponent(real.url)}`;
+		const url = `${ESBUILD_SHIM_URL}?real=${encodeURIComponent(real.url)}`;
+		return { url, format: 'module', shortCircuit: true };
+	}
+	// typescript: same pattern. Skipping when the importer is the typescript
+	// shim itself lets the shim's `export * from 'typescript'` reach the real
+	// module so namespace imports see the full ts surface.
+	if (specifier === 'typescript' && !isShimImporter(context.parentURL, TYPESCRIPT_SHIM_URL)) {
+		const real = await nextResolve(specifier, context);
+		const url = `${TYPESCRIPT_SHIM_URL}?real=${encodeURIComponent(real.url)}`;
 		return { url, format: 'module', shortCircuit: true };
 	}
 	return nextResolve(specifier, context);
