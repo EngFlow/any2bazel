@@ -116,4 +116,16 @@ export const initialize = real.initialize;
 export const stop = real.stop;
 export const version = real.version;
 
-export default real.default ?? real;
+// IMPORTANT: callers that use `import esbuild from 'esbuild'` (default import)
+// receive THIS object, and read `esbuild.transform` / `esbuild.build` off it.
+// If we just re-exported `real` here, those reads would bypass our wrappers
+// (gulp-tsb's transpiler.ts uses exactly this style). Proxy lets us intercept
+// the two methods we care about and pass everything else through.
+const wrappedDefault = new Proxy(real.default ?? real, {
+	get(target, key, recv) {
+		if (key === 'build') return build;
+		if (key === 'transform') return transform;
+		return Reflect.get(target, key, recv);
+	},
+});
+export default wrappedDefault;

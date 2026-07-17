@@ -37,7 +37,7 @@ from model import (Action, BuildSystem, CanonicalModel, Target, TargetKind,
 from serialize import dump_model
 
 
-_INTERESTING_MNEMONICS = ("EsbuildBundle", "EsbuildTransform", "Spawn")
+_INTERESTING_MNEMONICS = ("EsbuildBundle", "EsbuildTransform", "TsCompile", "Spawn")
 
 
 def _make_rel(repo_root: str):
@@ -77,15 +77,44 @@ def _classify_bundle_role(outputs: Iterable[str]) -> TargetRole:
 
 
 def _target_for_bundle(rec: dict) -> str:
-    outs = rec.get("outputs") or []
-    if outs:
-        # First output is stable across runs for a given entry point.
-        return outs[0]
+    """Pick a stable target name for an EsbuildBundle action.
+
+    Identity priority:
+      1. The entry point's `out` field from `--entryPoints=[{...}]`. This is
+         what the build system was *asked* to produce, so it's the most
+         meaningful identifier across build systems.
+      2. `--outfile=<...>`.
+      3. The first `.js`/`.mjs`/`.cjs` output. Esbuild's metafile also lists
+         copied static assets (svg, ttf, etc.); sorting them alphabetically
+         the entry-point .js can land after a `media/apple-dark.svg`, which
+         used to produce duplicate-asset target names.
+      4. The first output of any kind.
+    """
     args = rec.get("arguments") or []
-    # Fallback: the entryPoints field flattened into argv by preload.mjs.
     for a in args:
-        if a.startswith("--entryPoints=") or a.startswith("--outfile=") or a.startswith("--outdir="):
+        if a.startswith("--entryPoints="):
+            payload = a.split("=", 1)[1]
+            try:
+                entries = json.loads(payload)
+                if isinstance(entries, list) and entries:
+                    e = entries[0]
+                    if isinstance(e, dict) and "out" in e:
+                        # `out` is the basename without extension; entry-point
+                        # bundles are .js, so the canonical target name is
+                        # `<out>.js`.
+                        return str(e["out"]) + ".js"
+                    if isinstance(e, str):
+                        return e
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass
+        if a.startswith("--outfile="):
             return a.split("=", 1)[1]
+    outs = rec.get("outputs") or []
+    script_outs = [o for o in outs if o.endswith((".js", ".mjs", ".cjs"))]
+    if script_outs:
+        return script_outs[0]
+    if outs:
+        return outs[0]
     return "<esbuild>"
 
 
@@ -139,6 +168,12 @@ def extract(ndjson_path: str, repo_root: str) -> CanonicalModel:
                 _add_action(model, name, TargetKind.UNKNOWN, role, action)
             elif mnemonic == "EsbuildTransform":
                 _add_action(model, "<transform>",
+                            TargetKind.UNKNOWN, TargetRole.PRODUCTION, action)
+            elif mnemonic == "TsCompile":
+                # Mirror EsbuildTransform: one synthetic target pools all the
+                # per-file TS compiles (gulp-tsb processes ~7k files via one
+                # language service, same as the Java compile-group analog).
+                _add_action(model, "<tscompile>",
                             TargetKind.UNKNOWN, TargetRole.PRODUCTION, action)
             elif mnemonic == "Spawn":
                 name = _spawn_target(rec)

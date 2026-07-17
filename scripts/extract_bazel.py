@@ -36,6 +36,8 @@ _LINK = {"CppLink", "CppArchive"}
 # both Bazel-specific, not real compilations -- skipped, like C++ header
 # processing.) Mapped to the neutral 'JavaCompile' mnemonic the differ groups on.
 _JAVAC = {"Javac"}
+# Custom TS rule mnemonic emitted by cmake2bazel/bazel/rules/ts_program.bzl.
+_TSPROGRAM = {"TsProgram"}
 
 # Infer target kind from the link ACTION, not just the output extension.
 # Mnemonic is authoritative for archives: CppArchive always produces a static
@@ -107,12 +109,124 @@ def _is_real_compile(args) -> bool:
     return any(a.endswith(_REAL_SOURCE_EXTS) for a in args)
 
 
+def _build_depset_index(container: dict) -> Dict[int, List[int]]:
+    """Flatten each depSetOfFiles to a list of leaf artifact IDs.
+
+    Bazel aquery represents an action's input closure as a DAG of depSets
+    (`directArtifactIds` + `transitiveDepSetIds`). For TsProgram there's one
+    flat depSet, but we handle the general case so the extractor works for any
+    future custom rule that shares depSets via transitivity.
+    """
+    dsets = {d["id"]: d for d in container.get("depSetOfFiles", [])}
+    cache: Dict[int, List[int]] = {}
+
+    def flatten(did: int) -> List[int]:
+        if did in cache:
+            return cache[did]
+        d = dsets.get(did)
+        if d is None:
+            cache[did] = []
+            return []
+        out = list(d.get("directArtifactIds", []))
+        for tid in d.get("transitiveDepSetIds", []):
+            out.extend(flatten(tid))
+        cache[did] = out
+        return out
+
+    return {did: flatten(did) for did in dsets}
+
+
+def _out_dir_from_args(args) -> str:
+    """Recover the `--outDir <path>` value from a TsProgram action's argv.
+
+    We want a repo-relative outDir so per-file output paths align with the
+    npm side. Bazel's action passes `--outDir bazel-out/<config>/bin/out-build`;
+    we strip the bazel-out prefix to leave `out-build`, which is what the
+    npm build calls its equivalent directory.
+    """
+    it = iter(args)
+    for a in it:
+        if a == "--outDir":
+            v = next(it, "")
+            # bazel-out/k8-fastbuild/bin/out-build -> out-build
+            marker = "/bin/"
+            i = v.find(marker)
+            if i >= 0:
+                return v[i + len(marker):]
+            return v
+        if a.startswith("--outDir="):
+            v = a.split("=", 1)[1]
+            marker = "/bin/"
+            i = v.find(marker)
+            if i >= 0:
+                return v[i + len(marker):]
+            return v
+    return "out-build"
+
+
+def _ts_output_paths(src_relpath: str, out_dir: str) -> List[str]:
+    """Compute expected tsc outputs for a .ts source.
+
+    The npm side is instrumented per file (one TsCompile action per source).
+    Bazel runs tsc as ONE action producing an opaque output directory, so
+    aquery doesn't reveal per-file outputs. We derive them: `src/<rel>.ts`
+    with outDir `out-build` produces `out-build/<rel>.js` and
+    `out-build/<rel>.js.map`. This makes the two build systems' models
+    per-file diffable.
+    """
+    # src/tsconfig.json emits into outDir, stripping the tsconfig's own root
+    # ("src" here) from each source's path. The action passes --outDir=<out>.
+    rel = src_relpath
+    if rel.startswith("src/"):
+        rel = rel[len("src/"):]
+    if rel.endswith(".ts") and not rel.endswith(".d.ts"):
+        stem = rel[:-3]
+        return [f"{out_dir}/{stem}.js", f"{out_dir}/{stem}.js.map"]
+    return []
+
+
+def _extract_ts_program(action: dict, out_dir: str,
+                        artifacts: Dict[int, str],
+                        depsets: Dict[int, List[int]]) -> List[Action]:
+    """Split one TsProgram action into per-source TsCompile actions.
+
+    Mirrors the npm side's `<tscompile>` structure (per-file). Only .ts inputs
+    under src/ that emit .js are considered; type-only .d.ts inputs and
+    node_modules/type_deps inputs are filtered out.
+    """
+    input_ids: List[int] = []
+    for dsid in action.get("inputDepSetIds", []):
+        input_ids.extend(depsets.get(dsid, []))
+    seen = set()
+    actions: List[Action] = []
+    for aid in input_ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        path = artifacts.get(aid, "")
+        if not path.startswith("src/") or not path.endswith(".ts"):
+            continue
+        if path.endswith(".d.ts"):
+            continue
+        outs = _ts_output_paths(path, out_dir)
+        if not outs:
+            continue
+        actions.append(Action(
+            mnemonic="TsCompile",
+            arguments=(),
+            inputs=(path,),
+            outputs=tuple(outs),
+        ))
+    return actions
+
+
 def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
     with open(aquery_path) as f:
         container = json.load(f)
 
     artifacts = _build_path_index(container)
     labels = _label_index(container)
+    depsets = _build_depset_index(container)
 
     model = CanonicalModel(build_system=BuildSystem.BAZEL, repo_root=repo_root)
     by_target: Dict[str, Target] = {}
@@ -143,6 +257,18 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
             t.actions.append(Action(mnemonic="JavaCompile", arguments=args,
                                     outputs=outs))
             continue
+        elif mnem in _TSPROGRAM:
+            # tsc runs as ONE action in Bazel, so we derive per-file
+            # TsCompile actions from the input srcs and pool them under a
+            # `<tscompile>` target -- same name and structure the npm
+            # frontend uses (see extract_npm.py). That's what makes the
+            # two models diffable at per-source granularity.
+            out_dir = _out_dir_from_args(args)
+            per_file = _extract_ts_program(action, out_dir, artifacts, depsets)
+            t = target_for("<tscompile>", TargetKind.UNKNOWN)
+            t.role = TargetRole.PRODUCTION
+            t.actions.extend(per_file)
+            continue
         else:
             continue
         t.actions.append(Action(mnemonic=mnem, arguments=args, outputs=outs))
@@ -157,6 +283,11 @@ def _classify_bazel(t: Target) -> TargetRole:
     """Infer role from kind + name + presence of real compile actions. aquery
     has no UTILITY/dashboard concept, so roles here are PRODUCTION/TEST/AGGREGATE.
     A target with no real compile action (only links other libs) is AGGREGATE."""
+    # Skip auto-classification for synthetic targets whose role the extractor
+    # already set (e.g. <tscompile>). Overwriting them here would demote to
+    # AGGREGATE because TsCompile isn't in _COMPILE.
+    if t.role != TargetRole.UNKNOWN:
+        return t.role
     has_compile = any(
         (a.mnemonic in _COMPILE and _is_real_compile(a.arguments))
         or a.mnemonic == "JavaCompile"
