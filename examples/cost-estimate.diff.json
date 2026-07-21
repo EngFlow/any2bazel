@@ -1,0 +1,10 @@
+{
+  "converged": false,
+  "discrepancies": [
+    {"kind": "flags_diff", "severity": "error"},
+    {"kind": "missing_dep", "severity": "error"}
+  ],
+  "errors": 2,
+  "excluded": {},
+  "warnings": 0
+}

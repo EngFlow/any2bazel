@@ -198,6 +198,25 @@ python3 scripts/extract_cmake.py <build> <repo_root> model.cmake.json <build>/tr
 > the content differ are TODO (see `docs/TODO-configure-time-generation.md`).
 > This is distinct from build-time codegen (genrules), which is also unmodeled.
 
+### 2a. (Optional) Estimate migration cost
+Estimate scope immediately after the CMake extraction, then re-run with the
+diff once the first Bazel extraction exists. The estimate is a transparent
+engineering-effort range, not a vendor or LLM price quote.
+```bash
+python3 scripts/estimate_cost.py model.cmake.json --hourly-rate 180 \
+    > migration-estimate.initial.json
+```
+After step 5, tighten it with observed parity gaps:
+```bash
+python3 scripts/estimate_cost.py model.cmake.json --diff diff.json \
+    --hourly-rate 180 > migration-estimate.json
+```
+Its inputs and per-discrepancy weights are in the emitted JSON. Treat codegen,
+configure-time generation, and unknown roles as explicit scope risks. Calibrate
+the weights against completed migrations; do not present the result as a fixed
+bid. Keep LLM/API cost separate until token totals and a dated pricing snapshot
+are available.
+
 ### 3. Generate initial BUILD.bazel files  *(LLM step)*
 Read `model.cmake.json`. For each production target emit a `cc_library` /
 `cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Library
@@ -309,7 +328,10 @@ Once production parity is reached, opt into test diffing:
 Summarize: production targets reconciled, rounds taken, suppressions recorded in
 `cmake2bazel.json` (with rationale), excluded roles (dashboard/codegen) for
 human follow-up, and — if `include_tests` was on — test-source parity and any
-test-binary count gap.
+test-binary count gap. Include the final `migration-estimate.json`. For LLM/API
+cost, report the provider, model ID, region, token totals, retries, and the
+pricing snapshot separately; the repository cannot infer these from build
+artifacts.
 
 ## What you edit
 
@@ -321,7 +343,8 @@ per-iteration judgment goes into the generated `BUILD.bazel`/`MODULE.bazel` and
 
 ```bash
 python3 tests/test_engine.py && python3 tests/test_extractors.py \
-    && python3 tests/test_triage.py && python3 tests/test_configure.py
+    && python3 tests/test_triage.py && python3 tests/test_configure.py \
+    && python3 tests/test_estimate_cost.py
 ```
 
 Extractor tests run against fixtures that mirror the documented File API and
