@@ -32,6 +32,7 @@ class BuildSystem(str, Enum):
     CMAKE = "cmake"
     BAZEL = "bazel"
     MAVEN = "maven"
+    NPM = "npm"
     UNKNOWN = "unknown"
 
 
