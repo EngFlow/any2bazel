@@ -53,3 +53,16 @@
 - However, Maven uses a locally installed JDK (e.g., Jdk 25)
 - Maven dependencies: JSpecify, Error Prone Annotations, J2objc Annotations, Guava FailureAccess
 - Bazel build uses `rules_jvm_external`
+
+## Other Experiments
+
+### VSCode (Custom -> Bazel)
+
+- Source: https://github.com/microsoft/vscode
+- Generated BUILD files, see https://github.com/ulfjack/vscode/tree/vscode-with-bazel
+- Generated custom Bazel rules:
+  - `ts_program`
+  - `bundle_target_name`
+  - `esbuild_bundle`
+  - `vscode_app`
+  - `nodegyp_module`
