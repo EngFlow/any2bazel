@@ -1,4 +1,4 @@
-# cmake2bazel
+# any2bazel
 
 Migrate a C/C++ project from **CMake to Bazel** by generating `BUILD.bazel`
 files and then *iterating until Bazel's actual build actions match the CMake
@@ -9,6 +9,9 @@ each round is cheap and reproducible — an LLM does only the creative work
 This repo is packaged as a [Claude Code skill](#skill); see [`SKILL.md`](SKILL.md)
 for the agent-facing procedure. The Python core under `scripts/` is a plain
 library you can also run by hand.
+
+> **Developed for [Claude Code](https://claude.com/claude-code) using Opus 4.8.**
+> It may work with other agents, but this is untested.
 
 ## Installing the skill
 
