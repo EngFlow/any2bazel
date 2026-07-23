@@ -1,0 +1,19 @@
+{
+  "build_system": "cmake",
+  "configured_files": {},
+  "repo_root": "/example/project",
+  "targets": {
+    "app": {
+      "actions": [{"arguments": ["-c", "app/main.cc"], "inputs": [], "mnemonic": "CppCompile", "outputs": []}],
+      "deps": [{"external": true, "name": "fmt"}],
+      "kind": "executable",
+      "role": "production"
+    },
+    "core": {
+      "actions": [{"arguments": ["-c", "src/core.cc"], "inputs": [], "mnemonic": "CppCompile", "outputs": []}],
+      "deps": [],
+      "kind": "static_library",
+      "role": "production"
+    }
+  }
+}

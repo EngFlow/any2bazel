@@ -259,6 +259,7 @@ scripts/
   extract_bazel.py  bazel aquery jsonproto  → model.json (+ role classify)
   diff.py           role-filtered, TU-set parity diff → worklist + converged
   triage.py         groups diff.json into a systematic-cause worklist
+  estimate_cost.py  transparent engineering-effort range from model + diff
   serialize.py      model ↔ JSON (the contract between stages)
 tests/
   test_engine.py      diff/canonicalize/roles/config/TU-set behavior
@@ -291,9 +292,32 @@ python3 scripts/diff.py model.cmake.json model.bazel.json cmake2bazel.json > dif
 
 # 5. Triage — group the worklist by systematic cause before fixing.
 python3 scripts/triage.py diff.json
+
+# 6. Estimate — starts from CMake surface area; use the diff to revise it.
+python3 scripts/estimate_cost.py model.cmake.json --diff diff.json \
+    --hourly-rate 180 > migration-estimate.json
 ```
 
 Run as a skill, Claude drives step 2 and the triage/fix loop automatically.
+
+## Estimation
+
+`estimate_cost.py` is a deliberately visible engineering-effort heuristic. It
+reports a low/likely/high hour range, optional cost at a supplied hourly rate,
+and scope-risk flags. It does not invent an LLM price: record provider, model
+ID, region, token totals, retries, and a pricing snapshot separately.
+
+Once token totals and a dated pricing snapshot are known, add
+`--llm-input-tokens`, `--llm-output-tokens`, `--llm-input-per-million`, and
+`--llm-output-per-million` to report that API spend separately from engineering
+cost.
+
+An example that can run without CMake or Bazel is included:
+
+```bash
+python3 scripts/estimate_cost.py examples/cost-estimate.model.cmake.json \
+    --diff examples/cost-estimate.diff.json --hourly-rate 180
+```
 
 ## Tests
 
@@ -302,6 +326,7 @@ python3 tests/test_engine.py
 python3 tests/test_extractors.py
 python3 tests/test_triage.py
 python3 tests/test_configure.py
+python3 tests/test_estimate_cost.py
 ```
 
 The extractor tests run against fixtures under `tests/` that mirror the
