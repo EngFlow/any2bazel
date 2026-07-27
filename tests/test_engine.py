@@ -126,6 +126,41 @@ def test_missing_external_link_dep_is_error():
     assert any(d.kind == "missing_dep" and d.severity == "error" for d in discs)
 
 
+def test_external_dep_naming_an_in_project_target_is_not_missing():
+    # A dep flagged external=True whose name matches an in-project target is
+    # NOT truly external -- the CMake File-API surfaces cyclically-linked static
+    # libs as repeated link fragments (e.g. common<->core), so `common` shows up
+    # on core's link line as an "external" even though it's an in-project lib.
+    # Its sources are verified via the TU-set, so it must NOT be reported as a
+    # missing external dep even when the bazel side doesn't repeat the fragment.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("common", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("common/c.cpp", ["-DFOO=1"], is_bazel=False)]))
+    a.add(Target("core", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("core/a.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("common", external=True),
+                       Dependency("z", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("common", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("common/c.cpp", ["-DFOO=1"], is_bazel=True)]))
+    b.add(Target("core", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("core/a.cpp", ["-DFOO=1"], is_bazel=True)],
+                 deps=[Dependency("z", external=True)]))  # no repeated `common`
+    discs = diff_models(a, b)
+    # `common` must NOT be a missing external dep (it's an in-project target)...
+    assert not any(d.kind == "missing_dep" and "common" in (d.cmake_only or [])
+                   for d in discs), discs
+    # ...but a genuinely-absent external (drop `z` on bazel) still is.
+    b2 = _bs(CanonicalModel(), is_bazel=True)
+    b2.add(Target("common", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                  actions=[tu_from_raw("common/c.cpp", ["-DFOO=1"], is_bazel=True)]))
+    b2.add(Target("core", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                  actions=[tu_from_raw("core/a.cpp", ["-DFOO=1"], is_bazel=True)]))
+    discs2 = diff_models(a, b2)
+    assert any(d.kind == "missing_dep" and "z" in (d.cmake_only or [])
+               for d in discs2), discs2
+
+
 def test_external_dep_name_aligned_by_dep_map():
     # CMake records the archive basename ('Catch2Main'); Bazel the target/file
     # name ('catch2_main'). An explicit dep_map aligns them -> converges.
