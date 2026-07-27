@@ -26,7 +26,13 @@ GLOBAL_DEFINES = {
     "NDEBUG",
 }
 # System libs with no vcpkg .so (linked via linkopts on the final binary).
-SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan"}
+SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan", "pulse"}
+# Libs that export extern "C" FFI consumed by the prebuilt Rust archive and
+# also consume it back (a static-archive <-> static-archive cycle GNU ld can't
+# resolve in one pass). Whole-archive them so every FFI symbol is present
+# before the rust archive references it (matches the reference build linking
+# these as shared libs, where the cycle resolves at runtime).
+ALWAYSLINK_LIBS = {"LibUnicode", "LibWeb"}
 
 def global_flags():
     import re
@@ -131,6 +137,7 @@ def dep_label(d, targets, so, ar):
     nm = d["name"]
     if nm.startswith("lagom-"):
         tgt = lagom_to_target(nm, targets)
+        if tgt == "LibWeb": return "//Libraries/LibWeb:LibWeb"
         return "//:%s" % tgt if tgt else None
     if nm.endswith("_rust"):
         return [RUST_PKG + ":" + nm, "//Build/full/Libraries:rust_ffi_headers"]
@@ -140,15 +147,38 @@ def dep_label(d, targets, so, ar):
         return ("SYS", nm)  # linkopt on final binary
     return ("UNKNOWN", nm)
 
+def _emit_srcs(srcs):
+    print("    srcs = [")
+    for s in srcs:
+        if s.startswith("Build/full/Libraries/LibWeb/"):
+            lab = "//Libraries/LibWeb:" + s[len("Build/full/Libraries/LibWeb/"):]
+            print(f"        {lab!r},")
+        elif s.startswith("Build/full/Libraries/"):
+            lab = "//Build/full/Libraries:" + s[len("Build/full/Libraries/"):]
+            print(f"        {lab!r},")
+        elif s.startswith("Build/full/Services/"):
+            lab = "//Build/full/Services:" + s[len("Build/full/Services/"):]
+            print(f"        {lab!r},")
+        elif s.startswith("Build/full/UI/"):
+            lab = "//Build/full/UI:" + s[len("Build/full/UI/"):]
+            print(f"        {lab!r},")
+        else:
+            print(f"        {s!r},")
+    print("    ],")
+
+
 def main():
     targets = load()
     so, ar = vcpkg_available()
     libs = {n: t for n, t in targets.items() if t.get("role") == "production" and is_lib(t)}
+    exes = {n: t for n, t in targets.items()
+            if t.get("role") == "production" and t.get("kind") == "executable"}
     only = sys.argv[1:] if len(sys.argv) > 1 else sorted(libs)
     for name in only:
-        if name not in libs: 
-            print(f"# {name}: not a production lib", file=sys.stderr); continue
-        t = libs[name]
+        is_exe = name in exes
+        if name not in libs and not is_exe:
+            print(f"# {name}: not a production lib/exe", file=sys.stderr); continue
+        t = exes[name] if is_exe else libs[name]
         srcs = target_srcs(t)
         embeds = target_embed_inputs(t)
         defs = target_defines(t, name)
@@ -157,9 +187,10 @@ def main():
         deps, rustdeps, sysdeps, unknown = [], [], [], []
         for d in t.get("deps", []):
             if not d.get("external"):
-                if d["name"] in libs: deps.append("//:%s" % d["name"])
-                # non-lib internal deps (codegen targets, rust-build) are not
-                # Bazel deps: their outputs arrive via genrules / .a shims.
+                if d["name"] == "LibWeb": deps.append("//Libraries/LibWeb:LibWeb")
+                elif d["name"] in libs: deps.append("//:%s" % d["name"])
+                # exe deps on service static libs / other production libs
+                elif d["name"] in exes: pass  # exe->exe (spawn at runtime, not a link dep)
                 continue
             lab = dep_label(d, targets, so, ar)
             if lab is None: continue
@@ -169,20 +200,17 @@ def main():
                 (sysdeps if lab[0]=="SYS" else unknown).append(lab[1])
             else:
                 deps.append(lab)
+        rule = "cc_binary" if is_exe else "cc_library"
         print(f"# === {name} ({t['kind']}, {len(srcs)} TU) ===")
         if rustdeps: print(f"#   RUST deps (deferred): {rustdeps}")
         if unknown: print(f"#   UNKNOWN deps: {unknown}")
-        print("cc_library(")
+        print(f"{rule}(")
         print(f"    name = {name!r},")
-        print("    srcs = [")
-        for s in srcs:
-            if s.startswith("Build/full/Libraries/") and not s.startswith("Build/full/Libraries/LibWeb/"):
-                lab = "//Build/full/Libraries:" + s[len("Build/full/Libraries/"):]
-                print(f"        {lab!r},")
-            else:
-                print(f"        {s!r},")
-        print("    ],")
-        print(f'    hdrs = glob(["{lib_hdr_glob(name, srcs)}/**/*.h"], allow_empty = True),')
+        _emit_srcs(srcs)
+        if not is_exe:
+            print(f'    hdrs = glob(["{lib_hdr_glob(name, srcs)}/**/*.h"], allow_empty = True),')
+            if name in ALWAYSLINK_LIBS:
+                print("    alwayslink = True,")
         if defs:
             print("    local_defines = %r," % defs)
         if embeds:
@@ -195,6 +223,11 @@ def main():
                 copt_toks.append("-I" + i)
         if copt_toks:
             print("    copts = [%s]," % ", ".join("%r" % x for x in copt_toks))
+        # System libs (dl/pthread/vulkan/pulse) become linkopts. On a
+        # cc_library these PROPAGATE to the final binary's link (matches CMake,
+        # where the lib's INTERFACE/PRIVATE system deps flow to the executable).
+        if sysdeps:
+            print("    linkopts = [%s]," % ", ".join("%r" % ("-l"+l) for l in sorted(set(sysdeps))))
         deps.append("//:all_source_headers")
         alldeps = sorted(set(deps))
         if alldeps:

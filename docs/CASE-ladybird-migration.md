@@ -296,8 +296,62 @@ src/hdr lists from `generated_srcs.bzl`).
     Regression test: `test_bazel_shared_depset_dag_does_not_blow_up` (a wide
     shared-`mid` diamond that would explode under the old per-node expansion).
 
-Remaining: the services + `//:Ladybird`/WebContent, then the running-browser
-gate. Rust stays prebuilt-`.a` until Ring 2.
+### Services + renderer executables build, link, and RUN (DONE)
+
+The full renderer/service process set — `LibWebView`, `LibDevTools`, the five
+service static libs (`webcontentservice`/`requestserverservice`/
+`imagedecoderservice`/`compositorservice`/`webworkerservice`), and the five
+service **executables** (`WebContent`, `Compositor`, `WebWorker`,
+`RequestServer`, `ImageDecoder`) — all build and link under Bazel. Each
+executable is a real PIE ELF that runs (`--help` works). `WebContent` is the
+web renderer process; this is the headless browser's whole backend.
+
+The emitter now emits `cc_binary` for `role==production && kind==executable`
+targets (system libs → `linkopts`, exe→exe deps dropped as runtime-spawn, not
+link edges). Cross-package generated srcs are labeled to their owning package
+(`//Libraries/LibWeb:WebGL/GLFunctions.cpp`, `//Build/full/Services:…`).
+
+**Findings this surfaced (link-time — the payoff of actually linking binaries):**
+
+12. **Transitive `DT_NEEDED` of the prebuilt `.so` shims.** The vcpkg `cc_import`
+    shims are the top-level `.so` only; their own siblings (avif→libyuv,
+    cpptrace→libdwarf) aren't link inputs, so ld fails with undefined refs when
+    it can't follow `DT_NEEDED`. Fixed globally in `.bazelrc`:
+    `-LBuild/.../lib` + `-Wl,-rpath-link,…` (ld follows NEEDED at link),
+    `-Wl,--allow-shlib-undefined` (a shared lib's own deps resolve at *its*
+    load, not at this link), and `-Wl,-rpath,…` (the binary finds them at run
+    time — matches CMake's install-rpath to the vcpkg lib dir).
+
+13. **Prebuilt Rust archives are a link-cycle + duplicate-symbol minefield.**
+    Cargo emits one `.a` per crate with **circular cross-crate references**
+    (`liburl_rust` ↔ `libregex_rust`) — GNU ld's single pass can't resolve that
+    across separate archives. Fix: pre-merge all crate `.a` into one
+    `librust_combined.a` (`ar -M`) and `alias` every crate label to it, so the
+    whole rust closure links as one unit. Two more: (a) the Rust FFI is *also*
+    circular with C++ — `libregex_rust` calls LibUnicode's `extern "C"`
+    exports (`unicode_simple_case_fold`) and LibUnicode calls back into
+    `libunicode_rust`; in the reference these are separate `.so`s that resolve
+    at runtime, but as static archives one pass can't satisfy the cycle. Fix:
+    `alwayslink=True` on the FFI-provider libs (`LibUnicode`, `LibWeb`) so all
+    their `extern "C"` symbols are present before the rust archive references
+    them. (b) Each crate archive bundles an identical copy of the rust
+    allocator shim (`__rust_realloc`, `__rust_alloc_zeroed`); merging them into
+    one link collides. Fix: `-Wl,--allow-multiple-definition` (the copies are
+    byte-identical; the reference sidesteps this only by per-crate `.so`
+    isolation). All three are prebuilt-archive artifacts that Ring 2
+    (rules_rust from source, one target per crate) dissolves.
+
+14. **System libraries a *library* pulls must propagate as `linkopts`.**
+    LibMedia needs `libpulse` (a `/usr/lib` system `.so`, no vcpkg shim);
+    `pulse` was an UNKNOWN external. Added to `SYSTEM_LIBS`, and the emitter now
+    puts a lib's system deps in its own `linkopts` (which propagate to the final
+    binary — matches CMake's interface/private system-dep flow), not only on
+    executables. Also: `woff2dec` (static) references `woff2common` symbols, so
+    the shim declares `woff2dec`'s `deps=[":woff2common"]`.
+
+Remaining for the gate: the Qt `ladybird` UI binary (needs Qt6 + its own moc
+codegen), which spawns these service processes to render a page headless. Rust
+stays prebuilt-`.a` until Ring 2.
 
 ## Plan for the rest
 

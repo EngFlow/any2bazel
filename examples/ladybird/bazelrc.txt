@@ -40,3 +40,19 @@ build --cxxopt=-DUSE_VULKAN_DMABUF_IMAGES=1 --cxxopt=-DENABLE_COMPILETIME_FORMAT
 build --cxxopt=-D_FILE_OFFSET_BITS=64 --cxxopt=-D_FORTIFY_SOURCE=3
 build --cxxopt=-fstack-protector-strong --cxxopt=-march=native --cxxopt=-fdiagnostics-color=always
 build --copt=-fPIC
+
+# Link: let ld resolve the transitive DT_NEEDED of the vcpkg .so shims
+# (avif->libyuv, cpptrace->libdwarf, ...) which are not themselves link inputs.
+# -rpath-link makes ld follow NEEDED at link time; -rpath makes the built
+build --linkopt=-Wl,--allow-shlib-undefined
+build --linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+# binary find them at run time (matches CMake's install-rpath to the vcpkg lib).
+build --linkopt=-LBuild/full/vcpkg_installed/x64-linux-dynamic/lib
+build --linkopt=-Wl,-rpath-link,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+build --linkopt=-Wl,--allow-shlib-undefined
+build --linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+# The prebuilt Rust crate archives each bundle an identical copy of the rust
+# allocator shim (__rust_realloc/__rust_alloc_zeroed/...). The reference build
+# isolates them by linking each crate into its own .so; our combined-archive
+# shim pulls several into one link, so take the first (identical) definition.
+build --linkopt=-Wl,--allow-multiple-definition
