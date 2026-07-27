@@ -220,6 +220,24 @@ def test_ignore_flags_and_defines_suppress_diffs():
     assert summarize(diff_models(a, b, cfg))["converged"]  # suppressed: clean
 
 
+def test_force_include_path_normalized():
+    # `-include FILE` / `-imacros FILE` carry a FILE path (a forced header), not
+    # a search dir. CMake spells it absolutely, Bazel repo-relative -- the same
+    # forced header must line up (normalized to repo-relative), so a pure
+    # spelling difference converges...
+    cmake_raw = ["-DFOO=1", "-include", "/work/proj/Externals/x/fix.h"]
+    bazel_raw = ["-DFOO=1", "-include", "Externals/x/fix.h"]
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    assert summarize(diff_models(a, b))["converged"], diff_models(a, b)
+
+    # ...but a DIFFERENT forced header (or a missing one) is still a real gap.
+    b2 = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=True), is_bazel=True)
+    discs = diff_models(a, b2)
+    assert any(d.kind == "flags_diff" and
+               any("fix.h" in f for f in (d.cmake_only or [])) for d in discs), discs
+
+
 def test_ignore_flag_prefixes():
     a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1", "-Wthread-safety-analysis"],
                            is_bazel=False))
