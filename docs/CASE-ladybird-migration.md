@@ -211,9 +211,50 @@ running-browser parity we `cc_import` the reference build's `.a` (a
 philosophy as the vcpkg `.so` shims. Building them hermetically via `rules_rust`
 is Ring 2.
 
-Remaining: run the emitter up the DAG (L2→L12), diffing per layer, adding vcpkg/
-system-lib shims as new externals appear, until `//:Ladybird` (or WebContent)
-links — then the running-browser gate.
+**Status: the whole L0–L8 C++ stack builds and links under Bazel** — 32
+libraries (~660 TUs) including the JS engine (`LibJS`), `LibGfx`, `LibWasm`,
+`LibTLS`, `LibUnicode`. Project-wide diff over the built stack is down to **3
+discrepancies, all on one generated assembly file** (`interpreter_x86_64.S`) —
+i.e. the entire C++ library stack is at compile-parity. Only LibWeb (its own
+package, Ring 1b codegen) + the services/UI + Rust-from-source remain.
+
+**Additional findings surfaced walking the ladder:**
+
+5. **`-isystem` vs `-I` for third-party headers.** CMake passes vcpkg include
+   roots with `-isystem`, which suppresses `-Werror` inside third-party headers
+   (openssl `tls1.h` `cast-qual`, skia `SkTemplates.h` `attributes`). Emitting
+   them as `-I` (or via `cc_library.includes`, which Bazel spells inconsistently)
+   makes those warnings fatal. Fix: global vcpkg `-isystem` in `.bazelrc` + the
+   emitter uses `-isystem` for any per-target `vcpkg_installed` include.
+
+6. **Optimization level is a correctness input.** The reference build is
+   RelWithDebInfo (`-O2`); Bazel defaults to `-O0`. `LibWasm`'s musttail
+   interpreter loop only compiles clean at `-O2` (`-Werror=maybe-musttail-local-
+   addr` fires when the tail call can't be optimized). Pinned `-O2 -g` in
+   `.bazelrc` — needed for faithful parity and codegen agreement anyway.
+
+7. **C++23 `#embed` data are compiler inputs.** `LibJS` `#embed`s
+   `JavaScriptImplementations/*.js`; the sandbox must stage them. Emit them as
+   the consuming target's `additional_compiler_inputs` (detected by scanning
+   sources for `#embed`).
+
+8. **`cc_library.defines` vs `local_defines`** (already noted as finding 3) and
+   **string-valued defines** (`WASM_CRANELIFT_COMPILER_PATH="…"`) need embedded
+   quotes escaped for Bazel (`=\\"…\\"`).
+
+9. **The whole source tree as an implicit header root.** CMake's global
+   `-ILibraries -IServices -I.` lets any TU `#include <LibGfx/Palette.h>` with no
+   dep edge; the source tree is simply present. Bazel sandboxes to declared
+   inputs, so this is modeled as three catch-all header libraries every target
+   depends on: `//:all_source_headers` (all in-tree `.h`),
+   `//Build/full/Libraries:generated_lib_headers` (CMake `generate_export_header`
+   `Export.h` + other materialized headers), and
+   `//Build/full/Services:generated_service_headers` (IPC endpoints). Faithful to
+   how CMake actually compiles; a stricter per-dep header model is future work.
+
+Remaining: LibWeb's own `cc_library` in its package (wiring the Ring 1b genrule
+outputs as generated srcs), the services + `//:Ladybird`, then the
+running-browser gate. Rust stays prebuilt-`.a` until Ring 2.
 
 ## Plan for the rest
 

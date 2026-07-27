@@ -28,6 +28,23 @@ GLOBAL_DEFINES = {
 # System libs with no vcpkg .so (linked via linkopts on the final binary).
 SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan"}
 
+def global_flags():
+    import re
+    rc = open(os.path.join(ROOT, ".bazelrc")).read()
+    return set(re.findall(r"--(?:cxxopt|copt)=(\S+)", rc))
+
+GLOBAL_FLAGS = global_flags()
+
+def target_flags(t):
+    """Per-target compile flags (feature/warning) not covered by .bazelrc."""
+    flags = set()
+    for a in t["actions"]:
+        if a["mnemonic"] != "CppCompile": continue
+        for x in a["arguments"]:
+            if x.startswith(("-f", "-m", "-p")) and x not in GLOBAL_FLAGS:
+                flags.add(x)
+    return sorted(flags)
+
 def load():
     m = json.load(open(MODEL))
     return m["targets"]
@@ -64,7 +81,8 @@ def target_defines(t, name):
             if x.startswith("-D"):
                 d = x[2:]
                 if d not in GLOBAL_DEFINES:
-                    defs.add(d)
+                    # Bazel needs embedded quotes escaped in (local_)defines.
+                    defs.add(d.replace('"', '\\"'))
     return sorted(defs)
 
 def target_private_includes(t):
@@ -81,11 +99,33 @@ def target_private_includes(t):
         while i < len(args):
             if args[i] in ("-I", "-isystem"):
                 p = args[i+1]
-                if p not in globalroots and p.startswith(ROOT):
+                if p in globalroots:
+                    pass
+                elif p.startswith(ROOT):
                     incs.append(os.path.relpath(p, ROOT))
+                elif p.startswith("/"):
+                    incs.append(p)  # system include (e.g. /usr/include/libdrm)
                 i += 1
             i += 1
     return sorted(set(incs))
+
+
+def target_embed_inputs(t):
+    """Files pulled in via C++23 #embed; must be staged as compiler inputs."""
+    import re as _re
+    embeds = set()
+    for a in t["actions"]:
+        if a["mnemonic"] != "CppCompile": continue
+        for src in a["inputs"]:
+            p = os.path.join(ROOT, src)
+            if not (src.endswith((".cpp", ".cc", ".c")) and os.path.exists(p)):
+                continue
+            txt = open(p, encoding="utf-8", errors="ignore").read()
+            for m in _re.findall(r'#\s*embed\s+"([^"]+)"', txt):
+                rel = os.path.normpath(os.path.join(os.path.dirname(src), m))
+                if os.path.exists(os.path.join(ROOT, rel)):
+                    embeds.add(rel)
+    return sorted(embeds)
 
 def dep_label(d, targets, so, ar):
     nm = d["name"]
@@ -110,13 +150,16 @@ def main():
             print(f"# {name}: not a production lib", file=sys.stderr); continue
         t = libs[name]
         srcs = target_srcs(t)
+        embeds = target_embed_inputs(t)
         defs = target_defines(t, name)
         incs = target_private_includes(t)
+        flags = target_flags(t)
         deps, rustdeps, sysdeps, unknown = [], [], [], []
         for d in t.get("deps", []):
             if not d.get("external"):
-                if d["name"].endswith("_rust-build"): continue  # codegen; .a via external
-                if d["name"] in targets: deps.append("//:%s" % d["name"])
+                if d["name"] in libs: deps.append("//:%s" % d["name"])
+                # non-lib internal deps (codegen targets, rust-build) are not
+                # Bazel deps: their outputs arrive via genrules / .a shims.
                 continue
             lab = dep_label(d, targets, so, ar)
             if lab is None: continue
@@ -132,13 +175,27 @@ def main():
         print("cc_library(")
         print(f"    name = {name!r},")
         print("    srcs = [")
-        for s in srcs: print(f"        {s!r},")
+        for s in srcs:
+            if s.startswith("Build/full/Libraries/") and not s.startswith("Build/full/Libraries/LibWeb/"):
+                lab = "//Build/full/Libraries:" + s[len("Build/full/Libraries/"):]
+                print(f"        {lab!r},")
+            else:
+                print(f"        {s!r},")
         print("    ],")
         print(f'    hdrs = glob(["{lib_hdr_glob(name, srcs)}/**/*.h"], allow_empty = True),')
         if defs:
             print("    local_defines = %r," % defs)
-        if incs:
-            print("    copts = [%s]," % ", ".join("%r" % ("-I"+i) for i in incs))
+        if embeds:
+            print("    additional_compiler_inputs = %r," % embeds)
+        copt_toks = list(flags)
+        for i in incs:
+            if "vcpkg_installed" in i:
+                copt_toks += ["-isystem", i]  # third-party: suppress -Werror
+            else:
+                copt_toks.append("-I" + i)
+        if copt_toks:
+            print("    copts = [%s]," % ", ".join("%r" % x for x in copt_toks))
+        deps.append("//:all_source_headers")
         alldeps = sorted(set(deps))
         if alldeps:
             print("    deps = [")
