@@ -365,8 +365,16 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # vs Bazel's 'catch2_main', or 'OpenSSL::SSL' vs 'ssl') is aligned by an
     # explicit, recorded cfg.dep_map entry -- not a fuzzy match -- so a residual
     # missing_dep is a genuinely-absent dep, not a naming artifact.
-    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a_views, a_names)}
-    b_ext = _external_deps(b_views, b_names)
+    # An "external" dep naming a target that EXISTS as an in-project target
+    # (either side) is not truly external -- it's an internal lib the CMake
+    # File-API surfaced as a link fragment (common with cyclically-linked
+    # static libs, whose .a is repeated on the link line but which are not a
+    # direct structural dependency). Such names are verified via the compile
+    # TU-set of that target, so drop them from the external closure.
+    _internal_names = set(a_views) | set(b_views)
+    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a_views, a_names)
+             if cfg.dep_map.get(d, d) not in _internal_names and d not in _internal_names}
+    b_ext = {d for d in _external_deps(b_views, b_names) if d not in _internal_names}
     for dep in sorted(a_ext - b_ext):
         out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,
                                "<external>", "external link dependency missing on bazel side",
