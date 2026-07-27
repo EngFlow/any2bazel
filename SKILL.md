@@ -1,6 +1,6 @@
 ---
-name: cmake2bazel
-description: Migrate a C/C++ project from CMake to Bazel by iterating until Bazel's build matches the CMake reference build. Use when asked to convert/port a CMake project to Bazel, generate BUILD.bazel files from CMakeLists, or verify Bazel build parity against CMake. MVP scope — no codegen/custom commands.
+name: any2bazel
+description: Migrate a project (CMake, Maven, or a VSCode-style npm/esbuild build) to Bazel by iterating until Bazel's build actions match the reference build. Use when asked to convert/port a CMake/Maven/npm project to Bazel, generate BUILD.bazel files, or verify Bazel build parity against a reference build. CMake→Bazel is the mature path; Maven and npm are newer. MVP scope — no codegen/custom commands.
 user-invocable: true
 allowed-tools:
   - Read
@@ -9,30 +9,54 @@ allowed-tools:
   - Bash
 ---
 
-# /cmake2bazel — CMake → Bazel migration via parity iteration
+# /any2bazel — migrate to Bazel via parity iteration
 
-Migrate a C/C++ project from CMake to Bazel by generating `BUILD.bazel` files,
-then **iterating until Bazel's actual build actions match the CMake reference
-build**. The loop is driven by a deterministic diff, so each round is cheap and
-the LLM only does the creative work (generating and fixing BUILD files), never
-the mechanical comparison.
+Migrate a project to Bazel by generating `BUILD.bazel` files, then **iterating
+until Bazel's actual build actions match the reference build**. The loop is
+driven by a deterministic diff, so each round is cheap and the LLM only does the
+creative work (generating and fixing BUILD files), never the mechanical
+comparison.
+
+> **Formerly `cmake2bazel`.** The engine grew a language-neutral, action-based
+> IR with multiple frontends. One artifact still carries the old name: the
+> migration config file is still literally `cmake2bazel.json`.
+
+## Frontends and maturity
+
+All frontends extract into one shared **action-based model**; a language/
+mnemonic-aware differ compares each against a Bazel `aquery` model.
+
+| Frontend | Reference source | Diffs | Status |
+|----------|------------------|-------|--------|
+| **CMake** | File API codemodel-v2 | C/C++ compile + link parity | **Mature** — the validated path, detailed below |
+| **Maven** | forked `javac` argfiles | Java source-set parity | **Early** — argv-floor only |
+| **VSCode / npm** | esbuild/tsc/`child_process` instrumentation | standalone TS emit check | **Experimental** — not wired into the main loop |
+
+**Trust and detail the CMake path.** The numbered procedure below is the
+CMake→Bazel loop. The Maven and npm frontends share the model and differ but are
+newer captures; see *Other frontends* at the end for how they differ.
 
 ## Core idea
 
-Both build systems are made to emit a structured description of what they
-*actually build*, normalized into one **canonical model**, then compared:
+Each build system is made to emit a structured description of what it *actually
+builds*, normalized into one **canonical action model**, then compared:
 
 ```
 CMake File API codemodel  ──extract_cmake.py──┐
-                                              ├─► diff.py ─► worklist / converged?
-Bazel aquery jsonproto    ──extract_bazel.py──┘    ▲
-                                                   │
+                                              ├─► reconstruct.py ─► diff.py ─► worklist / converged?
+Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
+                                                       │
                           cmake2bazel.json (migration decisions)
 ```
 
 - **CMake side = File API codemodel-v2** (not `compile_commands.json`, which
   lacks link info). **Bazel side = `bazel aquery`**. Both expose compile *and*
   link actions.
+- **The model stores raw ACTIONS** (argv floor + annotations); all
+  canonicalization/interpretation happens in the differ (`reconstruct.py` +
+  `canonicalize.py` + `diff.py`), keyed on the model's `build_system` tag (for
+  noise) and each action's mnemonic (for grouping). See
+  `docs/DESIGN-action-based-ir.md`.
 - **Parity has two stages**, both reported by one diff run ("steps" below = the
   numbered procedure; these are the *stages* of what's checked):
   - **Compile parity** — every TU compiled with equivalent flags/defines/
@@ -71,7 +95,9 @@ errors by design.
 ## The migration config: `cmake2bazel.json`
 
 Lives at the **migrated project's repo root**, committed alongside the BUILD
-files as the durable record of migration decisions:
+files as the durable record of migration decisions. The filename still carries
+the old project name; it applies to the CMake→Bazel path (the only frontend that
+reads it today):
 
 ```json
 {
@@ -151,9 +177,16 @@ flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
   only) — both have planned follow-ups
 - Packaging / install rules
 - Automatic external-dependency resolution (find_package → bzlmod)
+- **Maven**: coordinate-identity deps (`group:artifact:version`, scope) and Java
+  flag canonicalization — argv-floor only.
+- **VSCode / npm**: not integrated into this parity loop (`diff_ts.py` is a
+  standalone TS emit check only).
 
 ## Prerequisites
-- `cmake` ≥ 3.14 (File API), `bazel`/`bazelisk`, `python3`
+- `python3`; `bazel`/`bazelisk`
+- CMake path: `cmake` ≥ 3.14 (File API)
+- Maven path: `mvn` (forked-compile capable)
+- VSCode/npm path: `node` (the instrumentation preload)
 
 ## Procedure
 
@@ -162,7 +195,7 @@ flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
 > NOT the project being migrated. When running inside a target repo, invoke them
 > by absolute path, e.g.
 > `python3 "$SKILL_DIR/scripts/extract_cmake.py" …` where `$SKILL_DIR` is this
-> skill's install location (e.g. `~/.claude/skills/cmake2bazel`). The artifacts
+> skill's install location (e.g. `~/.claude/skills/any2bazel`). The artifacts
 > you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
 > `BUILD.bazel`/`MODULE.bazel`, and `cmake2bazel.json` — live in or beside the
 > target repo.
@@ -317,14 +350,50 @@ test-binary count gap.
 per-iteration judgment goes into the generated `BUILD.bazel`/`MODULE.bazel` and
 `cmake2bazel.json` (reviewed).
 
+## Other frontends
+
+The Maven and VSCode/npm frontends share the action model and differ but are
+newer captures — treat their output as exploratory, and don't apply the CMake
+`cmake2bazel.json` machinery to them (they don't read it).
+
+### Maven → Bazel (early)
+Maven has no action graph; the reference is the **forked `javac` argument
+file**. Java compiles a whole source set at once, so it's compared as a
+project-wide union of `.java` sources (grouping/naming agnostic), analogous to
+how libraries are compared. argv-floor only — coordinate deps aren't extracted.
+```bash
+mvn clean compile -Dmaven.compiler.fork=true          # writes <module>/target/*arguments
+python3 scripts/extract_maven.py <module_dir> <repo_root> model.maven.json
+bazel aquery 'mnemonic("Javac", //...)' --output=jsonproto > aquery.json
+python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
+python3 scripts/diff.py model.maven.json model.bazel.json > diff.json
+```
+Diff kinds: `missing_java_src` / `extra_java_src` (a `.java` compiled on only
+one side).
+
+### VSCode / npm → Bazel (experimental)
+An npm/gulp/esbuild build is instrumented in-process by a Node preload (hooks
+esbuild, the TS language service, and `child_process`), emitting one NDJSON
+record per action. `diff_ts.py` does a **standalone** TS source→emit check; it
+is not part of the main diff loop.
+```bash
+NODE_OPTIONS="--import file://$SKILL_DIR/scripts/npm_instrument/preload.mjs" \
+VSCODE_EMIT_BUILD_IR=$PWD/actions.ndjson \
+    npm run <build-script>
+python3 scripts/extract_npm.py actions.ndjson <repo_root> model.npm.json
+python3 scripts/diff_ts.py model.npm.json model.bazel.json    # standalone check
+```
+
 ## Tests
 
 ```bash
 python3 tests/test_engine.py && python3 tests/test_extractors.py \
+    && python3 tests/test_maven.py && python3 tests/test_extract_npm.py \
     && python3 tests/test_triage.py && python3 tests/test_configure.py
 ```
 
-Extractor tests run against fixtures that mirror the documented File API and
-aquery schemas. When a real project surfaces a schema detail the extractors
-mishandle (fragment quoting, `external/` repo paths in aquery, multi-config),
-fix the extractor and capture that output as a new fixture.
+Extractor tests run against fixtures that mirror the documented File API,
+aquery, Maven argfile, and npm-NDJSON schemas. When a real project surfaces a
+schema detail the extractors mishandle (fragment quoting, `external/` repo paths
+in aquery, multi-config), fix the extractor and capture that output as a new
+fixture.

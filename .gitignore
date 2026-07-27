@@ -1,0 +1,9 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Migration artifacts produced by the tool (live beside the target repo)
+model.*.json
+aquery.json
+diff.json
+actions.ndjson
