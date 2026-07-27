@@ -105,13 +105,68 @@ re-validated against the real AK diff.
    the static-link and final-binary cases correct; the intermediate-solib case
    is inherently a project-wide-only check.
 
-## Plan for the rest (Rings 1–2)
+## Ring 1b — codegen byte-parity (DONE for LibWeb)
 
-- **Ring 1b — codegen byte-parity.** Wrap the generator families
-  (`libweb_bindings` IDL, `generate_libweb_css_*.py`, WebGL, etc.) as genrules
-  invoking the same Python; byte-diff outputs against `Build/full`. Nail this
-  before compiling anything downstream of generated headers (LibWeb depends
-  heavily on them).
+**Result: 1379/1379 LibWeb generated files byte-identical to the CMake build,
+produced by Bazel genrules invoking the same Python generators.**
+
+**How Ladybird codegen actually works (the good news).** The entire generated
+surface is *Python scripts* — there are **no compiled host-tool generators**
+(no IPC-compiler binary, no bindings-compiler binary; even IPC endpoints come
+from `Meta/Generators/generate_ipc_definitions.py`). Extracting every
+`CUSTOM_COMMAND` from `Build/full/build.ninja` that touches `Meta/Generators/`
+yields **46 generator commands** across the tree, plus one mega-command:
+`generate_libweb_bindings.py -o Bindings <661 IDL files>` produces **1331
+files** in a single invocation (not 665 per-file runs, as the "665 bindings"
+framing suggested). Each generator command is a clean
+`python3 <script> -h out.h -c out.cpp -j in.json` shape, trivially a genrule.
+
+**Tooling built (committed to any2bazel):**
+- `Meta/bazel_parity_harness.py` — re-runs every generator command from
+  `build.ninja` into a scratch mirror and byte-diffs each output against
+  `Build/full`. Proves the generators are reproducible before we wrap them.
+  (Result: 71/71 single-generator outputs + 1331/1331 bindings identical.)
+- `Meta/emit_codegen_bazel.py` — parses `build.ninja`, rewrites each generator
+  command as a Bazel `genrule` (absolute source paths → package-relative
+  `$(location …)`; CMake `*.tmp` outputs → genrule `outs`; quoted args via
+  `shlex`), and emits the bindings mega-rule. Output: `Libraries/LibWeb/
+  codegen.bzl` (27 genrules) + `Meta/BUILD.bazel` (`//Meta:generators`
+  filegroup staging the whole `Meta/Generators` + `Meta/Utils` Python tree,
+  since generators do `sys.path.append` then `import Generators.*` / `Utils.*`).
+
+**Two parity findings surfaced by Bazel sandboxing (the payoff of hermetic
+execution):**
+
+1. **Undeclared implicit input.** `generate_dom_tree.py` for
+   `HTML/MediaControlsDOM` reads `HTML/MediaControls.css` at generation time via
+   a `<link rel="stylesheet" href="MediaControls.css">` inside the input
+   `MediaControls.html`. CMake never declared this dependency (it happened to
+   work because the source tree is present in-place); Bazel's sandbox has only
+   the declared `srcs`, so it failed loudly with `FileNotFoundError`. Fix: add
+   `HTML/MediaControls.css` to that genrule's `srcs`. This is a *correctness*
+   win — under CMake, editing `MediaControls.css` would not reliably retrigger
+   the generator.
+
+2. **Latent nondeterminism (`PYTHONHASHSEED`).** `generate_libweb_bindings.py`
+   emits one dictionary's dependency-ordered structs (`AudioConfiguration` vs
+   `VideoConfiguration` in `MediaCapabilities.h`) in an order that depends on
+   Python set iteration — i.e. it varies with `PYTHONHASHSEED`. The CMake
+   `Build/full` reference happens to match `PYTHONHASHSEED=0`; Bazel's default
+   (randomized) seed produced a content-identical but reordered file (1378/1379
+   parity). Fix: pin `PYTHONHASHSEED=0` on every codegen genrule — which both
+   restores byte-parity *and* makes the actions hermetic and remote-cacheable.
+   This is a real reproducibility bug in the upstream generator (its output is
+   not seed-stable); the migration hardens it.
+
+Remaining Ring 1b work is mechanical: run `emit_codegen_bazel.py` for the other
+libraries with generators (LibJS bytecode, LibHTTP HSTS, the IPC endpoints under
+LibRequests/LibWebView/Services, Compositor WebGL replayer) — same pattern, same
+harness to verify.
+
+## Plan for the rest (Rings 1c–2)
+
+- **Ring 1b (remaining libs).** Apply the proven emitter/harness to the
+  non-LibWeb generator commands (LibJS/LibHTTP/IPC/Compositor). Same shape.
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
   LibCore/LibUnicode/… → LibJS/LibGfx → LibWeb → LibWebView → Services/UI →
   `Ladybird`. Per layer: generate `BUILD.bazel` from the model, aquery, diff,
