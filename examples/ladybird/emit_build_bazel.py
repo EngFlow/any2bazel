@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Ring 1c: emit BUILD.bazel cc_library targets from the CMake reference model.
+
+Reads model.cmake.full.json and emits one cc_library per production library,
+bottom-up by dependency layer. Global copts/defines/includes live in .bazelrc
+(mirrored from Meta/CMake/compile_options.cmake); per-target we emit only srcs,
+the target's own <Name>_EXPORTS + Skia-style defines, its private gendir
+-isystem, and deps (internal -> //:Target, external -> vcpkg shim / system).
+
+Generated headers (Ring 1b genrules) and configure-time headers are supplied
+via the global -I roots into Build/full plus //Libraries/LibWeb codegen outputs.
+"""
+import json, os, sys, re
+from collections import defaultdict
+
+ROOT = "/home/ubuntu/ladybird-work"
+MODEL = os.path.join(ROOT, "model.cmake.full.json")
+VCPKG_LIB = os.path.join(ROOT, "Build/full/vcpkg_installed/x64-linux-dynamic/lib")
+VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+RUST_PKG = "//Build/full/cargo/build/x86_64-unknown-linux-gnu/release"
+
+# Global defines already set in .bazelrc; do not re-emit per target.
+GLOBAL_DEFINES = {
+    "USE_VULKAN=1", "ENABLE_COMPILETIME_FORMAT_CHECK", "USE_FONTCONFIG=1",
+    "_FORTIFY_SOURCE=3", "USE_VULKAN_DMABUF_IMAGES=1", "_FILE_OFFSET_BITS=64",
+    "NDEBUG",
+}
+# System libs with no vcpkg .so (linked via linkopts on the final binary).
+SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan"}
+
+def load():
+    m = json.load(open(MODEL))
+    return m["targets"]
+
+def is_lib(t): return t.get("kind") in ("shared_library", "static_library", "object_library")
+
+def vcpkg_available():
+    so, ar = set(), set()
+    for f in os.listdir(VCPKG_LIB):
+        if f.startswith("lib") and ".so" in f: so.add(f[3:].split(".so")[0])
+        elif f.startswith("lib") and f.endswith(".a"): ar.add(f[3:-2])
+    return so, ar
+
+def lagom_to_target(name, targets):
+    stem = name[len("lagom-"):]
+    if stem == "ak": return "AK"
+    cand = "Lib" + stem
+    for t in targets:
+        if t.lower() == cand.lower(): return t
+    return None
+
+def target_srcs(t):
+    srcs = []
+    for a in t["actions"]:
+        if a["mnemonic"] != "CppCompile": continue
+        srcs += [i for i in a["inputs"] if i.endswith((".cpp", ".c", ".cc", ".S"))]
+    return sorted(set(srcs))
+
+def target_defines(t, name):
+    defs = set()
+    for a in t["actions"]:
+        if a["mnemonic"] != "CppCompile": continue
+        for x in a["arguments"]:
+            if x.startswith("-D"):
+                d = x[2:]
+                if d not in GLOBAL_DEFINES:
+                    defs.add(d)
+    return sorted(defs)
+
+def target_private_includes(t):
+    """Per-target -isystem/-I under Build/full (the target's own gendir) not in
+    the 6 global roots."""
+    globalroots = {ROOT, ROOT+"/Libraries", ROOT+"/Services",
+                   ROOT+"/Build/full", ROOT+"/Build/full/Libraries",
+                   ROOT+"/Build/full/Services",
+                   ROOT+"/Build/full/vcpkg_installed/x64-linux-dynamic/include"}
+    incs = []
+    for a in t["actions"]:
+        if a["mnemonic"] != "CppCompile": continue
+        args = a["arguments"]; i = 0
+        while i < len(args):
+            if args[i] in ("-I", "-isystem"):
+                p = args[i+1]
+                if p not in globalroots and p.startswith(ROOT):
+                    incs.append(os.path.relpath(p, ROOT))
+                i += 1
+            i += 1
+    return sorted(set(incs))
+
+def dep_label(d, targets, so, ar):
+    nm = d["name"]
+    if nm.startswith("lagom-"):
+        tgt = lagom_to_target(nm, targets)
+        return "//:%s" % tgt if tgt else None
+    if nm.endswith("_rust"):
+        return [RUST_PKG + ":" + nm, "//Build/full/Libraries:rust_ffi_headers"]
+    if nm in so or nm in ar:
+        return VCPKG + ":" + nm
+    if nm in SYSTEM_LIBS:
+        return ("SYS", nm)  # linkopt on final binary
+    return ("UNKNOWN", nm)
+
+def main():
+    targets = load()
+    so, ar = vcpkg_available()
+    libs = {n: t for n, t in targets.items() if t.get("role") == "production" and is_lib(t)}
+    only = sys.argv[1:] if len(sys.argv) > 1 else sorted(libs)
+    for name in only:
+        if name not in libs: 
+            print(f"# {name}: not a production lib", file=sys.stderr); continue
+        t = libs[name]
+        srcs = target_srcs(t)
+        defs = target_defines(t, name)
+        incs = target_private_includes(t)
+        deps, rustdeps, sysdeps, unknown = [], [], [], []
+        for d in t.get("deps", []):
+            if not d.get("external"):
+                if d["name"].endswith("_rust-build"): continue  # codegen; .a via external
+                if d["name"] in targets: deps.append("//:%s" % d["name"])
+                continue
+            lab = dep_label(d, targets, so, ar)
+            if lab is None: continue
+            if isinstance(lab, list):
+                deps.extend(lab)
+            elif isinstance(lab, tuple):
+                (sysdeps if lab[0]=="SYS" else unknown).append(lab[1])
+            else:
+                deps.append(lab)
+        print(f"# === {name} ({t['kind']}, {len(srcs)} TU) ===")
+        if rustdeps: print(f"#   RUST deps (deferred): {rustdeps}")
+        if unknown: print(f"#   UNKNOWN deps: {unknown}")
+        print("cc_library(")
+        print(f"    name = {name!r},")
+        print("    srcs = [")
+        for s in srcs: print(f"        {s!r},")
+        print("    ],")
+        print(f'    hdrs = glob(["{lib_hdr_glob(name, srcs)}/**/*.h"], allow_empty = True),')
+        if defs:
+            print("    local_defines = %r," % defs)
+        if incs:
+            print("    copts = [%s]," % ", ".join("%r" % ("-I"+i) for i in incs))
+        alldeps = sorted(set(deps))
+        if alldeps:
+            print("    deps = [")
+            for d in alldeps: print(f"        {d!r},")
+            print("    ],")
+        print(")")
+        print()
+
+def lib_hdr_glob(name, srcs):
+    # infer the source dir from the first src (Libraries/LibX or Services/X)
+    if srcs:
+        return os.path.dirname(srcs[0]).split("/")[0] + "/" + srcs[0].split("/")[1]
+    return name
+
+if __name__ == "__main__":
+    main()

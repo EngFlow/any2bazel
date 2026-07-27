@@ -163,7 +163,59 @@ libraries with generators (LibJS bytecode, LibHTTP HSTS, the IPC endpoints under
 LibRequests/LibWebView/Services, Compositor WebGL replayer) — same pattern, same
 harness to verify.
 
-## Plan for the rest (Rings 1c–2)
+## Ring 1c — per-library BUILD generation (in progress, pattern proven)
+
+The 42 production libraries form a clean **13-layer dependency DAG** (L0 `AK`
+→ … → L9 `LibWeb` → L11 `LibWebView` → L12 `webcontentservice`). Ring 1c walks
+it bottom-up, generating a `cc_library` per lib from the reference model and
+diffing to compile+link parity.
+
+**Emitter (`examples/ladybird/emit_build_bazel.py`).** Reads
+`model.cmake.full.json` and emits one `cc_library` per production lib: `srcs`
+from the compile actions, `local_defines` for the target's private
+`<Name>_EXPORTS`, a per-target gendir `-I` copt, and `deps` wired by class —
+internal → `//:Target`, vcpkg externals → the shim package, prebuilt Rust
+crates → a cargo-`.a` shim. Global copts/defines live in `.bazelrc`.
+
+**Proven across the representative cases** (built + diffed to zero
+compile-parity discrepancies):
+- **Plain lib** — `LibDiff` (AK-only dep).
+- **vcpkg-dep lib** — `LibCrypto` (needs `crypto`, `tommath` `.so` shims).
+- **Rust + generated-header lib** — `LibUnicode`: depends on the prebuilt
+  `liblibunicode_rust.a` **and** a cargo-generated `LibUnicode/RustFFI.h`.
+
+**Findings this surfaced:**
+
+3. **`cc_library.defines` leak (real correctness fix).** AK's private defines
+   (`AK_EXPORTS`, `AK_HAS_CPPTRACE=1`, `FMT_SHARED`) were emitted as `defines`,
+   which **propagate to every consumer** in Bazel — so LibCrypto/LibDiff TUs
+   got them, which CMake keeps `PRIVATE` to AK. The diff caught it as
+   `defines_diff` (bazel_only) on every downstream TU. Fix: per-target
+   `<Name>_EXPORTS`-style defines are `local_defines` (non-propagating); the 7
+   genuinely-global defines (`USE_VULKAN=1`, `_FORTIFY_SOURCE=3`, …) moved to
+   `.bazelrc`. Cleared all `defines_diff`.
+
+4. **Generated/prebuilt headers need a Bazel target, not just `-I`.** CMake's
+   global `-IBuild/full/Libraries` made `<LibUnicode/RustFFI.h>` resolve because
+   the file sat in-tree; Bazel's sandbox has only declared inputs, so the same
+   `-I` copt isn't enough — the header must be a `hdrs` of some target. Modeled
+   the cargo-`cxx` FFI byproducts as a `//Build/full/Libraries:rust_ffi_headers`
+   `cc_library` (`includes=["."]`) that Rust-dependent libs depend on. (Ring 1b
+   LibWeb codegen headers are already proper genrule outputs.)
+
+**Rust decision (Ring 1c uses prebuilt, Ring 2 builds from source).** Seven core
+libs (LibUnicode/URL/TextCodec/Regex/Gfx/JS) plus LibWeb depend on Rust crates
+that cargo compiles to static `.a` archives. For compile+link and
+running-browser parity we `cc_import` the reference build's `.a` (a
+`//Build/full/cargo/.../release` shim package), the same deferred-linking
+philosophy as the vcpkg `.so` shims. Building them hermetically via `rules_rust`
+is Ring 2.
+
+Remaining: run the emitter up the DAG (L2→L12), diffing per layer, adding vcpkg/
+system-lib shims as new externals appear, until `//:Ladybird` (or WebContent)
+links — then the running-browser gate.
+
+## Plan for the rest
 
 - **Ring 1b (remaining libs).** Apply the proven emitter/harness to the
   non-LibWeb generator commands (LibJS/LibHTTP/IPC/Compositor). Same shape.
