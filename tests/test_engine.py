@@ -64,6 +64,55 @@ def test_toolchain_defaults_do_not_break_convergence():
     assert res["errors"] == 0, res
 
 
+def test_shared_tolerated_default_flag_does_not_fabricate_diff():
+    # Regression for the Ladybird finding: a project explicitly sets
+    # -fstack-protector-strong / -fdiagnostics-color=always on BOTH sides. The
+    # old canonicalizer stripped these prefixes from the Bazel side only, so the
+    # shared flag no longer cancelled and fabricated a false cmake_only diff.
+    # They must now survive canonicalization and cancel.
+    shared = ["-std=c++23", "-fstack-protector-strong", "-fdiagnostics-color=always"]
+    cmake_raw = list(shared)
+    # Bazel side has the same explicit flags PLUS its own injected default
+    # (-fstack-protector) and pure noise.
+    bazel_raw = list(shared) + ["-fstack-protector", "-fno-canonical-system-headers",
+                                "-frandom-seed=abc"]
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    discs = diff_models(a, b)
+    res = summarize(discs)
+    assert res["converged"], res
+    assert not any(d.kind == "flags_diff" for d in discs), \
+        [d for d in discs if d.kind == "flags_diff"]
+
+
+def test_cmake_stronger_variant_than_bazel_default_is_caught():
+    # If CMake requests -fstack-protector-strong but Bazel only has the injected
+    # default -fstack-protector, that's a REAL difference and must surface (the
+    # strip must not paper over it).
+    cmake_raw = ["-std=c++23", "-fstack-protector-strong"]
+    bazel_raw = ["-std=c++23", "-fstack-protector"]  # weaker default only
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    discs = diff_models(a, b)
+    fd = next(d for d in discs if d.kind == "flags_diff")
+    assert "-fstack-protector-strong" in fd.cmake_only
+    # and the bazel-only default is filtered from the cosmetic display
+    assert "-fstack-protector" not in (fd.bazel_only or [])
+
+
+def test_bazel_only_tolerated_default_filtered_from_display():
+    # Bazel injects a tolerated default the project didn't set; when it's the
+    # only difference on the bazel side it's tolerated AND hidden from display.
+    cmake_raw = ["-std=c++23", "-Wall", "-DNEED=1"]
+    bazel_raw = ["-std=c++23", "-fdiagnostics-color=always"]  # missing -Wall
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    discs = diff_models(a, b)
+    fd = next(d for d in discs if d.kind == "flags_diff")
+    assert "-Wall" in fd.cmake_only
+    assert "-fdiagnostics-color=always" not in (fd.bazel_only or [])
+
+
 def test_missing_cmake_flag_is_caught():
     cmake_raw = ["-DFOO=1", "-DNEEDED=1", "-std=c++17", "-fno-exceptions"]
     bazel_raw = ["-DFOO=1", "-std=c++17"]  # dropped NEEDED and -fno-exceptions
@@ -159,6 +208,38 @@ def test_external_dep_naming_an_in_project_target_is_not_missing():
     discs2 = diff_models(a, b2)
     assert any(d.kind == "missing_dep" and "z" in (d.cmake_only or [])
                for d in discs2), discs2
+def test_bazel_link_input_libs_inferred_as_deps():
+    # Regression for the Ladybird finding: Bazel feeds link deps to the linker
+    # as depset INPUTS by path, not always as -l argv tokens. The extractor now
+    # records library inputs on the link action, and reconstruct infers deps
+    # from them -- so an external archive/solib is visible even with no -l flag.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("fmt", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    # No -lfmt on argv; the solib is a declared link INPUT (external/ path),
+    # versioned like a real vcpkg/bzlmod solib.
+    link = Action(mnemonic="CppLink", arguments=("/usr/bin/gcc", "-o", "app"),
+                  inputs=("external/fmt+/libfmt.so.12.2.0",))
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True), link]))
+    # fmt must be inferred from the link input and cancel the cmake dep.
+    assert summarize(diff_models(a, b))["converged"], diff_models(a, b)
+
+
+def test_bazel_link_input_static_archive_inferred_as_dep():
+    # A statically-linked external archive fed as a link input (no -l flag).
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", [], is_bazel=False)],
+                 deps=[Dependency("simdutf", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    link = Action(mnemonic="CppLink", arguments=("/usr/bin/gcc", "-o", "app"),
+                  inputs=("external/simdutf+/libsimdutf.a",))
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", [], is_bazel=True), link]))
+    assert summarize(diff_models(a, b))["converged"], diff_models(a, b)
 
 
 def test_external_dep_name_aligned_by_dep_map():

@@ -65,26 +65,45 @@ Result: **118 → 4 discrepancies.** The 118 were fully systematic (every diff
 ×38 sources = one cause): missing `-DNDEBUG`, missing include roots, and the
 global warning set — all cleared in bulk by the `.bazelrc` + config.
 
-### Findings for the engine (real tool output, not fixture-driven)
+### Findings for the engine (real tool output, not fixture-driven) — FIXED
 
-1. **Bazel-default flag strip is asymmetric and over-eager.**
-   `canonicalize.py:BAZEL_DEFAULT_FLAG_PREFIXES` strips `-fstack-protector` and
-   `-fdiagnostics-color` **on the Bazel side only**. But Ladybird *explicitly*
-   sets `-fstack-protector-strong` / `-fdiagnostics-color=always` on both sides,
-   so the strip makes them look CMake-only. Worked around via `ignore.flags`;
-   the cleaner fix is to only strip the bazel-default when CMake didn't also
-   request it (symmetry-aware). Candidate engine improvement.
+Both were fixed in any2bazel (this branch), with regression tests, and
+re-validated against the real AK diff.
 
-2. **Library-level external deps are invisible on the Bazel side.** The Bazel
-   extractor reads external deps from `-l`/archive inputs on the link line, but
-   Bazel defers dynamic-lib linking to the final binary — so an intermediate
-   `cc_library`'s `.so` deps never appear on its own link line. CMake's
-   codemodel *does* record them per target. Hence AK shows 4 residual
-   `missing_dep` (fmt/simdutf/mimalloc/cpptrace) that are real deps, just not
-   observable at library granularity under Bazel. They resolve at the
-   final-binary link. Candidate engine improvement: read Bazel's structured
-   `cc_library` dep edges (cquery/providers), not just link-line `-l` tokens,
-   so the external closure is comparable per target rather than only globally.
+1. **Bazel-default flag strip was asymmetric and over-eager (FIXED).**
+   `canonicalize.py` stripped `-fstack-protector` / `-fdiagnostics-color` on the
+   Bazel side only, by prefix. Ladybird explicitly sets
+   `-fstack-protector-strong` / `-fdiagnostics-color=always` on both sides, so
+   (a) the prefix also ate the project's `-strong` variant and (b) stripping
+   only Bazel meant the shared flag no longer cancelled, fabricating a false
+   cmake-only `flags_diff` on every one of AK's 38 sources. Fix: split the
+   defaults into `BAZEL_NOISE_FLAG_PREFIXES` (pure noise, still stripped) and
+   `BAZEL_TOLERATED_FLAG_PREFIXES` (kept through canonicalization so shared
+   flags cancel; a CMake-only stronger variant still correctly errors; the
+   tolerated default is filtered only from the cosmetic `bazel_only` display in
+   `diff.py`). Re-validated: AK's `flags_diff` errors vanished WITHOUT any
+   `ignore.flags` workaround. Tests: `test_shared_tolerated_default_flag_*`,
+   `test_cmake_stronger_variant_than_bazel_default_is_caught`,
+   `test_bazel_only_tolerated_default_filtered_from_display`.
+
+2. **Link-input libraries were invisible to dep inference (FIXED, with a
+   caveat).** The Bazel extractor recorded only link-action `arguments` +
+   `outputs`, so dep inference saw only `-l`/archive tokens on argv. But Bazel
+   feeds many link deps to the linker as depset INPUTS by path (statically
+   linked `.a`, external solibs), never as `-l` flags. Fix: the extractor now
+   records a link action's library inputs (`.a`/`.so`/versioned-solib) from its
+   input depset, and `reconstruct.py` infers deps from them (new
+   `_lib_identity`, handling `libfmt.so.12.2.0` -> `fmt`). Tests:
+   `test_bazel_link_input_libs_inferred_as_deps`,
+   `test_bazel_link_input_static_archive_inferred_as_dep`.
+   **Caveat (by design, not a bug):** for an intermediate SHARED library like
+   AK, Bazel puts no deps on its link line or in its link depset at all — it
+   genuinely defers dynamic linking to the final binary. So AK-in-isolation
+   still shows 4 residual `missing_dep` (fmt/simdutf/mimalloc/cpptrace); those
+   are unobservable at that granularity and resolve at the project-wide external
+   closure when the final `Ladybird`/`WebContent` binaries link. The fix makes
+   the static-link and final-binary cases correct; the intermediate-solib case
+   is inherently a project-wide-only check.
 
 ## Plan for the rest (Rings 1–2)
 

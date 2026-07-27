@@ -20,21 +20,45 @@ import os
 import posixpath
 from typing import Iterable, List, Tuple
 
-# Flags Bazel's C++ toolchain injects (or sandboxing adds) that have no CMake
-# counterpart and must NOT count as discrepancies. Matched as exact tokens or
-# prefixes. Extend per-toolchain; this is intentionally conservative.
-BAZEL_DEFAULT_FLAG_PREFIXES = (
+# Flags Bazel's C++ toolchain injects that are PURE NOISE: they never have a
+# CMake counterpart and never collide with a real project flag, so they are
+# dropped from the Bazel side at canonicalization. Matched as exact tokens or
+# prefixes. Extend per-toolchain; intentionally conservative.
+BAZEL_NOISE_FLAG_PREFIXES = (
     "-fno-canonical-system-headers",
     "-no-canonical-prefixes",
-    "-fstack-protector",
-    "-Wunused-but-set-parameter",
-    "-Wno-free-nonheap-object",
-    "-fdiagnostics-color",
     "-frandom-seed=",     # derived from output path; pure noise for a diff
     "-D__DATE__",
     "-D__TIMESTAMP__",
     "-D__TIME__",
 )
+
+# Flags Bazel's toolchain injects by default that a project MIGHT ALSO set
+# explicitly. These are NOT stripped at canonicalization -- doing so is unsafe
+# for two reasons:
+#   1. Prefix greediness: stripping "-fstack-protector" also eats a project's
+#      "-fstack-protector-strong", so a flag CMake and Bazel BOTH set no longer
+#      cancels and fabricates a false cmake-only discrepancy.
+#   2. Asymmetry direction: stripping a flag only from the Bazel side can only
+#      ever CREATE false cmake-only errors (it shrinks the Bazel set), never
+#      hide a real one.
+# Instead they are kept through canonicalization so shared flags cancel in the
+# subtraction, and filtered only from the cosmetic `bazel_only` DISPLAY in
+# diff.py (they land in the tolerated bazel-only bucket regardless). If CMake
+# sets a variant Bazel lacks (e.g. CMake -fstack-protector-strong, Bazel only
+# the default -fstack-protector), that correctly surfaces as a real diff.
+BAZEL_TOLERATED_FLAG_PREFIXES = (
+    "-fstack-protector",
+    "-fdiagnostics-color",
+    "-Wunused-but-set-parameter",
+    "-Wno-free-nonheap-object",
+    "-fno-omit-frame-pointer",
+)
+
+# Back-compat alias: the union is what "bazel default" used to mean. Kept so any
+# external caller referencing the old name still works; canonicalization now
+# only strips the NOISE subset (see canonicalize_flags).
+BAZEL_DEFAULT_FLAG_PREFIXES = BAZEL_NOISE_FLAG_PREFIXES + BAZEL_TOLERATED_FLAG_PREFIXES
 
 # Flags that carry no correctness meaning for a parity check on either side.
 IGNORABLE_FLAG_PREFIXES = (
@@ -203,14 +227,17 @@ def canonicalize_flags(
 
         # include flavors: -I, -isystem, -iquote, -idirafter (split or joined)
         if tok in ("-I", "-isystem", "-iquote", "-idirafter") and i + 1 < n:
-            if not (is_bazel and _matches_any(tok, BAZEL_DEFAULT_FLAG_PREFIXES)):
-                includes.append(_to_repo_relative(raw[i + 1], repo_root))
+            includes.append(_to_repo_relative(raw[i + 1], repo_root))
             i += 2; continue
         if tok.startswith("-I"):
             includes.append(_to_repo_relative(tok[2:], repo_root)); i += 1; continue
 
-        # drop bazel toolchain defaults on the bazel side only
-        if is_bazel and _matches_any(tok, BAZEL_DEFAULT_FLAG_PREFIXES):
+        # drop pure-noise bazel toolchain flags on the bazel side only. NOTE:
+        # tolerated-default flags (-fstack-protector, -fdiagnostics-color, ...)
+        # are intentionally NOT dropped here -- see BAZEL_TOLERATED_FLAG_PREFIXES:
+        # they must survive so a flag both sides set cancels in the diff, and
+        # they're filtered from the cosmetic bazel_only display in diff.py.
+        if is_bazel and _matches_any(tok, BAZEL_NOISE_FLAG_PREFIXES):
             i += 1; continue
         # drop universally-ignorable flags on both sides
         if _matches_any(tok, IGNORABLE_FLAG_PREFIXES):

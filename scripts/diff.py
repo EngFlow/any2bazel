@@ -22,9 +22,23 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional
 
+from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES
 from config import MigrationConfig
 from model import (CanonicalModel, TargetKind, TargetRole, TranslationUnit)
 from reconstruct import TargetView, reconstruct
+
+
+def _display_bazel_only(flags) -> list:
+    """Cosmetic filter for the `bazel_only` side of a flag diff. Bazel-injected
+    tolerated defaults (-fstack-protector, -fdiagnostics-color, ...) are kept
+    through canonicalization so they CANCEL against a project flag both sides
+    set (see canonicalize.BAZEL_TOLERATED_FLAG_PREFIXES). When only Bazel has
+    them they're harmless toolchain noise, so drop them from the reported
+    bazel_only list to keep the worklist readable. Never affects severity --
+    bazel_only is always tolerated; this only tidies the display."""
+    return sorted(f for f in flags
+                  if not any(f == p or f.startswith(p)
+                             for p in BAZEL_TOLERATED_FLAG_PREFIXES))
 
 
 class Severity(str, Enum):
@@ -120,7 +134,7 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
             target=target, tu=a.source,
             detail="cmake compile flags missing on bazel side",
             cmake_only=sorted(a_fl - b_fl),
-            bazel_only=sorted(b_fl - a_fl),
+            bazel_only=_display_bazel_only(b_fl - a_fl),
         ))
     return out
 
