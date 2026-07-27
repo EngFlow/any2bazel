@@ -252,9 +252,52 @@ package, Ring 1b codegen) + the services/UI + Rust-from-source remain.
    `//Build/full/Services:generated_service_headers` (IPC endpoints). Faithful to
    how CMake actually compiles; a stricter per-dep header model is future work.
 
-Remaining: LibWeb's own `cc_library` in its package (wiring the Ring 1b genrule
-outputs as generated srcs), the services + `//:Ladybird`, then the
-running-browser gate. Rust stays prebuilt-`.a` until Ring 2.
+### LibWeb builds + links (the big one — DONE)
+
+**`//Libraries/LibWeb:LibWeb` builds and links** — 1,781 compile actions
+producing `libLibWeb.so` (55 MB) — with **zero** `defines_diff`/`flags_diff`/
+`includes_diff` across all 1,273 checked-in TUs vs the CMake reference. LibWeb
+lives in its **own package** (`Libraries/LibWeb/BUILD.bazel`) because it owns
+the Ring 1b codegen (`codegen.bzl` genrules): its 1,961 TUs split into 1,273
+checked-in srcs + 688 generated srcs that reference the genrule outputs by
+package-relative label (Bazel resolves a source-looking label to the same-package
+genrule output). Emitter: `examples/ladybird/emit_libweb_bazel.py` (mirrors the
+per-lib emitter but rebases every path to the package and pulls generated
+src/hdr lists from `generated_srcs.bzl`).
+
+**Findings this surfaced:**
+
+10. **Generated headers need a genfiles include root; source/genrule name
+    collisions must be de-duped.** Generated headers are included as
+    `<LibWeb/CSS/PropertyID.h>`, but under Bazel they land in
+    `bazel-bin/Libraries/LibWeb/…`, not the source tree. `includes=[".."]` on
+    the LibWeb library puts **both** `Libraries` (source root) and
+    `bazel-bin/Libraries` (genfiles root) on the header search path so
+    `<LibWeb/…>` resolves for checked-in and generated headers alike. Four
+    headers (`HTML/AttributeNames.h`, `HTML/TagNames.h`, `SVG/AttributeNames.h`,
+    `SVG/TagNames.h`) exist as **both** a checked-in file and a genrule output;
+    the `hdrs` glob then matched the on-disk copy while the label resolved to the
+    genrule output → "label duplicated in hdrs". Fix: `glob(["**/*.h"],
+    exclude = LIBWEB_GENERATED_HDRS) + LIBWEB_GENERATED_HDRS` (generated wins).
+    The remaining 689 "missing_tu" in the LibWeb diff are purely the
+    `bazel-out/…/bin/` vs `Build/full/` genfile-path prefix, not real gaps
+    (add a genfiles-prefix normalization to `cmake2bazel.json` to silence).
+
+11. **Extractor OOM on large targets (real tool bug — FIXED).** LibWeb's single
+    link action pulls a `depSetOfFiles` DAG of ~4k depsets over a ~13k-artifact
+    closure, heavily shared across nodes. `extract_bazel._build_depset_index`
+    eagerly materialized a *flattened leaf list per node* (`list.extend` up the
+    DAG), which is combinatorial and OOM-killed the extractor (exit 137) on any
+    real C++ target — the diff loop simply couldn't run on LibWeb. Fix:
+    `_DepsetResolver` flattens **lazily**, only for the handful of link /
+    TsProgram actions that actually need a closure, with an iterative
+    visited-set DAG walk (shared subgraphs expanded once) and per-root
+    `frozenset` memoization. Extraction of LibWeb dropped from OOM to seconds.
+    Regression test: `test_bazel_shared_depset_dag_does_not_blow_up` (a wide
+    shared-`mid` diamond that would explode under the old per-node expansion).
+
+Remaining: the services + `//:Ladybird`/WebContent, then the running-browser
+gate. Rust stays prebuilt-`.a` until Ring 2.
 
 ## Plan for the rest
 

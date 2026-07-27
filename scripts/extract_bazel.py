@@ -274,9 +274,7 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
             # external-dep closure observable per-target, not only when a dep
             # happens to appear as a -l flag. (Object inputs are filtered by the
             # differ; only archive/shared-lib inputs become deps.)
-            link_inputs: List[int] = []
-            for dsid in action.get("inputDepSetIds", []):
-                link_inputs.extend(depsets.get(dsid, []))
+            link_inputs = depsets.resolve(action.get("inputDepSetIds", []))
             lib_inputs = tuple(
                 p for p in (artifacts.get(i, "") for i in link_inputs)
                 if p.endswith((".a", ".lo", ".lib", ".so", ".dylib")) or ".so." in p)
