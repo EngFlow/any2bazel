@@ -4,9 +4,12 @@
 `d742aa8`, ~900 C++ translation units, 11 first-party libraries, 48 vendored
 externals, CMake → Bazel via the any2bazel action-graph differ.
 
-**Outcome:** both configurations build green (`bazel build //...` and
-`--define=enable_qt=true`), 1350 unit tests pass, all five binaries link and run,
-and both parity diffs converge with 0 errors.
+**Outcome:** all three configurations build green (`bazel build //...`,
+`--define=enable_qt=true`, `--define=system_libs=true`), 1350 unit tests pass, all
+five binaries link and run, and each configuration's parity diff converges with 0
+errors against its own CMake reference model. Every external is built from the
+in-tree sources by default, so the build is a function of the source tree rather
+than of the host.
 
 This document is **not** about that. It is about what the migration *found*. A
 build migration is an unusually good static analysis: to express a build in a
@@ -308,6 +311,82 @@ Two lessons, both generalizable beyond Dolphin:
 Fixed by adding `//Externals/enet:enet` (the bundled submodule) behind
 `--define=bundled_enet=true`, which restores CMake's fallback branch.
 
+### A third time, and then the actual fix: bundle everything by default
+
+Two more reports followed, both the same shape:
+
+```
+error: 'println' is not a member of 'fmt'                     # needs fmt >= 10.2
+error: no match for 'operator>>' (sf::Packet, u64)            # needs SFML 3
+```
+
+At that point the pattern is not a bug, it's the design: **11** of Dolphin's
+`dolphin_find_optional_system_library*` calls carry a floor plus a bundled
+fallback, and the translation had kept only the system branch of every one. Fixing
+them one report at a time is a treadmill whose length is the number of distros.
+
+The fmt case is what settles the argument. CMake's floor for fmt is **10.1**, but
+`fmt::println` was added in **10.2** — so the floor itself is wrong, and even a
+*faithful* translation of the version gate would break on a host with fmt 10.1.
+A version floor is a claim a human has to keep in sync with the code; the
+submodule pointer is checked in and cannot drift.
+
+So the fix was not "translate the 11 gates" but **invert the default**: build every
+external from the in-tree sources, and make the host's libraries an opt-in.
+
+```python
+config_setting(name = "system_libs", define_values = {"system_libs": "true"})
+
+alias(name = "fmt", actual = select({
+    ":system_libs": ":system_fmt",              # cc_library, linkopts = ["-lfmt"]
+    "//conditions:default": "//Externals/fmt:fmt",
+}))
+```
+
+One `config_setting` and one `alias` per external; the 13 aliases go into an
+`EXTERNAL_DEPS` list added to the `deps` of every Dolphin library and binary. No
+consumer knows which branch it got. `bazel build //...` is now a function of the
+source tree; `--define=system_libs=true` is for distro packagers who want to own
+the version question. This is CMake's `USE_SYSTEM_LIBS=OFF`, which is what §4's
+"recommended fix (b)" asked for.
+
+**The lesson for the tool is a stronger version of lesson 2 above.** A
+version-gated dependency is a conditional the action-graph diff cannot see — but
+the fix is not to teach the diff about conditionals. It is to notice that
+`system-or-bundled` is a *host-dependent resolution*, and that a migration should
+translate the **hermetic** branch, because that is the one whose correctness does
+not depend on where you run it. Enumerate the `find_optional_system_library`-shaped
+calls, and prefer the bundled side of each by default. The opt-in switch preserves
+the other branch for whoever needs it, at one `select()` per dependency.
+
+Doing that also produced the most useful diff of the whole migration, because it
+required a **second CMake reference model** (`-DUSE_SYSTEM_LIBS=OFF`: 58 targets
+vs 38) and diffing 14 newly-migrated libraries at flag level. Five real defects
+fell out that no code review would have caught:
+
+| finding | why it matters |
+|---|---|
+| Six **PUBLIC** compile definitions written as Bazel `local_defines` (`SFML_STATIC`, `LZMA_API_STATIC`, `ZSTD_MULTITHREAD`, `SPNG_STATIC`, `CURL_STATICLIB`, `PUGIXML_NO_EXCEPTIONS`) | the `*_STATIC` ones flip dllimport/visibility attributes and `PUGIXML_NO_EXCEPTIONS` changes pugixml's API shape — a mismatch is an ODR violation that links cleanly. Surfaced as `defines_diff` on ~670 TUs each |
+| `minizip-ng` missing `_LARGEFILE64_SOURCE` / `__USE_LARGEFILE64` | its `STDLIB_DEF`, needed for the `lseek64`/`stat64` family — a latent bug on >2 GiB archives |
+| `enet/win32.c` absent from `srcs` | entirely inside `#ifdef _WIN32`, so on Linux nothing would ever fail; only a TU-set comparison finds it |
+| curl compiled without its 70-flag `PICKY_COMPILER` warning set | curl is the *one* external Dolphin does not `dolphin_disable_warnings()`; invisible without a flag-level diff |
+| `-DOFF` reaching 554 TUs | an upstream CMake bug: `Externals/pugixml/CMakeLists.txt` does `set(PUGIXML_BUILD_DEFINES OFF)` meaning "none", and pugixml forwards `${PUGIXML_BUILD_DEFINES}` into `target_compile_definitions(... PUBLIC)`, so the literal string becomes a define on pugixml and every consumer |
+
+The last row is worth its own note on **process**: the right move was to record it
+in `cmake2bazel.json`'s `ignore.defines` with the explanation, *not* to add
+`-DOFF` to the Bazel build so the diff would go quiet. A parity diff exists to
+find differences worth explaining; copying an upstream bug to silence one turns
+the tool into a rubber stamp. Every suppression being a reviewable line in a
+checked-in file is what makes that distinction enforceable.
+
+Finally, an honest cost worth stating: **a build with a configuration switch needs
+one reference model per configuration.** Flipping the default retired
+`model.cmake.json` (the `AUTO` reference) as the default's yardstick — diffing the
+new default build against it now reports errors, correctly. Dolphin now has three
+(`AUTO`, `USE_SYSTEM_LIBS=OFF`, `ENABLE_QT=1`), and the checked-in diff config is
+aligned to the one that is actually the default. Saying that out loud is better
+than quietly re-pointing the config and claiming convergence.
+
 ---
 
 ## 5. AUTOMOC hides a missing entry in the source list
@@ -423,13 +502,22 @@ build faithfully; only the build proves the result works.
 
 **And building on ONE host wasn't sufficient either.** The enet bug (§4's
 addendum) survived a converged diff, a green `//...`, 1350 passing tests and a
-running emulator — then failed immediately on someone else's distro. The diff
-compares one *configured* build against another, so every host-dependent
-conditional in the original build description (`find_library` fallbacks, version
-floors, `check_function_exists`) is invisible to it by construction: it sees the
-branch taken, never the branch that exists. A migration that ends at "green on my
-machine" has verified one point in a configuration space the original build was
-explicitly written to span.
+running emulator — then failed immediately on someone else's distro, twice more
+after that (fmt, SFML). The diff compares one *configured* build against another,
+so every host-dependent conditional in the original build description
+(`find_library` fallbacks, version floors, `check_function_exists`) is invisible to
+it by construction: it sees the branch taken, never the branch that exists. A
+migration that ends at "green on my machine" has verified one point in a
+configuration space the original build was explicitly written to span.
+
+The durable fix wasn't a better diff, it was **translating the hermetic branch**:
+where the original build says "system library or bundled copy, depending on the
+host", migrate the bundled side and put the host side behind an opt-in `select()`.
+That removes the host from the answer instead of testing more hosts. It also
+turned out to be the highest-yield diff of the migration (§4), because it put 14
+previously-unmigrated libraries under flag-level comparison for the first time —
+which is the general shape: *the parts of a build you resolved away are the parts
+you never checked.*
 
 **The forcing function is the point.** Every finding here is a place where CMake's
 permissiveness — global include paths, non-enforced dependencies, `PUBLIC` by
@@ -474,9 +562,19 @@ grep MBEDTLS_VERSION_STRING Externals/mbedtls/include/mbedtls/version.h \
                             /usr/include/mbedtls/build_info.h
 
 # §4  every version-gated system dependency (each one a conditional the
-#     action-graph diff cannot see)
+#     action-graph diff cannot see); 25 calls, 11 with an explicit floor
 grep -n 'dolphin_find_optional_system_library' CMakeLists.txt
 grep -n 'ENET_SOCKOPT_TTL' /usr/include/enet/enet.h   # absent => needs bundled enet
+grep -rn 'FMT_VERSION' /usr/include/fmt/base.h        # < 100200 => fmt::println missing
+
+# §4  the PUBLIC compile definitions that must reach consumers (six of them, each
+#     an ODR hazard if a consumer disagrees)
+grep -rn 'target_compile_definitions.*PUBLIC' Externals/*/CMakeLists.txt \
+                                              Externals/*/*/CMakeLists.txt
+
+# §4  the -DOFF bug: "OFF" forwarded into target_compile_definitions(... PUBLIC)
+grep -n 'PUGIXML_BUILD_DEFINES' Externals/pugixml/CMakeLists.txt \
+                                Externals/pugixml/pugixml/CMakeLists.txt
 
 # §5  Q_OBJECT headers missing from the source list
 grep -rl Q_OBJECT Source/Core/DolphinQt/ | wc -l
