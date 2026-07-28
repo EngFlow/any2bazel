@@ -431,6 +431,38 @@ image decoder — is Bazel-built.
 
 Rust stays prebuilt-`.a` until Ring 2.
 
+## Hermeticity cleanup: dropping the global `-IBuild/full` include roots
+
+The `.bazelrc` carried `--cxxopt=-IBuild/full{,/Libraries,/Services}` on *every*
+compile, added early to mirror CMake's build-dir include. It was a hole of
+exactly the kind finding 1 is about, but repo-wide: with those roots visible, any
+TU could `#include` any CMake-generated header **without declaring a dep on it**,
+so Bazel could not catch a missing edge — the sandbox was being handed the whole
+reference build's header tree.
+
+It turned out to be entirely unnecessary. Removed, and the build is unaffected:
+LibWeb's 2,573 actions compile, `//:ladybird` plus all 5 service binaries link,
+and both `--headless=text` and `--headless=layout-tree` are **byte-identical to
+the CMake reference**. Generated headers now resolve only through declared deps
+(the per-package genrule outputs, plus the header-root `cc_library`s under
+`Build/full/*/BUILD.bazel` — which *are* declared).
+
+Worth noting how weak the earlier evidence was: aquery showed both
+`bazel-out/.../Bindings/MediaCapabilities.h` and
+`Build/full/.../Bindings/MediaCapabilities.h` as inputs to the same compile. The
+parity result was still real — the compile command line puts Bazel's genfiles
+root *before* `Build/full`, so Bazel's headers won — but it held by include-order
+luck rather than by construction. Now it holds by construction.
+
+Also deduplicated two repeated `--linkopt`s left over from iterating.
+
+**Still not portable to another machine**, which is a separate problem from this
+one: the build consumes 224 vcpkg `.so`s, a 260 MB prebuilt `librust_combined.a`,
+and 13 Qt `moc` outputs from `Build/full`, and hardcodes host Qt paths via
+`--action_env=CPLUS_INCLUDE_PATH`. That is Ring 2 (+ rules_rust, + moc).
+(`-march=native` is *not* part of that problem: upstream CMake does the same by
+default, so mirroring it is correct parity.)
+
 ## Plan for the rest
 
 - **Ring 1b (remaining libs).** Apply the proven emitter/harness to the
@@ -443,7 +475,11 @@ Rust stays prebuilt-`.a` until Ring 2.
 - **Ring 2 (stretch) — real bzlmod deps.** Swap `cc_import` shims for BCR
   `bazel_dep`s where they exist + `rules_foreign_cc` otherwise, and build a
   find_package/vcpkg → BCR resolver adapter (the designed-but-unbuilt external
-  resolver plug-in point).
+  resolver plug-in point). This is also the bulk of what stands between the
+  current build and *"can Ulf build it on his machine"*: today it needs my
+  `Build/full` for vcpkg `.so`s, the prebuilt Rust archive and Qt `moc` output.
+  Remaining after Ring 2: `rules_rust` for the 10 crates, a Bazel `moc` rule, and
+  replacing the hardcoded host Qt include paths.
 
 ## Success gate — MET
 
