@@ -69,3 +69,6 @@ were written by hand instead: [docs/BAZEL-RULES.md](docs/BAZEL-RULES.md).
   - `esbuild_bundle`
   - `vscode_app`
   - `nodegyp_module`
+- Case study, incl. byte parity (7710/7710 `.js`) and what a bespoke build
+  with no extractable action graph costs:
+  [docs/CASE-vscode-migration.md](docs/CASE-vscode-migration.md)
