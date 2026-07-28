@@ -110,7 +110,7 @@ re-validated against the real AK diff.
    the static-link and final-binary cases correct; the intermediate-solib case
    is inherently a project-wide-only check.
 
-## Ring 1b — codegen byte-parity (DONE for LibWeb)
+## Ring 1b — codegen byte-parity (DONE: all 46 generators)
 
 **Result: 1379/1379 LibWeb generated files byte-identical to the CMake build,
 produced by Bazel genrules invoking the same Python generators.**
@@ -176,10 +176,45 @@ reproducibility bug it caught and we fixed at the source):**
    nondeterminism source prove nothing.** `bazel_parity_harness.py` now takes
    `--seed N`.
 
-Remaining Ring 1b work is mechanical: run `emit_codegen_bazel.py` for the other
-libraries with generators (LibJS bytecode, LibHTTP HSTS, the IPC endpoints under
-LibRequests/LibWebView/Services, Compositor WebGL replayer) — same pattern, same
-harness to verify.
+### Ring 1b tail — the other 19 generators (DONE)
+
+The tree has 46 Python-generator commands; the 27 above are LibWeb's. The other
+19 all land in the **root** Bazel package (16 IPC endpoints under
+`Services/*` + `LibWebView`/`LibRequests`/`LibImageDecoderClient`, LibJS's
+`Bytecode/Op`, LibHTTP's HSTS table, the Compositor WebGL replayer), emitted by
+`Meta/emit_root_codegen_bazel.py` into `codegen_root.bzl`. **23 output files,
+23/23 byte-identical to CMake.** All 46 generators are now Bazel-run.
+
+Three things this surfaced that the LibWeb emitter didn't have to handle:
+
+- **CMake's `cd` has nothing to do with where output lands.**
+  `WebContentClientEndpoint.h` is generated with
+  `cd Build/full/Libraries/LibWebView` but written to `Services/WebContent/`.
+  Output paths in `build.ninja` are relative to that `cd`, so they must be
+  resolved against it and then rebased onto the package — not read literally.
+- **Subpackage sources need labels.** The WebGL replayer reads
+  `Libraries/LibWeb/WebGL/GLFunctions.json`, which is in a *different* Bazel
+  package, so the root package must reference it as
+  `//Libraries/LibWeb:WebGL/GLFunctions.json`. Bazel rejected the flat path
+  outright, which is the sort of thing a path-scraping emitter gets wrong
+  silently under CMake.
+- **Generating the files isn't enough — the include roots have to move too.**
+  Consumers include them as `<WebContent/WebContentClientEndpoint.h>` (CMake's
+  `-IServices`), so without genfiles header roots the compile keeps silently
+  resolving to CMake's copy under `Build/full` and the genrules are dead weight.
+  The emitter now also emits `generated_{libraries,services}_headers`
+  `cc_library`s (`includes = ["Libraries"|"Services"]`), listed *before* the
+  `Build/full` roots.
+
+**Verified by removal, not by inspection:** with all 23 CMake-generated files
+moved out of `Build/full`, all six binaries still build and the browser still
+renders `--headless=text` and `--headless=layout-tree` byte-identically to the
+reference. That is the test that distinguishes "Bazel generates this" from
+"Bazel happens to find CMake's copy."
+
+Of the 739 headers the `Build/full` globs supply, **708 are now also produced by
+Bazel**; the remaining 31 are Rust FFI headers and CMake's
+`generate_export_header` output (Ring 2 / rules_rust territory).
 
 ## Ring 1c — per-library BUILD generation (in progress, pattern proven)
 
@@ -465,8 +500,6 @@ default, so mirroring it is correct parity.)
 
 ## Plan for the rest
 
-- **Ring 1b (remaining libs).** Apply the proven emitter/harness to the
-  non-LibWeb generator commands (LibJS/LibHTTP/IPC/Compositor). Same shape.
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
   LibCore/LibUnicode/… → LibJS/LibGfx → LibWeb → LibWebView → Services/UI →
   `Ladybird`. Per layer: generate `BUILD.bazel` from the model, aquery, diff,
