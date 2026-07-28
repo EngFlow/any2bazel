@@ -54,6 +54,13 @@ not against this repo.
   Takes `--seed N` to set `PYTHONHASHSEED`: a single run inherits one seed and so
   cannot detect a seed-dependent generator (finding 2 matched by luck at seed 4
   and diverged at seed 1), so sweep several seeds.
+- **`repro-bindings-nondeterminism.sh`** — self-contained repro for finding 2:
+  `./repro-bindings-nondeterminism.sh /path/to/ladybird`. Needs only `python3`
+  and a checkout — no CMake, no Bazel, no build. Runs the bindings generator over
+  2 IDL files under `PYTHONHASHSEED` 0–5 and prints the struct emission order;
+  exits 1 if the order varies (bug present), 0 if stable (patch applied), so it
+  doubles as a CI guard. Note `to_idl_value.py` cannot be run directly — it is a
+  library module with no `main()` whose imports need `Meta/` on `sys.path`.
 - **`upstream-sort-dictionary-order.patch`** — the one-line upstream fix making
   `generate_libweb_bindings.py` sort its dictionary dependency names instead of
   iterating a set. Reproduces the CMake reference 1332/1332 under every seed
