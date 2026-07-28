@@ -51,6 +51,13 @@ not against this repo.
   result against the CMake build, proving the generators are reproducible before
   wrapping them. Result: 71/71 single-generator outputs identical (the
   1,331-file bindings mega-command verified separately, all identical).
+  Takes `--seed N` to set `PYTHONHASHSEED`: a single run inherits one seed and so
+  cannot detect a seed-dependent generator (finding 2 matched by luck at seed 4
+  and diverged at seed 1), so sweep several seeds.
+- **`upstream-sort-dictionary-order.patch`** — the one-line upstream fix making
+  `generate_libweb_bindings.py` sort its dictionary dependency names instead of
+  iterating a set. Reproduces the CMake reference 1332/1332 under every seed
+  tried; candidate for an upstream PR.
 
 ## Emitted / hand-written BUILD files (snapshots)
 
@@ -91,5 +98,7 @@ not against this repo.
 
 The other 14 findings are migration mechanics — including an extractor invariant
 Bazel's sandbox exposed (declared deps beat the command line: finding 1) and one
-genuine upstream reproducibility bug in Ladybird (a `PYTHONHASHSEED`-dependent
-generator).
+genuine upstream reproducibility bug in Ladybird, where a generator's emission
+order followed Python's set iteration; fixed at the source by sorting
+(finding 2, `upstream-sort-dictionary-order.patch`) rather than papered over
+with a seed pin.

@@ -136,7 +136,7 @@ framing suggested). Each generator command is a clean
 
 **Two parity findings surfaced by Bazel sandboxing (the payoff of hermetic
 execution — one an extractor bug it caught, one a latent upstream
-reproducibility bug):**
+reproducibility bug it caught and we fixed at the source):**
 
 1. **Off-command-line input dropped by the extractor (our bug, not CMake's).**
    `generate_dom_tree.py` for `HTML/MediaControlsDOM` reads
@@ -166,16 +166,49 @@ reproducibility bug):**
    tempting shortcut for any CMake→Bazel extractor and this is exactly where it
    breaks.
 
-2. **Latent nondeterminism (`PYTHONHASHSEED`).** `generate_libweb_bindings.py`
-   emits one dictionary's dependency-ordered structs (`AudioConfiguration` vs
-   `VideoConfiguration` in `MediaCapabilities.h`) in an order that depends on
-   Python set iteration — i.e. it varies with `PYTHONHASHSEED`. The CMake
-   `Build/full` reference happens to match `PYTHONHASHSEED=0`; Bazel's default
-   (randomized) seed produced a content-identical but reordered file (1378/1379
-   parity). Fix: pin `PYTHONHASHSEED=0` on every codegen genrule — which both
-   restores byte-parity *and* makes the actions hermetic and remote-cacheable.
-   This is a real reproducibility bug in the upstream generator (its output is
-   not seed-stable); the migration hardens it.
+2. **Latent nondeterminism in the generator — fixed by sorting.**
+   `generate_libweb_bindings.py` emitted the dependency-ordered dictionary
+   structs of `MediaCapabilities.h` (`AudioConfiguration` vs
+   `VideoConfiguration`) in an order that varied with `PYTHONHASHSEED`: the
+   topological sort in `dictionaries_in_dependency_order()`
+   (`Meta/Generators/libweb_bindings/to_idl_value.py`) iterated a **set** of
+   dependency names, and `dependency_names_for()` /
+   `GenerationContext.dictionary_type_names()` build that set as a comprehension
+   — so DFS visit order, and hence emission order, followed Python's per-process
+   string hash.
+
+   My first response was to pin `PYTHONHASHSEED=0` on every codegen genrule.
+   That restores byte-parity, but it's the wrong fix: it freezes the symptom into
+   the build system and leaves the generator producing seed-dependent output for
+   everyone else (CMake, `ninja`, anyone running the script by hand). **The
+   generator should sort.** One line, upstream:
+
+   ```python
+   # Meta/Generators/libweb_bindings/to_idl_value.py, in dictionaries_in_dependency_order()
+   -        for dependency_name in dependency_names_for(dictionary):
+   +        # Sorted: dependency_names_for() returns a set, so iterating it directly
+   +        # makes the emitted order depend on PYTHONHASHSEED.
+   +        for dependency_name in sorted(dependency_names_for(dictionary)):
+   ```
+
+   Sorting the names (not the `Dictionary` objects) keeps the topological
+   ordering correct — it only makes the tie-break among independent dependencies
+   deterministic — and it is stable regardless of seed. Verified: the patched
+   generator reproduces the CMake reference **1332/1332 files byte-identical
+   under seeds 0, 1, 2, 7 and 12345**, whereas the unpatched generator diverges
+   on `MediaCapabilities.h` at seed 1 while matching at seed 4. Patch:
+   `examples/ladybird/upstream-sort-dictionary-order.patch` — worth an upstream
+   PR (this one is a genuine upstream bug, unlike finding 1).
+
+   **Why this hid for so long, and the harness lesson:** the parity harness
+   originally ran each generator exactly once, inheriting whatever seed the
+   process had. A seed-dependent generator passes such a check most of the time —
+   note seed 4 matches by luck — so "1331/1331 identical" was never evidence of
+   reproducibility. The harness now takes `--seed N` and is swept over several
+   seeds (46 commands / 71 outputs identical at seeds 1 and 3). *Determinism
+   checks that don't vary the nondeterminism source prove nothing.* The
+   `PYTHONHASHSEED=0` pin stays on the genrules, but now as defence-in-depth for
+   hermeticity/remote-caching rather than as the thing holding parity up.
 
 Remaining Ring 1b work is mechanical: run `emit_codegen_bazel.py` for the other
 libraries with generators (LibJS bytecode, LibHTTP HSTS, the IPC endpoints under

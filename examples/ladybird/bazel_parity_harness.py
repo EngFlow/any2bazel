@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """Ring 1b parity harness: extract every Python-generator CUSTOM_COMMAND from
 Build/full/build.ninja, re-run it into a scratch mirror, and byte-diff each
-produced file against the CMake-materialized file in Build/full."""
+produced file against the CMake-materialized file in Build/full.
+
+Usage: bazel_parity_harness.py [--seed N]
+
+--seed sets PYTHONHASHSEED for every generator. A generator whose output depends
+on set/dict iteration order will match the reference under some seeds and not
+others, so a single run (which inherits the seed CMake happened to use) can't
+prove reproducibility -- sweep several seeds. This is how the
+generate_libweb_bindings.py dictionary-ordering bug was found, and re-running
+with a few seeds is what keeps it fixed.
+"""
 import os, re, subprocess, sys, shutil, filecmp
 
 ROOT = "/home/ubuntu/ladybird-work"
@@ -21,6 +31,12 @@ def outputs_of(cmd):
     return re.findall(r'copy_if_different \S+\.tmp (\S+)', cmd)
 
 def main():
+    seed = None
+    if "--seed" in sys.argv:
+        seed = sys.argv[sys.argv.index("--seed") + 1]
+    env = dict(os.environ)
+    if seed is not None:
+        env["PYTHONHASHSEED"] = seed
     if os.path.exists(SCRATCH):
         shutil.rmtree(SCRATCH)
     shutil.copytree(FULL, SCRATCH, symlinks=True,
@@ -30,7 +46,7 @@ def main():
     problems = []
     for cmd in cmds:
         rc = subprocess.run(cmd.replace(FULL, SCRATCH), shell=True, cwd=SCRATCH,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=env)
         cwd = cd_of(cmd).replace(FULL, SCRATCH)
         outs = outputs_of(cmd)
         cdreal = cd_of(cmd)
@@ -51,7 +67,8 @@ def main():
                 identical += 1
             else:
                 mismatch += 1; problems.append(("DIFF", o, ""))
-    print(f"generator commands: {len(cmds)}  errored: {errored}")
+    print(f"generator commands: {len(cmds)}  errored: {errored}"
+          + (f"  PYTHONHASHSEED={seed}" if seed is not None else "  (inherited seed)"))
     print(f"output files checked: {total}  identical: {identical}  mismatch: {mismatch}")
     for kind, name, detail in problems[:50]:
         print(f"  {kind:8} {name}")

@@ -165,7 +165,10 @@ def libweb_codegen():
 
 def libweb_bindings_codegen():
     # Mega-genrule: 661 IDL args (659 static + 2 generated) -> 1331 files.
-    # Byte-identical to CMake (proven 1331/1331 by Meta/bazel_parity_harness.py).
+    # Byte-identical to CMake (proven 1331/1331 by Meta/bazel_parity_harness.py,
+    # now across a sweep of PYTHONHASHSEED values -- the generator sorts its
+    # dictionary dependency order, so the seed pin below is belt-and-braces
+    # hermeticity, not a correctness crutch).
     # srcs uses a glob of ALL *.idl so the generator's include/partial-interface
     # closure is present in the Bazel sandbox, not just the 661 top-level args.
     native.genrule(
