@@ -54,6 +54,11 @@ not against this repo.
   Takes `--seed N` to set `PYTHONHASHSEED`: a single run inherits one seed and so
   cannot detect a seed-dependent generator (finding 2 matched by luck at seed 4
   and diverged at seed 1), so sweep several seeds.
+- **`BUGREPORT-bindings-nondeterminism.md`** — the upstream bug report for
+  finding 2, ready to file: environment, copy-pasteable repro with actual vs
+  expected output, root cause, honest impact assessment (reproducibility bug, not
+  a miscompile — both orderings compile), the one-line fix, and what was
+  deliberately *not* changed.
 - **`repro-bindings-nondeterminism.sh`** — self-contained repro for finding 2:
   `./repro-bindings-nondeterminism.sh /path/to/ladybird`. Needs only `python3`
   and a checkout — no CMake, no Bazel, no build. Runs the bindings generator over
