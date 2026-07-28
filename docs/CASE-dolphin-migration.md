@@ -444,6 +444,67 @@ Qt code in it whatsoever.
 GUI links, so `uicommon` is configuration-independent; and make `Qt6::DBus`
 `PRIVATE`.
 
+### Qt's private headers are versioned, and my translation pasted the version in
+
+A fourth report, worth recording because it is §4's lesson landing on a dependency
+that *cannot* be bundled away:
+
+```
+Source/Core/DolphinQt/MainWindow.cpp:35:10: fatal error:
+  qpa/qplatformnativeinterface.h: No such file or directory
+```
+
+`qplatformnativeinterface.h` is a Qt **private** header, and Qt installs private
+headers under a *versioned* directory:
+
+```
+/usr/include/x86_64-linux-gnu/qt6/QtGui/6.10.2/QtGui/qpa/...
+```
+
+Dolphin's CMake asks for them properly (`DolphinQt/CMakeLists.txt:15`):
+
+```cmake
+# GuiPrivate is needed to #include qplatformnativeinterface.h in MainWindow.cpp
+# with Qt 6.10+.
+find_package(Qt6 REQUIRED COMPONENTS GuiPrivate)
+...
+${Qt6Gui_PRIVATE_INCLUDE_DIRS}
+```
+
+My translation reduced `Qt6Gui_PRIVATE_INCLUDE_DIRS` to the literal string
+`6.10.2` in a `.bzl` file, with a comment telling the reader to edit it if their
+Qt differed. So the Bazel build worked on exactly one Qt patch release, and the
+"documentation" for that was a caveat in a README — which is what a hardcoded
+host assumption looks like when you are honest about it and *still* the wrong
+answer.
+
+The fix is a repository rule that does what `find_package` does: locate the Qt
+include root and `moc`, then **read the versioned private-header directory off the
+filesystem** rather than naming it. That directory *is* Qt's private-header
+version marker, so reading it is the detection; nothing about the version is
+written down in the repo, and any Qt 6.x works. It also `fail()`s with the package
+to install and the `#include` that needs it when the private headers are absent —
+a diagnosis instead of a missing-header error 200 files into the build.
+
+Two things generalize:
+
+1. **A migration should test the *variable*, not the value.** This bug survived a
+   converged diff, a green `//...`, 1350 passing tests and a running GUI, because
+   every one of those ran on the machine the version string was copied from. The
+   test that catches it is cheap and obvious once stated: mirror the dependency's
+   tree with its version renamed, point the build at it, and see whether it still
+   builds. (It now does, and that mirror is the exact tree that reproduces the
+   reported failure on the old code.)
+2. **`find_package`/`pkg_check_modules`/`check_*` are the highest-value things in
+   a CMake build to translate as *questions*.** §4's externals could dodge the
+   question entirely by building the bundled copy; Qt has no bundled copy on Linux,
+   so there the only correct move is to ask it. Either way the rule is the same:
+   **where the original build asks a question about the host, the translation must
+   ask the same question or eliminate it — never answer it once and paste the
+   answer.** Every host-dependent conditional a migration resolves-and-bakes is a
+   latent "works on my machine", and they are individually invisible to an
+   action-graph diff by construction.
+
 ---
 
 ## 7. Smaller things, noted in passing
@@ -502,8 +563,8 @@ build faithfully; only the build proves the result works.
 
 **And building on ONE host wasn't sufficient either.** The enet bug (§4's
 addendum) survived a converged diff, a green `//...`, 1350 passing tests and a
-running emulator — then failed immediately on someone else's distro, twice more
-after that (fmt, SFML). The diff compares one *configured* build against another,
+running emulator — then failed immediately on someone else's distro, three times
+more after that (fmt, SFML, and Qt's versioned private headers in §6). The diff compares one *configured* build against another,
 so every host-dependent conditional in the original build description
 (`find_library` fallbacks, version floors, `check_function_exists`) is invisible to
 it by construction: it sees the branch taken, never the branch that exists. A
@@ -575,6 +636,11 @@ grep -rn 'target_compile_definitions.*PUBLIC' Externals/*/CMakeLists.txt \
 # §4  the -DOFF bug: "OFF" forwarded into target_compile_definitions(... PUBLIC)
 grep -n 'PUGIXML_BUILD_DEFINES' Externals/pugixml/CMakeLists.txt \
                                 Externals/pugixml/pugixml/CMakeLists.txt
+
+# §6  Qt's versioned PRIVATE header dir -- the thing find_package(Qt6 COMPONENTS
+#      GuiPrivate) resolves, and a hardcoded version string cannot
+ls -d /usr/include/x86_64-linux-gnu/qt6/QtGui/6.*/
+find /usr/include -name qplatformnativeinterface.h
 
 # §5  Q_OBJECT headers missing from the source list
 grep -rl Q_OBJECT Source/Core/DolphinQt/ | wc -l
