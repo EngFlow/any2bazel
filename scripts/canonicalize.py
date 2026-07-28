@@ -192,6 +192,15 @@ def canonicalize_flags(
         if tok.startswith("-D"):
             _add_define(defines, tok[2:]); i += 1; continue
 
+        # force-include flavors: -include FILE / -imacros FILE. The argument is
+        # a FILE path (not a search dir), which each build system may spell
+        # absolutely (CMake) or repo-relative (Bazel); normalize it to a
+        # repo-relative path so the same forced header lines up. Emitted as a
+        # single joined token so the flag+path pair compares as one unit.
+        if tok in ("-include", "-imacros") and i + 1 < n:
+            other.append(tok + " " + _to_repo_relative(raw[i + 1], repo_root))
+            i += 2; continue
+
         # include flavors: -I, -isystem, -iquote, -idirafter (split or joined)
         if tok in ("-I", "-isystem", "-iquote", "-idirafter") and i + 1 < n:
             if not (is_bazel and _matches_any(tok, BAZEL_DEFAULT_FLAG_PREFIXES)):

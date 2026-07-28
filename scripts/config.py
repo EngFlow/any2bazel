@@ -67,6 +67,20 @@ class MigrationConfig:
     # 'external/absl+' and 'bazel-out/.../external/absl+' twin both -> '@absl').
     # Longest from-prefix wins. Applied before ignore_include_prefixes.
     include_map: tuple = ()  # tuple of (from_prefix, to_token)
+    # Source-path PREFIX REWRITES for TRANSLATION-UNIT keys, applied to both
+    # sides before the TU-set comparison -- the compile-source analogue of
+    # include_map. Same (from_prefix, to_token) shape, longest-prefix-wins.
+    # Its purpose is GENERATED-source grouping asymmetries: e.g. CMake's AUTOMOC
+    # bundles every moc_*.cpp into one mocs_compilation.cpp TU, while Bazel
+    # compiles each moc_*.cpp separately. Mapping both spellings to one token
+    # (the CMake bundle path AND the Bazel moc/ dir -> "@moc") reconciles them:
+    # the pooled TU maps collapse to the shared token, so presence matches and
+    # the representative TU's flags are still compared (extra Bazel defines stay
+    # benign WARN under the asymmetric-subset rule). Only ever use for codegen
+    # whose per-TU flags are uniform; never to paper over a real missing source.
+    # Unlike include_map, the token REPLACES the whole path (the remainder is
+    # dropped) so N generated files collapse to 1 -- see map_source().
+    source_map: tuple = ()  # tuple of (from_prefix, to_token)
     # CMake target names to drop entirely from the diff: third-party/vendored
     # code Bazel pulls as an external module, or tooling out of migration scope.
     # Unlike `ignore` (flags/defines), this is the only lever for missing_tu /
@@ -109,6 +123,23 @@ class MigrationConfig:
         frm, to = best
         return to + include[len(frm):]
 
+    def map_source(self, source: str) -> str:
+        """Apply source_map prefix rewrites to a TU key (longest from-prefix
+        wins). Returns the source unchanged if no rule matches.
+
+        NOTE the deliberate difference from map_include: the token REPLACES the
+        whole path -- the remainder after the prefix is DROPPED, not appended.
+        That makes the map COLLAPSING, which is exactly what the generated-code
+        grouping case needs: a whole directory of Bazel moc_*.cpp files and the
+        single CMake mocs_compilation.cpp bundle both become the one token, so
+        the two sides' TU sets reconcile. (An appending map could never collapse
+        N files to 1.)"""
+        best = None
+        for frm, to in self.source_map:
+            if source.startswith(frm) and (best is None or len(frm) > len(best[0])):
+                best = (frm, to)
+        return best[1] if best else source
+
     def include_ignored(self, include: str) -> bool:
         return any(include.startswith(p) for p in self.ignore_include_prefixes)
 
@@ -134,6 +165,8 @@ def load(path: str) -> MigrationConfig:
         ignore_include_prefixes=tuple(ig.get("include_prefixes", [])),
         include_map=tuple(
             (e["from"], e["to"]) for e in ig.get("include_map", [])),
+        source_map=tuple(
+            (e["from"], e["to"]) for e in ig.get("source_map", [])),
         exclude_targets=set(obj.get("exclude_targets", [])),
         bazel_args=tuple(obj.get("bazel_args", [])),
         include_tests=bool(obj.get("include_tests", False)),
