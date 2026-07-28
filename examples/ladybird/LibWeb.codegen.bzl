@@ -136,8 +136,10 @@ def libweb_codegen():
     )
     native.genrule(
         name = 'gen_MediaControlsDOM',
-        # HTML/MediaControls.css is read via a <link> in the .html at gen time
-        # (implicit input CMake never declared — surfaced by Bazel sandboxing).
+        # HTML/MediaControls.css is read via a <link> in the .html at gen time.
+        # It never appears on the generator's command line; CMake declares it in
+        # DEPENDS (Meta/CMake/libweb_generators.cmake), so the emitter must read
+        # ninja's dep list, not just the command line. Bazel's sandbox caught it.
         srcs = ['HTML/MediaControls.html', 'HTML/MediaControls.css', 'HTML/TagNames.h', 'HTML/AttributeNames.h', 'SVG/TagNames.h', 'SVG/AttributeNames.h'] + ["//Meta:generators"],
         outs = ['HTML/MediaControlsDOM.h', 'HTML/MediaControlsDOM.cpp'],
         cmd = "PYTHONHASHSEED=0 python3 Meta/Generators/generate_dom_tree.py -h $(location HTML/MediaControlsDOM.h) -c $(location HTML/MediaControlsDOM.cpp) -i $(location HTML/MediaControls.html) -s MediaControlsDOM -n Web::HTML --html-tags $(location HTML/TagNames.h) --html-attributes $(location HTML/AttributeNames.h) --svg-tags $(location SVG/TagNames.h) --svg-attributes $(location SVG/AttributeNames.h)",

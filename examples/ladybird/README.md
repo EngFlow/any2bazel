@@ -42,7 +42,10 @@ not against this repo.
 - **`emit_codegen_bazel.py`** — parses `build.ninja` and emits a Bazel `genrule`
   per generator command: absolute paths → package-relative `$(location …)`,
   CMake `*.tmp` outputs → genrule `outs`, quoted args via `shlex`, every command
-  pinned to `PYTHONHASHSEED=0` for hermetic, byte-stable output.
+  pinned to `PYTHONHASHSEED=0` for hermetic, byte-stable output. `srcs` is the
+  **union of the command line and the ninja edge's declared deps** — generators
+  read inputs never passed as arguments (see finding 1 in the case doc), so
+  scraping only the command line silently under-declares them.
 - **`bazel_parity_harness.py`** — re-runs every `Meta/Generators/*.py`
   `CUSTOM_COMMAND` from `build.ninja` into a scratch mirror and byte-diffs the
   result against the CMake build, proving the generators are reproducible before
@@ -86,6 +89,7 @@ not against this repo.
 3. **Extractor OOM on large C++ targets** — depset flattening was eager and
    per-node (combinatorial on shared DAGs); now lazy, memoized, iterative.
 
-The other 14 findings are migration mechanics (and two upstream correctness bugs
-in Ladybird: an undeclared implicit codegen input, and a `PYTHONHASHSEED`-
-dependent generator).
+The other 14 findings are migration mechanics — including an extractor invariant
+Bazel's sandbox exposed (declared deps beat the command line: finding 1) and one
+genuine upstream reproducibility bug in Ladybird (a `PYTHONHASHSEED`-dependent
+generator).

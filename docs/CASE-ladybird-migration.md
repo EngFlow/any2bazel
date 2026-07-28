@@ -135,17 +135,36 @@ framing suggested). Each generator command is a clean
   since generators do `sys.path.append` then `import Generators.*` / `Utils.*`).
 
 **Two parity findings surfaced by Bazel sandboxing (the payoff of hermetic
-execution):**
+execution — one an extractor bug it caught, one a latent upstream
+reproducibility bug):**
 
-1. **Undeclared implicit input.** `generate_dom_tree.py` for
-   `HTML/MediaControlsDOM` reads `HTML/MediaControls.css` at generation time via
-   a `<link rel="stylesheet" href="MediaControls.css">` inside the input
-   `MediaControls.html`. CMake never declared this dependency (it happened to
-   work because the source tree is present in-place); Bazel's sandbox has only
-   the declared `srcs`, so it failed loudly with `FileNotFoundError`. Fix: add
-   `HTML/MediaControls.css` to that genrule's `srcs`. This is a *correctness*
-   win — under CMake, editing `MediaControls.css` would not reliably retrigger
-   the generator.
+1. **Off-command-line input dropped by the extractor (our bug, not CMake's).**
+   `generate_dom_tree.py` for `HTML/MediaControlsDOM` reads
+   `HTML/MediaControls.css` at generation time, by following a `<link
+   rel="stylesheet" href="MediaControls.css">` inside its declared input
+   `MediaControls.html`. So the `.css` is a real input that **never appears on
+   the generator's command line**. Our first `emit_codegen_bazel.py` derived
+   `srcs` purely by scraping the command line, so it dropped the `.css`, and
+   Bazel's sandbox failed loudly with `FileNotFoundError`.
+
+   **Upstream CMake gets this right** — it lists the file explicitly in the
+   generator's `dependencies`/`DEPENDS`
+   (`Meta/CMake/libweb_generators.cmake`, in the `MediaControlsDOM.cpp`
+   `invoke_py_generator` call), which is visible in the ninja edge and verified
+   by `touch Libraries/LibWeb/HTML/MediaControls.css && ninja -n …
+   MediaControlsDOM.cpp` → the generator re-runs. Nothing to patch upstream.
+
+   The **real** lesson is an extractor invariant: *the build graph's declared
+   dependency list is authoritative, the command line is not*. `srcs` must be
+   the union of (command-line paths) and (the edge's `DEPENDS`), because a tool
+   may read inputs it was never handed as arguments. `emit_codegen_bazel.py`
+   now parses each ninja edge's dep list and folds in any in-package input the
+   command line didn't mention. Tree-wide that rule matters for **3 of 46**
+   generator edges — `MediaControlsDOM` plus the two ImageDecoder IPC endpoints
+   (whose `.ipc` input reaches the command line only via a `../..`-relative
+   path, i.e. the same class of mismatch). Scraping command lines is the
+   tempting shortcut for any CMake→Bazel extractor and this is exactly where it
+   breaks.
 
 2. **Latent nondeterminism (`PYTHONHASHSEED`).** `generate_libweb_bindings.py`
    emits one dictionary's dependency-ordered structs (`AudioConfiguration` vs

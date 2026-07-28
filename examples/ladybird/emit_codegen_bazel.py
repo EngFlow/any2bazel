@@ -30,11 +30,23 @@ def parse(lib_build_dir):
                    if 'python3' in s and 'Generators/' in s), None)
         if not py:
             continue
-        rules.append(py.strip())
+        # The ninja edge's own dependency list (CMake DEPENDS) is authoritative:
+        # a generator may read files that never appear on its command line
+        # (e.g. generate_dom_tree.py follows <link href> out of its input HTML).
+        # Scraping only the command line silently drops those inputs, which is
+        # fine under CMake (in-place source tree) but fails in Bazel's sandbox.
+        declared = [os.path.normpath(d) for d in
+                    b.split(': CUSTOM_COMMAND', 1)[1].split('\n', 1)[0].split()]
+        rules.append((py.strip(), declared))
     return rules
 
-def convert(py, pkg_src_dir):
-    """py: the 'python3 .../script.py <args>' segment. Returns (name, dict)."""
+def convert(py, pkg_src_dir, declared=()):
+    """py: the 'python3 .../script.py <args>' segment.
+
+    declared: the CMake/ninja DEPENDS list for this edge. Inputs listed there but
+    absent from the command line are implicit reads and must still be declared as
+    Bazel srcs, or the sandboxed action fails.  Returns (name, dict).
+    """
     script = re.search(r'Generators/(\S+\.py)', py).group(1)
     tail = shlex.split(py.split(script, 1)[1])
     outs, srcs, argv = [], [], []
@@ -58,6 +70,14 @@ def convert(py, pkg_src_dir):
         else:
             argv.append(shlex.quote(t) if ' ' in t else t)
         i += 1
+    # Fold in DEPENDS-only inputs (implicit reads: not on the command line).
+    for d in (os.path.normpath(x) for x in declared):
+        if not d.startswith(pkg_src_dir + '/'):
+            continue            # generator script (covered by //Meta:generators)
+        rel = os.path.relpath(d, pkg_src_dir)
+        if rel not in srcs:
+            srcs.append(rel)
+
     base = os.path.splitext(os.path.basename(outs[0]))[0] if outs else script
     name = 'gen_' + re.sub(r'[^A-Za-z0-9]', '_', base)
     return name, dict(script=script, outs=outs, srcs=srcs, args=' '.join(argv))
@@ -71,10 +91,10 @@ def main():
     print('# %d Python-generator genrules for %s (byte-parity: Meta/bazel_parity_harness.py)\n' % (len(rules), lib))
     print('def %s_codegen():' % lib.split('/')[-1].lower())
     seen = set()
-    for py in rules:
+    for py, declared in rules:
         if 'generate_libweb_bindings.py' in py:
             continue  # mega-rule handled separately
-        name, d = convert(py, pkg_src)
+        name, d = convert(py, pkg_src, declared)
         if name in seen:
             continue
         seen.add(name)
