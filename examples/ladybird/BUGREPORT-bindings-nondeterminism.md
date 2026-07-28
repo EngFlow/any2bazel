@@ -1,5 +1,7 @@
 # `generate_libweb_bindings.py` output depends on `PYTHONHASHSEED`
 
+*Filed upstream: [LadybirdBrowser/ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)*
+
 `dictionaries_in_dependency_order()` in `Meta/Generators/libweb_bindings/to_idl_value.py`
 iterates a *set* of dependency names (`for dependency_name in dependency_names_for(dictionary)`),
 so when a dictionary has two independent dependencies their emission order follows Python's

@@ -55,7 +55,8 @@ not against this repo.
   cannot detect a seed-dependent generator (finding 2 matched by luck at seed 4
   and diverged at seed 1), so sweep several seeds.
 - **`BUGREPORT-bindings-nondeterminism.md`** — the upstream bug report for
-  finding 2, ready to file: one paragraph, a copy-pasteable repro, and the fix.
+  finding 2: one paragraph, a copy-pasteable repro, and the fix. **Filed as
+  [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899).**
 - **`repro-bindings-nondeterminism.sh`** — self-contained repro for finding 2:
   `./repro-bindings-nondeterminism.sh /path/to/ladybird`. Needs only `python3`
   and a checkout — no CMake, no Bazel, no build. Runs the bindings generator over
@@ -63,7 +64,8 @@ not against this repo.
   exits 1 if the order varies (bug present), 0 if stable (patch applied), so it
   doubles as a CI guard. Note `to_idl_value.py` cannot be run directly — it is a
   library module with no `main()` whose imports need `Meta/` on `sys.path`.
-- **`upstream-sort-dictionary-order.patch`** — the one-line upstream fix making
+- **`upstream-sort-dictionary-order.patch`** — the one-line upstream fix (for
+  [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)) making
   `generate_libweb_bindings.py` sort its dictionary dependency names instead of
   iterating a set. Reproduces the CMake reference 1332/1332 under every seed
   tried; candidate for an upstream PR.

@@ -197,8 +197,9 @@ reproducibility bug it caught and we fixed at the source):**
    generator reproduces the CMake reference **1332/1332 files byte-identical
    under seeds 0, 1, 2, 7 and 12345**, whereas the unpatched generator diverges
    on `MediaCapabilities.h` at seed 1 while matching at seed 4. Patch:
-   `examples/ladybird/upstream-sort-dictionary-order.patch` — worth an upstream
-   PR (this one is a genuine upstream bug, unlike finding 1).
+   `examples/ladybird/upstream-sort-dictionary-order.patch`. **Filed upstream as
+   [LadybirdBrowser/ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)** (this one is a genuine upstream bug,
+   unlike finding 1).
 
    **Why this hid for so long, and the harness lesson:** the parity harness
    originally ran each generator exactly once, inheriting whatever seed the
