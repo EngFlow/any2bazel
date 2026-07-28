@@ -202,6 +202,38 @@ def test_object_library_foldin_converges():
     assert summarize(diff_models(a, b))["converged"]
 
 
+def test_source_map_reconciles_codegen_bundling_asymmetry():
+    # CMake's AUTOMOC bundles every moc_*.cpp into ONE mocs_compilation.cpp TU;
+    # Bazel compiles each moc_*.cpp separately. Same generated meta-object code,
+    # different (build-system-specific) source paths, so the path-keyed TU diff
+    # reports the CMake bundle as missing_tu and each Bazel moc TU as extra_tu.
+    # A source_map collapsing both spellings to one token reconciles them.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("app/main.cpp", ["-DFOO=1"], is_bazel=False),
+                          tu_from_raw("build/app_autogen/mocs_compilation.cpp",
+                                      ["-DFOO=1"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("app/main.cpp", ["-DFOO=1"], is_bazel=True),
+                          tu_from_raw("bazel-out/k8-fastbuild/bin/moc/moc_A.cpp",
+                                      ["-DFOO=1"], is_bazel=True),
+                          tu_from_raw("bazel-out/k8-fastbuild/bin/moc/moc_B.cpp",
+                                      ["-DFOO=1"], is_bazel=True)]))
+    # Without the map: the CMake bundle is a hard missing_tu error.
+    res = summarize(diff_models(a, b))
+    assert not res["converged"]
+    kinds = {d["kind"] for d in res["discrepancies"] if d["severity"] == "error"}
+    assert "missing_tu" in kinds
+
+    # With it: both sides' moc paths collapse to "@moc" and the diff converges.
+    cfg = MigrationConfig(source_map=(
+        ("build/app_autogen/mocs_compilation.cpp", "@moc"),
+        ("bazel-out/k8-fastbuild/bin/moc/", "@moc"),
+    ))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
 def test_ignore_flags_and_defines_suppress_diffs():
     # A reviewer-approved flag/define difference is suppressed via config and
     # the diff converges; without the config it's an error.

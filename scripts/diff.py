@@ -196,14 +196,17 @@ _LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
                   TargetKind.INTERFACE}
 
 
-def _union_tus(views: Dict[str, TargetView], names) -> Dict[str, TranslationUnit]:
+def _union_tus(views: Dict[str, TargetView], names,
+               cfg: "MigrationConfig") -> Dict[str, TranslationUnit]:
     """Pool TUs of the given target views into one source-keyed map (the TU-SET
     comparison): grouping/renames/fold-ins don't matter -- every compiled source
-    lands in one flat map keyed by repo-relative path."""
+    lands in one flat map keyed by repo-relative path. Keys are run through
+    cfg.map_source so generated-source grouping asymmetries (e.g. CMake's single
+    AUTOMOC bundle vs Bazel's per-header moc_*.cpp) collapse to one token."""
     out: Dict[str, TranslationUnit] = {}
     for n in names:
         for tu in views[n].tus:
-            out.setdefault(tu.key(), tu)
+            out.setdefault(cfg.map_source(tu.key()), tu)
     return out
 
 
@@ -255,7 +258,7 @@ def _all_source_keys(views: Dict[str, TargetView], cfg: "MigrationConfig") -> se
         if not in_scope:
             continue
         for tu in t.tus:
-            keys.add(tu.key())
+            keys.add(cfg.map_source(tu.key()))
     return keys
 
 
@@ -290,8 +293,8 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     b_all = _all_source_keys(b_views, cfg)
 
     # ---- libraries: project-wide TU-set comparison -------------------------
-    a_union = _union_tus(a_views, a_libs)
-    b_union = _union_tus(b_views, b_libs)
+    a_union = _union_tus(a_views, a_libs, cfg)
+    b_union = _union_tus(b_views, b_libs, cfg)
     for src in sorted(set(a_union) - b_all):
         out.append(Discrepancy(Kind.MISSING_TU.value, Severity.ERROR.value,
                                "<libraries>", "source compiled in cmake but not bazel", tu=src))
@@ -310,7 +313,10 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
                                name, "executable in bazel but not cmake"))
     for name in sorted(a_exes & b_exes):
         ta, tb = a_views[name], b_views[name]
-        amap, bmap = ta.tu_map(), tb.tu_map()
+        # TU keys go through cfg.map_source (see _union_tus) so codegen grouping
+        # asymmetries collapse to a shared token on both sides.
+        amap = {cfg.map_source(k): v for k, v in ta.tu_map().items()}
+        bmap = {cfg.map_source(k): v for k, v in tb.tu_map().items()}
         # Presence is judged against the whole other side (a_all/b_all), not just
         # this exe's own TUs: a source this exe compiles may live in a library on
         # the other side (or vice versa) -- that's a grouping difference, not a
@@ -402,8 +408,8 @@ def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
                if t.role == TargetRole.TEST and not cfg.target_excluded(n)}
 
     # 1. test-source TU-set union
-    a_union = _union_tus(a_views, a_tests)
-    b_union = _union_tus(b_views, b_tests)
+    a_union = _union_tus(a_views, a_tests, cfg)
+    b_union = _union_tus(b_views, b_tests, cfg)
     for src in sorted(set(a_union) - b_all):
         out.append(Discrepancy(Kind.MISSING_TEST_TU.value, Severity.ERROR.value,
                                "<tests>", "test source compiled in cmake but not bazel", tu=src))
