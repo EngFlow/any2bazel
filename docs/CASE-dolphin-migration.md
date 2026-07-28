@@ -18,7 +18,9 @@ discover every place the original build got away with not saying what it meant.
 Dolphin is a well-maintained, 20-year-old codebase, and every finding below
 predates the migration and is live in `master` today.
 
-The order is roughly worst-first.
+The order is roughly worst-first. §8 is the exception: it is about the
+migration's own output — two artifacts a reviewer rejected, and what that says
+about where a migration is allowed to put files.
 
 ---
 
@@ -539,6 +541,77 @@ Two things generalize:
 
 ---
 
+## 8. The migration's own footprint is part of the deliverable
+
+Two findings about the *output* of a migration rather than the subject of it. Both
+were review rejections, and both generalize: a migration whose artifacts a
+maintainer refuses to carry has not landed, however green the build is.
+
+### A vendored submodule is not a place you can put a file
+
+Dolphin's externals are git submodules, and the in-tree ones need a `BUILD.bazel`.
+For most of them that is free, because the wrapper directory belongs to the
+superproject and the submodule nests one level deeper
+(`Externals/fmt/BUILD.bazel` globs into `Externals/fmt/fmt/`). For four of them —
+`gtest`, `Vulkan-Headers`, `VulkanMemoryAllocator`, `libadrenotools` — the
+submodule checkout **is** the directory, so the obvious move writes the file
+inside someone else's repository. I did that, then documented the consequence:
+the superproject commit can't track those four files, so the patch was incomplete
+and needed a *separate* markdown file reproducing their contents verbatim to be
+reproducible.
+
+That is the tell. When a translation's artifact needs prose to explain why it
+can't be committed, the artifact is in the wrong place. Two mechanisms fix it
+without touching a submodule:
+
+- **Put the targets in the nearest superproject-owned package and glob down.**
+  A package's globs may reach into a subdirectory as long as that subdirectory
+  declares no package of its own, so one superproject `Externals/BUILD.bazel`
+  can own `gtest/googletest/src/...` and the three header-only ones.
+- **Neutralize an upstream `BUILD.bazel` from the outside, not by deleting it.**
+  Two of these submodules ship their own Bazel packages (googletest's wants
+  abseil/re2/rules_python; watcher's has a macOS-only `select()`), and both break
+  `bazel build //...`. My first fix moved those files aside as
+  `BUILD.bazel.submodule-orig` — i.e. a dirty submodule worktree. `.bazelignore`
+  is the wrong tool too: it hides the *sources* the superproject wants to build.
+  The right one is `common --deleted_packages=Externals/gtest,...` in `.bazelrc`,
+  which tells Bazel those directories are not packages, handing their files to
+  the nearest enclosing one.
+
+The invariant worth stating up front on any submodule-vendored project:
+**`git submodule status` must be clean at every commit of the migration.** It's
+checkable in one command, and it forces the packaging question to be answered
+early, when it's cheap.
+
+### Stage-by-stage migration narrative is not repo documentation
+
+The migration accumulated five markdown files in the subject repo — a plan, a
+~1000-line per-stage report, a Qt design note, a generated file that pasted every
+`BUILD.bazel` into a code block, and the script that generated it. Written
+incrementally, each one was the natural place to put what I'd just learned. Read
+at once by the person who has to merge them, they are sprawl: the plan describes
+a sequence that has already happened, the report re-derives conclusions the BUILD
+files now state, and the generated one is pure duplication of files that are
+about to be committed anyway.
+
+The split that holds up is by **audience and lifetime**:
+
+| content | belongs |
+|---|---|
+| how to build, config switches, layout, what's out of scope, how to re-verify parity | ONE short doc in the subject repo (`docs/bazel-build.md`, ~130 lines) |
+| findings about the subject's build, generalizable lessons, reproduction commands | the migration tool's repo — this document |
+| the sequence I did the work in, per-stage diff counts, superseded designs | nowhere; it's process exhaust, and `git log` already has it |
+| the contents of the BUILD files | the BUILD files |
+
+Only the first row is something a maintainer has to review and keep forever, so
+only the first row goes in their tree, and it should be short enough to read in
+one sitting. The rule I'd apply next time: **every markdown file added to the
+subject repo needs a reader who is not me.** For the tool-side write-up the test
+is different and looser — a future migration of a different project — which is
+exactly why the two shouldn't share a file.
+
+---
+
 ## What the migration is actually good at
 
 Worth separating, because it shaped which bugs got found:
@@ -647,7 +720,8 @@ grep -rl Q_OBJECT Source/Core/DolphinQt/ | wc -l
 grep -rn IOWindow.h Source/Core/DolphinQt/CMakeLists.txt   # empty
 ```
 
-Full migration record: `BAZEL_MIGRATION.md` (plan),
-`BAZEL_MIGRATION_REPORT.md` (per-stage findings),
-`STAGE8_QT_DESIGN.md` (Qt codegen), `DOLPHIN_BAZEL_PATCH.md` (the generated
-Bazel files) — all in the Dolphin tree as of the migration commit.
+In-tree documentation for the resulting build (how to build it, the three
+configuration switches, what is deliberately out of scope, and the commands to
+re-extract both models and re-run the diff): `docs/bazel-build.md` in the Dolphin
+tree. The BUILD files themselves carry the per-target rationale. §8 explains why
+that is the whole of it.
