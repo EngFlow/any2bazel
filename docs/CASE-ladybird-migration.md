@@ -349,9 +349,69 @@ link edges). Cross-package generated srcs are labeled to their owning package
     executables. Also: `woff2dec` (static) references `woff2common` symbols, so
     the shim declares `woff2dec`'s `deps=[":woff2common"]`.
 
-Remaining for the gate: the Qt `ladybird` UI binary (needs Qt6 + its own moc
-codegen), which spawns these service processes to render a page headless. Rust
-stays prebuilt-`.a` until Ring 2.
+## 🏁 THE GATE: a Bazel-built browser that renders (MET)
+
+`bazel build //:ladybird` produces a 100 MB PIE ELF that **renders web pages**:
+
+```
+$ bazel-bin/ladybird --headless=text examples/ladybird/PROOF-test-page.html
+Hello from Bazel
+
+JS says 2+2=4
+```
+
+HTML parsed, CSS applied, layout run, and **LibJS executed the page's script**
+(`document.getElementById('out').textContent = 'JS says 2+2=' + (2+2)`).
+`--headless=layout-tree` dumps the full box tree with computed geometry and font
+metrics (`examples/ladybird/PROOF-render-layout-tree.txt`). Output is
+**byte-identical to the CMake reference build's**.
+
+**Proof it is really the Bazel build, end to end.** Ladybird is multi-process:
+the UI binary spawns `WebContent` (renderer), `Compositor`, `RequestServer`,
+`ImageDecoder`. Moving the reference build's entire service directory out of the
+tree (`mv Build/full/libexec …`) and re-running:
+
+- CMake `Build/full/bin/Ladybird` → **fails**: `Could not launch any of
+  [ …/libexec/RequestServer, …/bin/RequestServer, ./RequestServer ]`.
+- Bazel `bazel-bin/ladybird` → **renders**, spawning its own Bazel-built
+  siblings from `bazel-bin/`.
+
+So every process in the running browser — UI, renderer, compositor, network,
+image decoder — is Bazel-built.
+
+**What the `ladybird` UI binary needed (last-mile findings):**
+
+15. **Qt's moc unity file needs its includes staged as compiler inputs.** CMake
+    AUTOMOC generates `mocs_compilation.cpp`, which is a unity file that
+    `#include`s each `EWIEGA46WW/moc_*.cpp`. Only the unity file is a `srcs`
+    entry, so Bazel's sandbox lacked the 12 included `.cpp` — they are neither
+    headers nor separately-compiled sources. Fix: a `filegroup` of the
+    `moc_*.cpp` wired as the binary's `additional_compiler_inputs` (the same
+    lever finding 7 needed for `#embed` data). Generated shader headers
+    (`WebContentViewLinux{Frag,Vert}Shader.h`, included by bare name) became
+    `hdrs` of the UI package with `includes=["Qt"]`.
+
+16. **Bazel rejects absolute include paths outside the execution root — even as
+    `-isystem`, even globally.** `find_package(Qt6)` yields
+    `-I/usr/include/x86_64-linux-gnu/qt6/...` and
+    `-I/usr/lib/.../mkspecs/linux-g++`. As per-target `copts` Bazel errors with
+    "references a path outside of the execution root"; moving them to global
+    `.bazelrc` `--cxxopt`s fails identically (the check is on the flag, not the
+    target). The working lever is the compiler's own env:
+    `build --action_env=CPLUS_INCLUDE_PATH=<qt dirs>`, which Bazel passes
+    through unvalidated. The emitter now *skips* absolute include roots in
+    per-target copts and they are declared once in `.bazelrc`. (This is the
+    general shape of the answer for any `find_package` system dependency, and a
+    concrete argument for Ring 2's hermetic-toolchain/BCR direction.)
+
+17. **Catch-all header libraries make every edit a world rebuild.** Because
+    every target depends on `//:all_source_headers`, adding `UI/**/*.h` to its
+    glob (needed for `<UI/Qt/Application.h>`) invalidated all ~2,700 actions —
+    twice, once more for the UI autogen header target. Faithful to CMake's
+    global `-I`, but it costs incrementality; a stricter per-dep header model is
+    the fix (noted in finding 9 as future work, now with a measured cost).
+
+Rust stays prebuilt-`.a` until Ring 2.
 
 ## Plan for the rest
 
@@ -367,11 +427,21 @@ stays prebuilt-`.a` until Ring 2.
   find_package/vcpkg → BCR resolver adapter (the designed-but-unbuilt external
   resolver plug-in point).
 
-## Success gate
+## Success gate — MET
 
-A **running browser built by Bazel** at the end. Compile+link parity per the
-diff is the engineering check; a Bazel-built `Ladybird` that renders a page is
-the acceptance test.
+A **running browser built by Bazel**. Compile+link parity per the diff is the
+engineering check; a Bazel-built `Ladybird` that renders a page is the
+acceptance test. Both are met: see "🏁 THE GATE" above — `bazel build
+//:ladybird` renders HTML+CSS+JS byte-identically to the CMake reference, with
+every process (UI, WebContent, Compositor, RequestServer, ImageDecoder)
+Bazel-built, proven by removing the reference services and watching the CMake
+binary fail while the Bazel one renders.
+
+**Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
+LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
+define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
+byte-identical; 17 findings, 3 of them real any2bazel engine fixes with
+regression tests.
 
 ## Environment notes (this sandbox)
 

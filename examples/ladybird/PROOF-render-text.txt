@@ -1,0 +1,6 @@
+Hello from Bazel
+ 
+
+JS says 2+2=4
+
+  

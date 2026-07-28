@@ -145,6 +145,13 @@ def dep_label(d, targets, so, ar):
         return VCPKG + ":" + nm
     if nm in SYSTEM_LIBS:
         return ("SYS", nm)  # linkopt on final binary
+    # Qt6 + GL: system .so under /usr/lib; CMake finds them via find_package.
+    # Map the CMake target name to the -l library name; the /usr/lib search
+    # path is a global -L in .bazelrc.
+    SYS_MAP = {"Qt6Core": "Qt6Core", "Qt6Gui": "Qt6Gui", "Qt6Widgets": "Qt6Widgets",
+               "GLX": "GLX", "OpenGL": "OpenGL"}
+    if nm in SYS_MAP:
+        return ("SYS", SYS_MAP[nm])
     return ("UNKNOWN", nm)
 
 def _emit_srcs(srcs):
@@ -217,6 +224,12 @@ def main():
             print("    additional_compiler_inputs = %r," % embeds)
         copt_toks = list(flags)
         for i in incs:
+            if i.startswith("/"):
+                # System include roots (/usr Qt6, libdrm) can't be per-target
+                # copts: Bazel rejects a path outside the execution root even
+                # with -isystem. They live as global -isystem in .bazelrc
+                # (mirroring CMake's find_package include dirs).
+                continue
             if "vcpkg_installed" in i:
                 copt_toks += ["-isystem", i]  # third-party: suppress -Werror
             else:

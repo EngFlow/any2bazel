@@ -56,3 +56,11 @@ build --linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
 # isolates them by linking each crate into its own .so; our combined-archive
 # shim pulls several into one link, so take the first (identical) definition.
 build --linkopt=-Wl,--allow-multiple-definition
+# System library search path for find_package deps (Qt6, GLX/OpenGL).
+build --linkopt=-L/usr/lib/x86_64-linux-gnu
+# Qt6 + system includes: Bazel rejects absolute include paths outside the
+# execution root even as -isystem (per-target OR global copts). Feed them to
+# the compiler via CPLUS_INCLUDE_PATH instead -- the compiler's own system
+# include env, which Bazel does not validate. Mirrors CMake's find_package(Qt6)
+# include dirs. --host_action_env too so genrule/host compiles see them.
+build --action_env=CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu/qt6:/usr/include/x86_64-linux-gnu/qt6/QtCore:/usr/include/x86_64-linux-gnu/qt6/QtGui:/usr/include/x86_64-linux-gnu/qt6/QtWidgets:/usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++:/usr/include/libdrm

@@ -1,0 +1,38 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_import")
+package(default_visibility = ["//visibility:public"])
+
+# All vcpkg headers as one include tree (matches CMake's single -isystem).
+cc_library(
+    name = "headers",
+    # Whole include tree (some headers are .c/.inc, e.g. wuffs-v0.3.c).
+    hdrs = glob(["include/**"], allow_empty = True),
+    # No includes=[] here: the vcpkg include root is a global -isystem in
+    # .bazelrc (matches CMake), so third-party headers stay warning-suppressed.
+)
+
+# Shared libs (cc_import over the prebuilt .so) — deferred dynamic linking,
+# resolved at the final binary (same philosophy as the AK slice).
+SHARED = [
+    "SDL3", "avcodec", "avformat", "avif", "avutil", "brotlicommon", "curl",
+    "brotlidec", "brotlienc", "cpptrace", "crypto", "expat", "fmt",
+    "fontconfig", "freetype", "harfbuzz", "icudata", "icui18n", "icuuc",
+    "jpeg", "jxl", "mimalloc", "png16", "psl", "simdjson", "simdutf",
+    "skia", "sqlite3", "ssl", "swresample", "tommath", "webp",
+    "webpdecoder", "webpdemux", "webpmux", "xml2", "z",
+]
+
+[
+    cc_import(name = n, shared_library = "lib/lib%s.so" % n, deps = [":headers"])
+    for n in SHARED
+]
+
+# Static libs (vcpkg ships these as .a).
+# woff2dec references woff2common symbols; declare the dependency so the
+# common archive is on the link line (it's not itself a Ladybird dep).
+cc_import(name = "woff2common", static_library = "lib/libwoff2common.a", deps = [":headers"])
+cc_import(name = "woff2dec", static_library = "lib/libwoff2dec.a", deps = [":headers", ":woff2common"])
+
+# ANGLE ships its .so with a doubled "lib" prefix (liblibEGL_angle.so), so the
+# lib%s.so name convention above doesn't apply — declare them explicitly.
+cc_import(name = "libEGL_angle", shared_library = "lib/liblibEGL_angle.so", deps = [":headers"])
+cc_import(name = "libGLESv2_angle", shared_library = "lib/liblibGLESv2_angle.so", deps = [":headers"])

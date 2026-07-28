@@ -1,40 +1,91 @@
-# Ladybird → Bazel: Ring 1b codegen artifacts
+# Ladybird → Bazel: migration artifacts (running browser)
 
-These are the codegen-parity artifacts from migrating the Ladybird browser
-(CMake+vcpkg, C++23) to Bazel. See `../../docs/CASE-ladybird-migration.md` for
-the full story. They run against a Ladybird checkout with a completed reference
-build in `Build/full` (CMake File-API + `ninja` materialize all generated files
-there), not against this repo.
+Artifacts from migrating the Ladybird browser (CMake + vcpkg, C++23, ~3,000
+production TUs) to Bazel with the any2bazel parity loop. See
+`../../docs/CASE-ladybird-migration.md` for the full story and all 17 findings.
 
-## Files
+**Result: `bazel build //:ladybird` produces a browser that renders web pages**,
+byte-identically to the CMake reference — HTML, CSS, layout, and JS. Every
+process in the running browser (UI, `WebContent` renderer, `Compositor`,
+`RequestServer`, `ImageDecoder`) is Bazel-built; proven by moving the reference
+build's service directory away and watching the CMake binary fail to launch
+while the Bazel one still renders.
 
-- **`bazel_parity_harness.py`** — extracts every `Meta/Generators/*.py`
-  `CUSTOM_COMMAND` from `Build/full/build.ninja`, re-runs it into a scratch
-  mirror, and byte-diffs each produced `.h`/`.cpp`/`.idl` against the CMake
-  build. Proves the generators are reproducible before wrapping them. Result on
-  Ladybird: 71/71 single-generator outputs identical (the 1331-file bindings
-  mega-command is verified separately, all identical).
+These files run against a Ladybird checkout with a completed reference build in
+`Build/full` (CMake File-API + `ninja` materialize all generated files there),
+not against this repo.
 
-- **`emit_codegen_bazel.py`** — parses `build.ninja` and emits a Bazel
-  `genrule` per generator command: absolute source paths become
-  package-relative `$(location …)`, CMake `*.tmp` outputs become genrule `outs`,
-  quoted args are handled via `shlex`, and every command is pinned to
-  `PYTHONHASHSEED=0` for hermetic, byte-stable output. Usage:
-  `emit_codegen_bazel.py Libraries/LibWeb > codegen.bzl`.
+## Proof of the gate
 
-- **`LibWeb.codegen.bzl`** — the emitted result for LibWeb: 27 genrules that
-  reproduce all **1379** LibWeb generated files byte-for-byte under Bazel,
-  including the single `generate_libweb_bindings.py` mega-genrule (661 IDL
-  inputs → 1331 files). Loaded from a `Libraries/LibWeb/BUILD.bazel` that also
-  needs a `//Meta:generators` filegroup staging the whole `Meta/Generators` +
-  `Meta/Utils` Python tree (generators `sys.path.append` then import
-  `Generators.*` / `Utils.*`).
+- **`PROOF-test-page.html`** — the test page (HTML + CSS + a script that mutates
+  the DOM: `textContent = 'JS says 2+2=' + (2+2)`).
+- **`PROOF-render-text.txt`** — `bazel-bin/ladybird --headless=text` output.
+  Contains `JS says 2+2=4`, i.e. LibJS ran inside the Bazel-built renderer.
+- **`PROOF-render-layout-tree.txt`** — `--headless=layout-tree` output: the full
+  box tree with computed geometry and font metrics.
 
-## Two parity findings this surfaced
+## Emitters (model → BUILD files)
 
-1. **Undeclared implicit input** — `generate_dom_tree.py` reads
-   `HTML/MediaControls.css` via a `<link>` in its input `.html`; CMake never
-   declared it, Bazel's sandbox caught the `FileNotFoundError`.
-2. **`PYTHONHASHSEED` nondeterminism** — `generate_libweb_bindings.py` emitted
-   one file's structs in set-iteration order; pinning `PYTHONHASHSEED=0`
-   restores byte-parity with CMake and makes the actions cacheable.
+- **`emit_build_bazel.py`** — the per-target emitter. Reads the CMake File-API
+  model and emits one `cc_library` per production library and one `cc_binary`
+  per production executable: `srcs` from the compile actions (cross-package
+  generated srcs labeled to their owning package), `local_defines` for private
+  defines (never `defines`, which would leak to consumers), per-target flag
+  delta, `-isystem` for third-party includes, `additional_compiler_inputs` for
+  `#embed` data, `alwayslink` for the Rust-FFI provider libs, `linkopts` for
+  system libraries, and `deps` wired by class (internal → `//:Target`, vcpkg →
+  `cc_import` shim, Rust → prebuilt-`.a` shim).
+- **`emit_libweb_bazel.py`** — LibWeb lives in its own package (it owns the
+  codegen), so its 1,961 TUs are emitted there: 1,273 checked-in srcs +688
+  generated srcs referencing genrule outputs, with `includes=[".."]` so
+  `<LibWeb/CSS/PropertyID.h>` resolves from both the source and genfiles roots.
+- **`emit_codegen_bazel.py`** — parses `build.ninja` and emits a Bazel `genrule`
+  per generator command: absolute paths → package-relative `$(location …)`,
+  CMake `*.tmp` outputs → genrule `outs`, quoted args via `shlex`, every command
+  pinned to `PYTHONHASHSEED=0` for hermetic, byte-stable output.
+- **`bazel_parity_harness.py`** — re-runs every `Meta/Generators/*.py`
+  `CUSTOM_COMMAND` from `build.ninja` into a scratch mirror and byte-diffs the
+  result against the CMake build, proving the generators are reproducible before
+  wrapping them. Result: 71/71 single-generator outputs identical (the
+  1,331-file bindings mega-command verified separately, all identical).
+
+## Emitted / hand-written BUILD files (snapshots)
+
+- **`root.BUILD.bazel`** — the workspace root: `//:AK` (hand-written, the
+  vertical-slice template), the emitted libraries and binaries, and the
+  catch-all header libraries that model CMake's global `-I` of the whole source
+  tree.
+- **`LibWeb.BUILD.bazel`** + **`LibWeb.codegen.bzl`** — LibWeb's package: 27
+  genrules reproducing all **1,379** generated files byte-for-byte (including
+  the `generate_libweb_bindings.py` mega-genrule: 661 IDL inputs → 1,331 files)
+  plus the 1,961-TU `cc_library`.
+- **`vcpkg.BUILD.bazel`** — the external-dependency shim: one `cc_library`
+  header tree + a `cc_import` per prebuilt `.so`/`.a` from vcpkg's output.
+- **`rust.BUILD.bazel`** — the prebuilt-Rust shim. Cargo's per-crate archives
+  have circular cross-crate references, so they are pre-merged into one
+  `librust_combined.a` and every crate label aliases to it.
+- **`UI.BUILD.bazel`** — the Qt autogen shim: moc/qrc sources, the generated
+  shader headers, and the `filegroup` of `moc_*.cpp` that the moc unity file
+  `#include`s (staged as `additional_compiler_inputs`).
+- **`bazelrc.txt`** — the global build configuration mirroring
+  `Meta/CMake/compile_options.cmake`: the tree-wide warning/feature set, include
+  roots, `-O2 -g` (the reference is RelWithDebInfo, and it is a *correctness*
+  input), the vcpkg `-isystem`, the link settings that make the prebuilt `.so`
+  shims resolve, and `CPLUS_INCLUDE_PATH` for the Qt6 system includes Bazel
+  refuses as copts.
+- **`cmake2bazel.json`** — the migration config driving the diff loop
+  (generated-path normalizations).
+
+## Findings that became any2bazel engine fixes
+
+1. **Bazel-default flag strip was asymmetric and over-eager** — split into
+   noise vs tolerated prefixes so shared flags cancel and a CMake-only stronger
+   variant is still caught.
+2. **Link-input libraries were invisible to dep inference** — the extractor now
+   records a link action's library inputs from its input depset, not just argv.
+3. **Extractor OOM on large C++ targets** — depset flattening was eager and
+   per-node (combinatorial on shared DAGs); now lazy, memoized, iterative.
+
+The other 14 findings are migration mechanics (and two upstream correctness bugs
+in Ladybird: an undeclared implicit codegen input, and a `PYTHONHASHSEED`-
+dependent generator).
