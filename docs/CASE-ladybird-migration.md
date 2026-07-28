@@ -2,8 +2,13 @@
 
 Working migration of the [Ladybird](https://ladybird.org) browser engine
 (CMake + vcpkg, C++23) to Bazel, driven by the any2bazel parity loop. This doc
-is the durable plan and the running record of findings; the Bazel workspace
-itself lives in the Ladybird checkout (`~/ladybird-work`), not in this repo.
+is the durable plan and the running record of findings. Everything else — the
+Bazel workspace, the emitters (`Meta/emit_*.py`), the parity harness, the
+generated BUILD files — lives in the Ladybird checkout (`~/ladybird-work`), not
+in this repo: it is target-specific scaffolding and machine-generated output, so
+checking it in here would just be a stale copy. What belongs in any2bazel is
+whatever these findings pushed back into the engine (`scripts/`) plus this
+write-up.
 
 ## Why Ladybird
 
@@ -183,7 +188,7 @@ The 42 production libraries form a clean **13-layer dependency DAG** (L0 `AK`
 it bottom-up, generating a `cc_library` per lib from the reference model and
 diffing to compile+link parity.
 
-**Emitter (`examples/ladybird/emit_build_bazel.py`).** Reads
+**Emitter (`Meta/emit_build_bazel.py`, in the Ladybird tree).** Reads
 `model.cmake.full.json` and emits one `cc_library` per production lib: `srcs`
 from the compile actions, `local_defines` for the target's private
 `<Name>_EXPORTS`, a per-target gendir `-I` copt, and `deps` wired by class —
@@ -274,7 +279,7 @@ lives in its **own package** (`Libraries/LibWeb/BUILD.bazel`) because it owns
 the Ring 1b codegen (`codegen.bzl` genrules): its 1,961 TUs split into 1,273
 checked-in srcs + 688 generated srcs that reference the genrule outputs by
 package-relative label (Bazel resolves a source-looking label to the same-package
-genrule output). Emitter: `examples/ladybird/emit_libweb_bazel.py` (mirrors the
+genrule output). Emitter: `Meta/emit_libweb_bazel.py` (mirrors the
 per-lib emitter but rebases every path to the package and pulls generated
 src/hdr lists from `generated_srcs.bzl`).
 
@@ -367,7 +372,7 @@ link edges). Cross-package generated srcs are labeled to their owning package
 `bazel build //:ladybird` produces a 100 MB PIE ELF that **renders web pages**:
 
 ```
-$ bazel-bin/ladybird --headless=text examples/ladybird/PROOF-test-page.html
+$ bazel-bin/ladybird --headless=text /tmp/test-page.html
 Hello from Bazel
 
 JS says 2+2=4
@@ -376,7 +381,7 @@ JS says 2+2=4
 HTML parsed, CSS applied, layout run, and **LibJS executed the page's script**
 (`document.getElementById('out').textContent = 'JS says 2+2=' + (2+2)`).
 `--headless=layout-tree` dumps the full box tree with computed geometry and font
-metrics (`examples/ladybird/PROOF-render-layout-tree.txt`). Output is
+metrics. Output is
 **byte-identical to the CMake reference build's**.
 
 **Proof it is really the Bazel build, end to end.** Ladybird is multi-process:
