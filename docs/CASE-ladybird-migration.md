@@ -440,7 +440,9 @@ image decoder — is Bazel-built.
     entry, so Bazel's sandbox lacked the 12 included `.cpp` — they are neither
     headers nor separately-compiled sources. Fix: a `filegroup` of the
     `moc_*.cpp` wired as the binary's `additional_compiler_inputs` (the same
-    lever finding 7 needed for `#embed` data). Generated shader headers
+    lever finding 7 needed for `#embed` data). *Superseded:* moc is now run by
+    Bazel via `rules_qt` and the unity file is gone — see the `rules_qt`
+    section. Generated shader headers
     (`WebContentViewLinux{Frag,Vert}Shader.h`, included by bare name) became
     `hdrs` of the UI package with `includes=["Qt"]`.
 
@@ -455,7 +457,8 @@ image decoder — is Bazel-built.
     through unvalidated. The emitter now *skips* absolute include roots in
     per-target copts and they are declared once in `.bazelrc`. (This is the
     general shape of the answer for any `find_package` system dependency, and a
-    concrete argument for Ring 2's hermetic-toolchain/BCR direction.)
+    concrete argument for Ring 2's hermetic-toolchain/BCR direction. *Mostly
+    superseded:* Qt now comes from `rules_qt`, leaving only `libdrm` here.)
 
 17. **Catch-all header libraries make every edit a world rebuild.** Because
     every target depends on `//:all_source_headers`, adding `UI/**/*.h` to its
@@ -493,10 +496,71 @@ Also deduplicated two repeated `--linkopt`s left over from iterating.
 
 **Still not portable to another machine**, which is a separate problem from this
 one: the build consumes 224 vcpkg `.so`s, a 260 MB prebuilt `librust_combined.a`,
-and 13 Qt `moc` outputs from `Build/full`, and hardcodes host Qt paths via
-`--action_env=CPLUS_INCLUDE_PATH`. That is Ring 2 (+ rules_rust, + moc).
+and (at the time) 13 Qt `moc` outputs from `Build/full`. Qt is since solved (see
+the `rules_qt` section below); the rest is Ring 2 (+ rules_rust).
 (`-march=native` is *not* part of that problem: upstream CMake does the same by
 default, so mirroring it is correct parity.)
+
+## Qt: from CMake's prebuilt autogen to `rules_qt` (DONE)
+
+Findings 15 and 16 above were the two ugliest shims in the build: 12 `moc_*.cpp`
+plus `qrc_ladybird.cpp` copied out of CMake's `ladybird_autogen/`, and host Qt
+headers smuggled past Bazel's absolute-path check via
+`--action_env=CPLUS_INCLUDE_PATH`. Both are now gone. Qt comes from
+[`rules_qt`](https://github.com/Vertexwahn/rules_qt6) on the BCR
+(`bazel_dep(name = "rules_qt", version = "0.0.7")`), which fetches an official
+qt.io build and exposes `moc`/`rcc`/`uic` plus per-module `cc_library`s. The moc
+step is 11 genrules over the `Q_OBJECT` headers and one `rcc` genrule for
+`ladybird.qrc`; the unity `mocs_compilation.cpp` and its
+`additional_compiler_inputs` filegroup are deleted, as is the Qt half of
+`CPLUS_INCLUDE_PATH`. Verified the way finding 1 taught us to: with CMake's
+`ladybird_autogen/` moved aside the build is still green, and all **11 moc bodies
+are byte-identical** to CMake's (only the `#include` line of the header moc read
+differs, which is what moc's `-f` sets).
+
+Four things this cost, each a general lesson about `moc` under Bazel:
+
+18. **moc's output depends on the header's whole `#include` closure, so the
+    closure must be in the sandbox.** With only the one `Q_OBJECT` header staged,
+    four outputs silently lost an `#include <QtGui/qtextcursor.h>` — moc emits
+    metatype includes for types it has *seen the definition of*. `tools =
+    [moc]` stages the binary but no headers. Fix: a `moc_input_headers`
+    filegroup (source headers + generated headers + Qt's own `include/**`, i.e.
+    CMake's `MOC_INCLUDES`) in each genrule's `srcs`, and pass the matching
+    `-I` flags. This is a silent-wrong-output failure mode, not a build error;
+    only the byte-diff against CMake caught it.
+
+19. **CMake's moc unity file was load-bearing, not just an optimization.**
+    Compiling each `moc_*.cpp` separately broke one TU: `TabBar.h` has an inline
+    `as<Tab>()` (a `dynamic_cast`) but only forward-declares `Tab`. CMake got
+    away with it because `mocs_compilation.cpp` `#include`s `moc_Tab.cpp`
+    (which includes `Tab.h`) *before* `moc_TabBar.cpp`. Unity builds hide
+    incomplete-type bugs behind file ordering. Fixed with moc's `-b` to prepend
+    the include explicitly — visible and order-independent — rather than
+    reinstating the unity file.
+
+20. **Qt's official builds use `reduce_relocations`, which requires `-fPIC` in
+    consumers.** Our copts mirrored CMake's `-fPIE`, and against qt.io's Qt that
+    produced a `SIGSEGV` inside `QGuiApplication::screenAdded` during
+    `QApplication` construction — before any Ladybird code ran, and *only* in GUI
+    mode (`--headless` was fine, since it never constructs a `QApplication`).
+    `qconfig.pri` lists `reduce_relocations`; `rules_qt`'s own `qt_cc_binary`
+    hardcodes `-fPIC` for exactly this reason. One-character fix, non-obvious
+    symptom: parity with CMake's flags is *not* always right once a dependency
+    changes provenance.
+
+21. **A distro Qt and a BCR Qt are different dependencies.** `rules_qt` 0.0.7
+    pins Qt 6.8.3; Ladybird's CMake requires ≥ 6.9. Adding a 6.10.2 entry to
+    `qt_modules.bzl` (three archive URLs + SHAs from the qt.io repository XML)
+    was ~20 lines and worked first try, which is the right shape for an upstream
+    PR. Also note qt.io's Qt bundles ICU 73 while vcpkg gives Ladybird ICU 78:
+    both load into the same process, and that is *fine* because ICU suffixes its
+    symbols per soversion (`u_strlen_73` vs `u_strlen_78`). Worth knowing before
+    blaming a duplicate-library ODR problem — I did, and was wrong.
+
+The remaining host dependency in this area is small: `libdrm` (still via
+`CPLUS_INCLUDE_PATH`) and the glslang-generated shader headers, still copied
+from `Build/full`.
 
 ## Plan for the rest
 
@@ -510,9 +574,9 @@ default, so mirroring it is correct parity.)
   find_package/vcpkg → BCR resolver adapter (the designed-but-unbuilt external
   resolver plug-in point). This is also the bulk of what stands between the
   current build and *"can Ulf build it on his machine"*: today it needs my
-  `Build/full` for vcpkg `.so`s, the prebuilt Rust archive and Qt `moc` output.
-  Remaining after Ring 2: `rules_rust` for the 10 crates, a Bazel `moc` rule, and
-  replacing the hardcoded host Qt include paths.
+  `Build/full` for vcpkg `.so`s and the prebuilt Rust archive.
+  Remaining after Ring 2: `rules_rust` for the 10 crates. (Qt — moc/rcc and the
+  host include paths — is done, via `rules_qt`.)
 
 ## Success gate — MET
 
