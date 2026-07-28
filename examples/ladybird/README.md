@@ -48,27 +48,12 @@ not against this repo.
   scraping only the command line silently under-declares them.
 - **`bazel_parity_harness.py`** — re-runs every `Meta/Generators/*.py`
   `CUSTOM_COMMAND` from `build.ninja` into a scratch mirror and byte-diffs the
-  result against the CMake build, proving the generators are reproducible before
-  wrapping them. Result: 71/71 single-generator outputs identical (the
-  1,331-file bindings mega-command verified separately, all identical).
-  Takes `--seed N` to set `PYTHONHASHSEED`: a single run inherits one seed and so
-  cannot detect a seed-dependent generator (finding 2 matched by luck at seed 4
-  and diverged at seed 1), so sweep several seeds.
-- **`BUGREPORT-bindings-nondeterminism.md`** — the upstream bug report for
-  finding 2: one paragraph, a copy-pasteable repro, and the fix. **Filed as
-  [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899).**
-- **`repro-bindings-nondeterminism.sh`** — self-contained repro for finding 2:
-  `./repro-bindings-nondeterminism.sh /path/to/ladybird`. Needs only `python3`
-  and a checkout — no CMake, no Bazel, no build. Runs the bindings generator over
-  2 IDL files under `PYTHONHASHSEED` 0–5 and prints the struct emission order;
-  exits 1 if the order varies (bug present), 0 if stable (patch applied), so it
-  doubles as a CI guard. Note `to_idl_value.py` cannot be run directly — it is a
-  library module with no `main()` whose imports need `Meta/` on `sys.path`.
-- **`upstream-sort-dictionary-order.patch`** — the one-line upstream fix (for
-  [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)) making
+  result against the CMake build. 71/71 single-generator outputs identical (the
+  1,331-file bindings mega-command verified separately). Takes `--seed N`: a
+  single run inherits one seed and so cannot detect a seed-dependent generator.
+- **`upstream-sort-dictionary-order.patch`** — one-line upstream fix making
   `generate_libweb_bindings.py` sort its dictionary dependency names instead of
-  iterating a set. Reproduces the CMake reference 1332/1332 under every seed
-  tried; candidate for an upstream PR.
+  iterating a set ([ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)).
 
 ## Emitted / hand-written BUILD files (snapshots)
 
@@ -109,7 +94,6 @@ not against this repo.
 
 The other 14 findings are migration mechanics — including an extractor invariant
 Bazel's sandbox exposed (declared deps beat the command line: finding 1) and one
-genuine upstream reproducibility bug in Ladybird, where a generator's emission
-order followed Python's set iteration; fixed at the source by sorting
-(finding 2, `upstream-sort-dictionary-order.patch`) rather than papered over
-with a seed pin.
+genuine upstream reproducibility bug in Ladybird, fixed at the source by sorting
+rather than papered over with a seed pin
+([ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)).

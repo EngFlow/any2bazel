@@ -139,77 +139,37 @@ execution — one an extractor bug it caught, one a latent upstream
 reproducibility bug it caught and we fixed at the source):**
 
 1. **Off-command-line input dropped by the extractor (our bug, not CMake's).**
-   `generate_dom_tree.py` for `HTML/MediaControlsDOM` reads
-   `HTML/MediaControls.css` at generation time, by following a `<link
-   rel="stylesheet" href="MediaControls.css">` inside its declared input
-   `MediaControls.html`. So the `.css` is a real input that **never appears on
-   the generator's command line**. Our first `emit_codegen_bazel.py` derived
-   `srcs` purely by scraping the command line, so it dropped the `.css`, and
-   Bazel's sandbox failed loudly with `FileNotFoundError`.
+   `generate_dom_tree.py` reads `HTML/MediaControls.css` by following a `<link>`
+   out of its input `MediaControls.html`, so the `.css` never appears on the
+   generator's command line. Our first `emit_codegen_bazel.py` built `srcs` by
+   scraping the command line, dropped it, and the sandbox failed with
+   `FileNotFoundError`. Upstream CMake gets this right (it's in the generator's
+   `DEPENDS`; `touch` the `.css` and ninja re-runs) — nothing to patch there.
 
-   **Upstream CMake gets this right** — it lists the file explicitly in the
-   generator's `dependencies`/`DEPENDS`
-   (`Meta/CMake/libweb_generators.cmake`, in the `MediaControlsDOM.cpp`
-   `invoke_py_generator` call), which is visible in the ninja edge and verified
-   by `touch Libraries/LibWeb/HTML/MediaControls.css && ninja -n …
-   MediaControlsDOM.cpp` → the generator re-runs. Nothing to patch upstream.
+   The invariant: *the build graph's declared dependency list is authoritative,
+   the command line is not.* `srcs` = union(command line, edge `DEPENDS`), since a
+   tool may read inputs it was never handed. Matters for 3 of 46 generator edges
+   here. Scraping command lines is the tempting shortcut for a CMake→Bazel
+   extractor and this is where it breaks.
 
-   The **real** lesson is an extractor invariant: *the build graph's declared
-   dependency list is authoritative, the command line is not*. `srcs` must be
-   the union of (command-line paths) and (the edge's `DEPENDS`), because a tool
-   may read inputs it was never handed as arguments. `emit_codegen_bazel.py`
-   now parses each ninja edge's dep list and folds in any in-package input the
-   command line didn't mention. Tree-wide that rule matters for **3 of 46**
-   generator edges — `MediaControlsDOM` plus the two ImageDecoder IPC endpoints
-   (whose `.ipc` input reaches the command line only via a `../..`-relative
-   path, i.e. the same class of mismatch). Scraping command lines is the
-   tempting shortcut for any CMake→Bazel extractor and this is exactly where it
-   breaks.
+2. **Latent nondeterminism in the generator.**
+   `generate_libweb_bindings.py` emitted `MediaCapabilities.h`'s dictionary
+   structs in an order that varied with `PYTHONHASHSEED`, because
+   `dictionaries_in_dependency_order()` iterated a *set* of dependency names.
+   Filed and fixed upstream by sorting:
+   [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899).
 
-2. **Latent nondeterminism in the generator — fixed by sorting.**
-   `generate_libweb_bindings.py` emitted the dependency-ordered dictionary
-   structs of `MediaCapabilities.h` (`AudioConfiguration` vs
-   `VideoConfiguration`) in an order that varied with `PYTHONHASHSEED`: the
-   topological sort in `dictionaries_in_dependency_order()`
-   (`Meta/Generators/libweb_bindings/to_idl_value.py`) iterated a **set** of
-   dependency names, and `dependency_names_for()` /
-   `GenerationContext.dictionary_type_names()` build that set as a comprehension
-   — so DFS visit order, and hence emission order, followed Python's per-process
-   string hash.
+   I first pinned `PYTHONHASHSEED=0` on the genrules instead. That's the wrong
+   fix — it freezes the symptom into the build system and leaves every other
+   consumer emitting seed-dependent output. The generator should sort. The pin
+   stays only as hermeticity defence-in-depth.
 
-   My first response was to pin `PYTHONHASHSEED=0` on every codegen genrule.
-   That restores byte-parity, but it's the wrong fix: it freezes the symptom into
-   the build system and leaves the generator producing seed-dependent output for
-   everyone else (CMake, `ninja`, anyone running the script by hand). **The
-   generator should sort.** One line, upstream:
-
-   ```python
-   # Meta/Generators/libweb_bindings/to_idl_value.py, in dictionaries_in_dependency_order()
-   -        for dependency_name in dependency_names_for(dictionary):
-   +        # Sorted: dependency_names_for() returns a set, so iterating it directly
-   +        # makes the emitted order depend on PYTHONHASHSEED.
-   +        for dependency_name in sorted(dependency_names_for(dictionary)):
-   ```
-
-   Sorting the names (not the `Dictionary` objects) keeps the topological
-   ordering correct — it only makes the tie-break among independent dependencies
-   deterministic — and it is stable regardless of seed. Verified: the patched
-   generator reproduces the CMake reference **1332/1332 files byte-identical
-   under seeds 0, 1, 2, 7 and 12345**, whereas the unpatched generator diverges
-   on `MediaCapabilities.h` at seed 1 while matching at seed 4. Patch:
-   `examples/ladybird/upstream-sort-dictionary-order.patch`. **Filed upstream as
-   [LadybirdBrowser/ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)** (this one is a genuine upstream bug,
-   unlike finding 1).
-
-   **Why this hid for so long, and the harness lesson:** the parity harness
-   originally ran each generator exactly once, inheriting whatever seed the
-   process had. A seed-dependent generator passes such a check most of the time —
-   note seed 4 matches by luck — so "1331/1331 identical" was never evidence of
-   reproducibility. The harness now takes `--seed N` and is swept over several
-   seeds (46 commands / 71 outputs identical at seeds 1 and 3). *Determinism
-   checks that don't vary the nondeterminism source prove nothing.* The
-   `PYTHONHASHSEED=0` pin stays on the genrules, but now as defence-in-depth for
-   hermeticity/remote-caching rather than as the thing holding parity up.
+   The lesson worth keeping is about the *harness*, not the generator: it ran
+   each generator once under an inherited seed, so "1331/1331 identical" was
+   never evidence of reproducibility — a seed-dependent generator passes such a
+   check most of the time. **Determinism checks that don't vary the
+   nondeterminism source prove nothing.** `bazel_parity_harness.py` now takes
+   `--seed N`.
 
 Remaining Ring 1b work is mechanical: run `emit_codegen_bazel.py` for the other
 libraries with generators (LibJS bytecode, LibHTTP HSTS, the IPC endpoints under
