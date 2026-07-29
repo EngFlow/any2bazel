@@ -236,7 +236,12 @@ Read `model.cmake.json`. For each production target emit a `cc_library` /
 `cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Library
 grouping need not match CMake (TU-set comparison is grouping-agnostic), but keep
 **executable** names aligned or add a `target_map` entry. Write `MODULE.bazel`
-as needed.
+as needed — before picking rulesets or pinning versions, read
+[docs/BAZEL-RULES.md](docs/BAZEL-RULES.md) (which rulesets have been exercised
+here, why some were hand-written instead, and why a version must be resolved
+rather than recalled). Put `common --check_direct_dependencies=error` in the
+generated `.bazelrc` so a declared version that MVS overrides fails the build
+instead of being a warning nobody reads.
 
 ### 4. Extract the Bazel side
 > **Critical: aquery must be invoked the way the project is actually built.**

@@ -1,5 +1,8 @@
 # Experiments
 
+Which Bazel rulesets these migrations used, at which versions, and where rules
+were written by hand instead: [docs/BAZEL-RULES.md](docs/BAZEL-RULES.md).
+
 ## CMake Experiments
 
 ### BoringSSL (cmake <-> Bazel)
