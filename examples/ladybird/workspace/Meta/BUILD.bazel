@@ -1,0 +1,13 @@
+package(default_visibility = ["//visibility:public"])
+
+# All Python generator scripts + their shared helper packages (Meta/Utils,
+# Meta/Generators/libweb_bindings). Generators do
+# sys.path.append(<Meta dir>) then import Utils.* / Generators.*, so the whole
+# tree must be present as tool inputs.
+filegroup(
+    name = "generators",
+    srcs = glob([
+        "Generators/**/*.py",
+        "Utils/**/*.py",
+    ]),
+)

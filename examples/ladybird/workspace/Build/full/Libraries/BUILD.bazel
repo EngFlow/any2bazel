@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+package(default_visibility = ["//visibility:public"])
+
+# Generated Rust FFI headers (cargo cxx byproducts materialized here by the
+# reference build). Exposed so <LibUnicode/RustFFI.h> etc. resolve in the Bazel
+# sandbox. includes=["."] makes this dir a header root => <Lib/RustFFI.h> works.
+cc_library(
+    name = "rust_ffi_headers",
+    hdrs = glob(["*/RustFFI.h", "*/*/RustFFI.h"], allow_empty = True),
+    includes = ["."],
+)
+
+# All CMake-generated per-library headers materialized under Build/full/Libraries
+# (generate_export_header -> <Lib>/Export.h, plus other generated .h). Exposed as
+# a header root so <LibCore/Export.h> etc. resolve in the sandbox.
+cc_library(
+    name = "generated_lib_headers",
+    hdrs = glob(["**/*.h"], allow_empty = True),
+    includes = ["."],
+)
+
+exports_files(['LibGfx/ImageFormats/TIFFTagHandler.cpp', 'LibHTTP/HSTSPreloadData.cpp', 'LibJS/Bytecode/Op.cpp', 'LibJS/Interpreter/interpreter_x86_64.S'])

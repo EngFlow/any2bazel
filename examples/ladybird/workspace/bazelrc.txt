@@ -1,0 +1,68 @@
+common --enable_bzlmod
+
+# C++23 everywhere (Ladybird global).
+build --cxxopt=-std=c++23 --host_cxxopt=-std=c++23
+
+# Global warning/feature flags from Meta/CMake/compile_options.cmake, applied
+# by CMake to every target. Mirror them as global copts.
+build --cxxopt=-Wcast-qual --cxxopt=-Wformat=2 --cxxopt=-Wimplicit-fallthrough
+build --cxxopt=-Wlogical-op --cxxopt=-Wmissing-declarations
+build --cxxopt=-Wmissing-field-initializers --cxxopt=-Wsuggest-override
+build --cxxopt=-Wno-expansion-to-defined --cxxopt=-Wno-invalid-offsetof
+build --cxxopt=-Wno-maybe-uninitialized --cxxopt=-Wno-shorten-64-to-32
+build --cxxopt=-Wno-unknown-warning-option --cxxopt=-Wno-unused-command-line-argument
+build --cxxopt=-Wno-user-defined-literals --cxxopt=-Werror --cxxopt=-Wall --cxxopt=-Wextra
+build --cxxopt=-fno-exceptions --cxxopt=-ffp-contract=off --cxxopt=-fstrict-flex-arrays=2
+build --cxxopt=-fstack-protector-strong --cxxopt=-fsigned-char
+build --cxxopt=-ftrivial-auto-var-init=zero --cxxopt=-fno-semantic-interposition
+build --cxxopt=-fvisibility-inlines-hidden --cxxopt=-Wno-literal-suffix
+build --cxxopt=-Wno-unqualified-std-cast-call --cxxopt=-Wvla --cxxopt=-Wno-array-bounds
+build --cxxopt=-Wno-stringop-overflow --cxxopt=-Wno-dangling-reference
+build --cxxopt=-fstack-clash-protection
+
+# Global include roots (repo-root-relative includes like <AK/Foo.h>).
+
+build --cxxopt=-I. --cxxopt=-ILibraries --cxxopt=-IServices
+# NOTE: deliberately NO global -IBuild/full* include roots. They were here to
+# mirror CMake's build-dir include, but they let any TU include any
+# CMake-generated header without declaring it -- the same undeclared-input hole
+# Bazel is supposed to catch (see finding 1). Generated headers now come only
+# from declared deps (the per-package genrule outputs + the header-root
+# cc_librarys under Build/full/*/BUILD.bazel, which ARE declared).
+# Verified: //:ladybird + all 5 services build, and --headless=text and
+# --headless=layout-tree are byte-identical to the CMake reference without them.
+# vcpkg headers as SYSTEM includes (matches CMake's -isystem: suppresses -Werror
+# in third-party headers like openssl/tls1.h cast-qual).
+build --cxxopt=-isystem --cxxopt=Build/full/vcpkg_installed/x64-linux-dynamic/include
+
+# NDEBUG (CMake RelWithDebInfo).
+# Reference build is CMake RelWithDebInfo (-O2 -g). Match its optimization so
+# optimization-sensitive diagnostics (e.g. -Werror=maybe-musttail-local-addr in
+# LibWasm) and codegen agree.
+build --cxxopt=-O2 --cxxopt=-g
+build --cxxopt=-DNDEBUG
+# Global defines from Meta/CMake/compile_options.cmake (every TU).
+build --cxxopt=-DUSE_VULKAN=1 --cxxopt=-DUSE_FONTCONFIG=1
+build --cxxopt=-DUSE_VULKAN_DMABUF_IMAGES=1 --cxxopt=-DENABLE_COMPILETIME_FORMAT_CHECK
+build --cxxopt=-D_FILE_OFFSET_BITS=64 --cxxopt=-D_FORTIFY_SOURCE=3
+build --cxxopt=-fstack-protector-strong --cxxopt=-march=native --cxxopt=-fdiagnostics-color=always
+build --copt=-fPIC
+
+# Link: let ld resolve the transitive DT_NEEDED of the vcpkg .so shims
+# (avif->libyuv, cpptrace->libdwarf, ...) which are not themselves link inputs.
+# -rpath-link makes ld follow NEEDED at link time; -rpath makes the built
+# binary find them at run time (matches CMake's install-rpath to the vcpkg lib).
+build --linkopt=-Wl,--allow-shlib-undefined
+build --linkopt=-LBuild/full/vcpkg_installed/x64-linux-dynamic/lib
+build --linkopt=-Wl,-rpath-link,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+build --linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+# The prebuilt Rust crate archives each bundle an identical copy of the rust
+# allocator shim (__rust_realloc/__rust_alloc_zeroed/...). The reference build
+# isolates them by linking each crate into its own .so; our combined-archive
+# shim pulls several into one link, so take the first (identical) definition.
+build --linkopt=-Wl,--allow-multiple-definition
+# System library search path for find_package deps (Qt6, GLX/OpenGL).
+build --linkopt=-L/usr/lib/x86_64-linux-gnu
+# System includes for find_package deps that are still host-provided (libdrm).
+# Qt6 no longer appears here: it comes from rules_qt as a real Bazel dep.
+build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm

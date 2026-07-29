@@ -1,0 +1,24 @@
+load("@rules_cc//cc:defs.bzl", "cc_import")
+package(default_visibility = ["//visibility:public"])
+
+# Prebuilt Rust staticlibs from the reference cargo build. Building from source
+# via rules_rust is Ring 2; for compile+link + running-browser parity we
+# cc_import the reference .a. The per-crate cargo archives have CIRCULAR
+# cross-crate symbol references (liburl_rust -> libunicode_rust, and the regex
+# crate is bundled into several), which a flat link can't resolve by ordering.
+# We pre-merge them into ONE combined archive (ar MRI, see Meta note) and alias
+# each crate name to it so the whole rust closure links as a single unit,
+# whatever the consumer's dep order. (Building rust_combined.a is a
+# materialization step, like the vcpkg .so shims.)
+cc_import(name = "rust_combined", static_library = "librust_combined.a")
+
+RUST_CRATES = [
+    "libunicode_rust", "liburl_rust", "libtextcodec_rust", "libregex_rust",
+    "libgfx_rust", "libjs_rust", "libweb_rust", "libweb_layout_rust",
+    "libweb_css_rust", "libweb_content_blocker_rust",
+]
+
+[
+    alias(name = c, actual = ":rust_combined")
+    for c in RUST_CRATES
+]

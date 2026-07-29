@@ -1,0 +1,28 @@
+module(name = "ladybird", version = "0.0.0")
+
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# Qt6 via rules_qt (kklochkov). Its qt.local_repo discovers the host Qt through
+# qmake, so moc/rcc and the Qt cc_library targets all come from one 6.10.2 SDK
+# -- the version Ladybird's CMake asks for -- and the moc rule reads its include
+# dirs from the Qt CcInfo compilation context instead of hand-passed -I flags.
+# rules_qt 2.0.1 is NOT on the BCR (the BCR's "rules_qt" is Vertexwahn's
+# unrelated rules_qt6), so point the dep at the upstream release tarball. This is
+# stock upstream v2.0.1 -- no local patches -- so any checkout can fetch it.
+bazel_dep(name = "rules_qt", version = "2.0.1")
+archive_override(
+    module_name = "rules_qt",
+    urls = ["https://github.com/kklochkov/rules_qt/archive/refs/tags/v2.0.1.tar.gz"],
+    strip_prefix = "rules_qt-2.0.1",
+    integrity = "sha256-RLp8ZJu4VVgNqssn5q5WnsE1BH4yn6CvIHAAOWqnvpM=",
+)
+
+qt = use_extension("@rules_qt//qt:extensions.bzl", "qt")
+qt.local_repo(
+    name = "qt6_local",
+    paths = {"linux-x86_64": "/usr/lib/qt6"},
+)
+qt.active_sdk(name = "qt", repo = "qt6_local")
+use_repo(qt, "qt")
+register_toolchains("@qt//:qt_linux_x86_64_toolchain")

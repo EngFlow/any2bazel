@@ -2,13 +2,11 @@
 
 Working migration of the [Ladybird](https://ladybird.org) browser engine
 (CMake + vcpkg, C++23) to Bazel, driven by the any2bazel parity loop. This doc
-is the durable plan and the running record of findings. Everything else — the
-Bazel workspace, the emitters (`Meta/emit_*.py`), the parity harness, the
-generated BUILD files — lives in the Ladybird checkout (`~/ladybird-work`), not
-in this repo: it is target-specific scaffolding and machine-generated output, so
-checking it in here would just be a stale copy. What belongs in any2bazel is
-whatever these findings pushed back into the engine (`scripts/`) plus this
-write-up.
+is the durable plan and the running record of findings. The workspace overlay
+it produced — the emitters (`Meta/emit_*.py`), the parity harness, and the
+generated BUILD files — is in [`examples/ladybird/`](../examples/ladybird/),
+along with an honest inventory of what still stops it from being a
+clone-and-build.
 
 ## Why Ladybird
 
@@ -593,6 +591,46 @@ The remaining host dependency in this area is small: `libdrm` (still via
 `CPLUS_INCLUDE_PATH`) and the glslang-generated shader headers, still copied
 from `Build/full`.
 
+## Finding 22: `glob()` cannot match generated files — and hid a stale-output dep
+
+The bindings mega-genrule (661 `.idl` in, 1,331 files out) declared
+`srcs = native.glob(["**/*.idl"])`, on the reasoning that the generator follows
+`includes`/partial interfaces between `.idl` files, so the whole closure has to
+be in the sandbox. Two of its inputs are themselves *generated*
+(`CSS/GeneratedCSS{StyleProperties,NumericFactoryMethods}.idl`).
+
+`glob()` matches **source files only** — it never sees a genrule's outputs. So
+those two inputs were not declared at all. The rule nonetheless built for days,
+because stale copies of CMake's output happened to be sitting in the source
+tree, where the glob *did* find them. Moving those two files aside is what
+exposed it (verify by removal, again). A checkout that had never run the CMake
+build would have failed.
+
+Two lessons, both about the emitters rather than about Ladybird:
+
+- **A glob in a generated BUILD file is a smell.** The emitters know each rule's
+  exact inputs — they read ninja's `DEPENDS` list. Emitting a wildcard instead
+  throws that information away and replaces a declared edge with "whatever is on
+  disk". Fixed: the mega-rule now lists its 659 source `.idl` plus the 2
+  generated ones as explicit labels. This is also strictly *tighter* than the
+  glob was — `HTML/PageSwapEvent.idl` is in the tree but not in CMake's
+  dependency closure, and the glob was feeding it in.
+- **Hand-appending to a generated file guarantees drift.** This rule had been
+  written by hand into `codegen.bzl`, which the emitter *skips* — so re-running
+  the emitter would have silently deleted it. It is now emitted by
+  `bindings_rule()` in `Meta/emit_codegen_bazel.py`, which derives the outs from
+  the ninja edge's output list (the generator takes an output *directory*,
+  `-o Bindings`, so there is nothing to scrape from argv) and the srcs from its
+  `DEPENDS` closure. Verified: the emitted rule is identical to the hand-written
+  one in outs and in argument order, the full parity harness still reports
+  1,402/1,402 byte-identical, and all 5 binaries build and render with the stale
+  `.idl` copies removed.
+
+Note this is the same shape as finding 3's lesson about coverage: the mega-rule
+contributes zero *comparisons* to the parity harness (its output goes to a
+directory, so the harness's per-file `copy_if_different` check does not apply),
+so a green harness never spoke to this rule's inputs at all.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -604,10 +642,12 @@ from `Build/full`.
   `bazel_dep`s where they exist + `rules_foreign_cc` otherwise, and build a
   find_package/vcpkg → BCR resolver adapter (the designed-but-unbuilt external
   resolver plug-in point). This is also the bulk of what stands between the
-  current build and *"can Ulf build it on his machine"*: today it needs my
-  `Build/full` for vcpkg `.so`s and the prebuilt Rust archive.
+  current build and *"can someone else build it on their machine"*: today it
+  needs a local `Build/full` for vcpkg `.so`s and the prebuilt Rust archive.
   Remaining after Ring 2: `rules_rust` for the 10 crates. (Qt — moc/rcc and the
-  host include paths — is done, via `rules_qt`.)
+  host include paths — is done, via `rules_qt`, now fetched by
+  `archive_override` from upstream rather than a local path.)
+  The full gap list is in [`examples/ladybird/README.md`](../examples/ladybird/README.md#known-gaps).
 
 ## Success gate — MET
 
@@ -622,7 +662,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical; 17 findings, 3 of them real any2bazel engine fixes with
+byte-identical; 22 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)

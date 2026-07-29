@@ -1,0 +1,12 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+package(default_visibility = ["//visibility:public"])
+
+# CMake-generated IPC endpoint headers materialized under Build/full/Services.
+# Exposed as a header root so <ImageDecoder/ImageDecoderClientEndpoint.h> etc.
+# resolve in the Bazel sandbox (matches CMake's -IBuild/full/Services).
+cc_library(
+    name = "generated_service_headers",
+    hdrs = glob(["**/*.h"], allow_empty = True),
+    includes = ["."],
+)
+exports_files(['Compositor/WebGLCommandReplayer.cpp'])
