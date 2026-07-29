@@ -130,7 +130,8 @@ framing suggested). Each generator command is a clean
 - `Meta/bazel_parity_harness.py` — re-runs every generator command from
   `build.ninja` into a scratch mirror and byte-diffs each output against
   `Build/full`. Proves the generators are reproducible before we wrap them.
-  (Result: 71/71 single-generator outputs + 1331/1331 bindings identical.)
+  Sweeps `--seed` and enumerates directory-output generators, so the bindings
+  mega-command is actually covered: 1,402 files compared, identical at every seed.
 - `Meta/emit_codegen_bazel.py` — parses `build.ninja`, rewrites each generator
   command as a Bazel `genrule` (absolute source paths → package-relative
   `$(location …)`; CMake `*.tmp` outputs → genrule `outs`; quoted args via
@@ -161,20 +162,38 @@ reproducibility bug it caught and we fixed at the source):**
    `generate_libweb_bindings.py` emitted `MediaCapabilities.h`'s dictionary
    structs in an order that varied with `PYTHONHASHSEED`, because
    `dictionaries_in_dependency_order()` iterated a *set* of dependency names.
-   Filed and fixed upstream by sorting:
-   [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899).
+   Filed as
+   [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)
+   and **fixed upstream** in `1df71518` — by sorting inside
+   `dependency_names_for()` (return type becomes `List[str]`), which is a better
+   place than my local patch's call site: the function can no longer hand a set
+   to *any* caller. My patch is dropped in favour of theirs.
 
    I first pinned `PYTHONHASHSEED=0` on the genrules instead. That's the wrong
    fix — it freezes the symptom into the build system and leaves every other
-   consumer emitting seed-dependent output. The generator should sort. The pin
-   stays only as hermeticity defence-in-depth.
+   consumer emitting seed-dependent output. The generator should sort. With the
+   upstream fix in, I verified the pin is no longer load-bearing (removed it from
+   all 46 genrules: build green, and Bazel's 1,332 binding files still
+   byte-identical to CMake's), then put it back purely as defence-in-depth.
 
-   The lesson worth keeping is about the *harness*, not the generator: it ran
-   each generator once under an inherited seed, so "1331/1331 identical" was
-   never evidence of reproducibility — a seed-dependent generator passes such a
-   check most of the time. **Determinism checks that don't vary the
-   nondeterminism source prove nothing.** `bazel_parity_harness.py` now takes
-   `--seed N`.
+   **The harness lesson, twice over.** First: it ran each generator once under an
+   inherited seed, so "identical" was never evidence of reproducibility — a
+   seed-dependent generator passes such a check most of the time. Determinism
+   checks that don't vary the nondeterminism source prove nothing, so
+   `bazel_parity_harness.py` took a `--seed N`. Second, and worse: when upstream's
+   fix landed I re-ran the seed sweep to confirm it, and got 71/71 identical at
+   eight seeds *with the fix reverted*. The sweep was checking the wrong files.
+   `outputs_of()` scraped destinations out of CMake's `copy_if_different <tmp>
+   <dest>`, but the bindings mega-command writes a whole output *directory*
+   (`-o Bindings`) with no such copy — so it contributed **zero** comparisons and
+   the run still reported success. The one generator with a known determinism bug
+   was the one generator the determinism harness never looked at. Fixed by
+   enumerating output directories when no `copy_if_different` is found: coverage
+   goes 71 → 1,402 files, it reproduces the `MediaCapabilities.h` diff on the
+   unfixed generator, and passes at every seed on the fixed one. A green check
+   whose *coverage* you haven't verified is indistinguishable from no check;
+   "71 files" should have looked absurd next to "1,379 generated files" long
+   before upstream forced me to look.
 
 ### Ring 1b tail — the other 19 generators (DONE)
 
