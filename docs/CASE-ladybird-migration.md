@@ -506,57 +506,69 @@ default, so mirroring it is correct parity.)
 Findings 15 and 16 above were the two ugliest shims in the build: 12 `moc_*.cpp`
 plus `qrc_ladybird.cpp` copied out of CMake's `ladybird_autogen/`, and host Qt
 headers smuggled past Bazel's absolute-path check via
-`--action_env=CPLUS_INCLUDE_PATH`. Both are now gone. Qt comes from
-[`rules_qt`](https://github.com/Vertexwahn/rules_qt6) on the BCR
-(`bazel_dep(name = "rules_qt", version = "0.0.7")`), which fetches an official
-qt.io build and exposes `moc`/`rcc`/`uic` plus per-module `cc_library`s. The moc
-step is 11 genrules over the `Q_OBJECT` headers and one `rcc` genrule for
-`ladybird.qrc`; the unity `mocs_compilation.cpp` and its
-`additional_compiler_inputs` filegroup are deleted, as is the Qt half of
-`CPLUS_INCLUDE_PATH`. Verified the way finding 1 taught us to: with CMake's
-`ladybird_autogen/` moved aside the build is still green, and all **11 moc bodies
-are byte-identical** to CMake's (only the `#include` line of the header moc read
-differs, which is what moc's `-f` sets).
+`--action_env=CPLUS_INCLUDE_PATH`. Both are gone, replaced by
+[`kklochkov/rules_qt`](https://github.com/kklochkov/rules_qt): `qt_cc_moc` over
+the 11 `Q_OBJECT` headers and `qt_qrc`/`qt_cc_rcc` for `ladybird.qrc`. The unity
+`mocs_compilation.cpp` and its `additional_compiler_inputs` filegroup are
+deleted, `CPLUS_INCLUDE_PATH` is down to `libdrm`, and Qt's libraries now reach
+the link through declared deps (`@qt//:QtCore` etc., resolved via Bazel's
+`_solib`) instead of `-lQt6Core` plus a global `-L`. Verified as finding 1
+teaches: with CMake's `ladybird_autogen/` moved aside the build is still green,
+and all **11 moc bodies are byte-identical** to CMake's.
 
-Four things this cost, each a general lesson about `moc` under Bazel:
+I evaluated two rule sets, and the difference is instructive:
 
-18. **moc's output depends on the header's whole `#include` closure, so the
-    closure must be in the sandbox.** With only the one `Q_OBJECT` header staged,
-    four outputs silently lost an `#include <QtGui/qtextcursor.h>` — moc emits
-    metatype includes for types it has *seen the definition of*. `tools =
-    [moc]` stages the binary but no headers. Fix: a `moc_input_headers`
-    filegroup (source headers + generated headers + Qt's own `include/**`, i.e.
-    CMake's `MOC_INCLUDES`) in each genrule's `srcs`, and pass the matching
-    `-I` flags. This is a silent-wrong-output failure mode, not a build error;
-    only the byte-diff against CMake caught it.
+18. **The Qt SDK should be discovered, not pinned.** Vertexwahn's `rules_qt6`
+    (the `rules_qt` module *on the BCR*) downloads a fixed qt.io build — 6.8.3 in
+    0.0.7, while Ladybird's CMake requires ≥ 6.9, so it needed a new module entry
+    (URLs + SHAs) before it would even be a legal Qt for this project. It also
+    drags in a second Qt alongside the distro one, which then wants
+    `QT_PLUGIN_PATH`/`QT_QPA_PLATFORM_PLUGIN_PATH` set by hand at runtime.
+    kklochkov's `qt.local_repo` instead runs `qmake -query` on an installed Qt
+    and generates the repo from the answer, so `moc`, the headers, and the `.so`s
+    are guaranteed to be one consistent SDK — here the same 6.10.2 CMake uses.
+    Nothing to pin, nothing to keep in sync, no runtime env fixups. (Its
+    `remote_repo` covers the hermetic build-from-source case.) That is the right
+    factoring for a `find_package`-shaped dependency, and it is what the
+    `find_package` → Bazel adapter I owe Ring 2 should imitate.
 
-19. **CMake's moc unity file was load-bearing, not just an optimization.**
-    Compiling each `moc_*.cpp` separately broke one TU: `TabBar.h` has an inline
-    `as<Tab>()` (a `dynamic_cast`) but only forward-declares `Tab`. CMake got
-    away with it because `mocs_compilation.cpp` `#include`s `moc_Tab.cpp`
-    (which includes `Tab.h`) *before* `moc_TabBar.cpp`. Unity builds hide
-    incomplete-type bugs behind file ordering. Fixed with moc's `-b` to prepend
-    the include explicitly — visible and order-independent — rather than
-    reinstating the unity file.
+19. **moc's output depends on the header's whole `#include` closure — so the rule
+    must own the include paths.** moc emits metatype includes only for types
+    whose definition it *has seen*: staging just the one `Q_OBJECT` header
+    silently drops e.g. `#include <QtGui/qtextcursor.h>` from four outputs. Not a
+    build error — wrong output that still compiles, caught only by the byte-diff
+    against CMake. With genrules I had to hand-maintain a `moc_input_headers`
+    filegroup plus matching `-I` flags (and a Qt-side `include_files` filegroup,
+    since `tools = [moc]` stages the binary but no headers). kklochkov's rule
+    reads the include dirs straight off the Qt toolchain's `CcInfo`
+    `compilation_context` — including `external_includes`, which its comments
+    call out as an easy field to miss — and stages the headers itself. Same
+    byte-identical result with **zero** include flags in my BUILD file: the rule
+    knows what moc needs better than its callers do.
 
-20. **Qt's official builds use `reduce_relocations`, which requires `-fPIC` in
-    consumers.** Our copts mirrored CMake's `-fPIE`, and against qt.io's Qt that
-    produced a `SIGSEGV` inside `QGuiApplication::screenAdded` during
-    `QApplication` construction — before any Ladybird code ran, and *only* in GUI
-    mode (`--headless` was fine, since it never constructs a `QApplication`).
-    `qconfig.pri` lists `reduce_relocations`; `rules_qt`'s own `qt_cc_binary`
-    hardcodes `-fPIC` for exactly this reason. One-character fix, non-obvious
-    symptom: parity with CMake's flags is *not* always right once a dependency
-    changes provenance.
+20. **CMake's moc unity file was hiding a real bug in Ladybird.** Compiling each
+    `moc_*.cpp` separately breaks one TU: `TabBar.h` calls `as<Tab>()` (a
+    `dynamic_cast`) inline but only forward-declares `Tab`. It only ever compiled
+    because `mocs_compilation.cpp` `#include`s `moc_Tab.cpp` *before*
+    `moc_TabBar.cpp`. Unity builds hide incomplete-type bugs behind file
+    ordering. My first fix was moc's `-b` flag to prepend the include — but that
+    is papering over it in the build system, and a well-designed rule (correctly)
+    offers no such knob. The actual fix is one line in `TabBar.h`:
+    `#include <UI/Qt/Tab.h>`. Upstreamable, and it makes the header
+    self-contained for every build system.
 
-21. **A distro Qt and a BCR Qt are different dependencies.** `rules_qt` 0.0.7
-    pins Qt 6.8.3; Ladybird's CMake requires ≥ 6.9. Adding a 6.10.2 entry to
-    `qt_modules.bzl` (three archive URLs + SHAs from the qt.io repository XML)
-    was ~20 lines and worked first try, which is the right shape for an upstream
-    PR. Also note qt.io's Qt bundles ICU 73 while vcpkg gives Ladybird ICU 78:
-    both load into the same process, and that is *fine* because ICU suffixes its
-    symbols per soversion (`u_strlen_73` vs `u_strlen_78`). Worth knowing before
-    blaming a duplicate-library ODR problem — I did, and was wrong.
+21. **Bazel-visible flags are only correct relative to the dependency you got.**
+    Against qt.io's Qt, our faithfully-mirrored CMake `-fPIE` produced a
+    `SIGSEGV` inside `QGuiApplication::screenAdded` during `QApplication`
+    construction — before any Ladybird code ran, and only in GUI mode, since
+    `--headless` never constructs a `QApplication`. Cause: those builds set
+    `reduce_relocations`, which requires `-fPIC` consumers (Vertexwahn's
+    `qt_cc_binary` hardcodes `-fPIC` for exactly this). Against the distro Qt
+    that `local_repo` discovers, `-fPIE` is correct again — verified both ways.
+    So this was never a Ladybird flag bug; it was a property of one Qt binary.
+    (I also briefly suspected the dual ICU — qt.io's Qt bundles ICU 73, vcpkg
+    gives Ladybird 78 — and was wrong: ICU version-suffixes its symbols
+    (`u_strlen_73`), so both coexist fine.)
 
 The remaining host dependency in this area is small: `libdrm` (still via
 `CPLUS_INCLUDE_PATH`) and the glslang-generated shader headers, still copied
