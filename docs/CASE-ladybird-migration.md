@@ -737,6 +737,29 @@ spirv-headers; direct3d/dng prune the rest).
    it has to be the same feature closure. A resolver that reconstructs the
    manifest instead of copying it will reintroduce exactly this class of bug.
 
+### Result on the full tree
+
+With Ladybird's manifest verbatim (47 deps, 45 overrides), its overlay-ports and
+overlay-triplets, the generated LDFLAGS file, and `--binarysource=clear` to force
+a genuine from-source build: the whole dependency tree builds with **zero network
+access** (55 distfiles served from the pre-fetched index by SHA512, no origin
+fallback), and across **all 83 shared libraries there are no content differences
+against the reference build**: 30 byte-identical, 53 differing only in `.dynstr`
+zero-padding, with `.text`/`.rodata`/`.data`/`.data.rel.ro`/`.dynsym`/`.gnu.hash`/
+`.rela.dyn` hashing identical in every one.
+
+The padding is diagnosed, not hand-waved, and it is an artifact of my test
+harness rather than of the design: the triplet sets `VCPKG_FIXUP_ELF_RPATH`, so
+the raw linker output embeds the *absolute buildtree path* as RUNPATH and patchelf
+later shrinks it to `$ORIGIN`, leaving slack proportional to the original string.
+My buildtree path is 8 characters shorter than the reference's, and the affected
+files are exactly 8 bytes smaller — and only libraries that link a sibling (an
+extra `NEEDED` entry) are affected, which is why e.g. `libbrotlicommon` is
+byte-identical while `libbrotlidec` is not. Under Bazel the buildtree path is
+fixed by the sandbox, so this becomes stable; it is also a reminder that
+`VCPKG_FIXUP_ELF_RPATH` makes vcpkg output *build-path-dependent*, which is worth
+knowing before trusting a remote cache.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →

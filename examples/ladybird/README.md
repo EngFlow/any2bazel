@@ -79,12 +79,15 @@ Honest inventory of what stops this from being a clone-and-build.
    `ar`, because they have circular cross-crate symbol references a flat link
    cannot order). Consequence: **you must run the CMake build first.**
 
-   Ring 2's design is settled and validated on skia (byte-identical output, zero
-   network): `http_file` per distfile with hashes lifted from the vcpkg portfiles,
-   then `vcpkg install` wrapped with `x-script` + `x-block-origin` so Bazel owns
+   Ring 2's design is settled and validated on the **whole dependency tree**:
+   `http_file` per distfile with hashes lifted from the vcpkg portfiles, then
+   `vcpkg install` wrapped with `x-script` + `x-block-origin` so Bazel owns
    fetching and vcpkg stays only the build recipe. Deliberately **not** the BCR —
    re-sourcing the deps would change versions/patches/features and destroy the
-   parity baseline. See finding 23 in
+   parity baseline. Measured: builds with zero network access, and all 83 shared
+   libraries match the reference in content (30 byte-identical, 53 differing only
+   in `.dynstr` padding caused by `VCPKG_FIXUP_ELF_RPATH` and the buildtree path
+   length). See finding 23 in
    [the case study](../../docs/CASE-ladybird-migration.md).
 2. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm`,
    `-L/usr/lib/x86_64-linux-gnu`, and `-L`/`-rpath` into
