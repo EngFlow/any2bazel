@@ -631,6 +631,112 @@ contributes zero *comparisons* to the parity harness (its output goes to a
 directory, so the harness's per-file `copy_if_different` check does not apply),
 so a green harness never spoke to this rule's inputs at all.
 
+## Finding 23: where the dependencies actually come from — and why not the BCR
+
+Before designing Ring 2 I had to answer a question I had been fudging: the 44
+external libraries the browser links — are they system packages, checked-in
+source, or prebuilt vendor binaries? **None of the above.** vcpkg compiles them
+from upstream source, on this machine: `vcpkg.json` pins 47 ports with exact
+version overrides against a pinned vcpkg baseline commit, and vcpkg downloads 85
+upstream tarballs (810 MB) and builds them (3.0 GB of buildtrees, 9,814 object
+files). Bazel then `cc_import`s the *output*. So Bazel is consuming the product
+of a from-source build it does not control.
+
+(I should also correct a number I had been repeating: "224 vcpkg `.so`s" was a
+file count of `lib/`, counting symlinks and `.a`s. It is 87 real `.so` + 97 `.a`,
+and what the linked binaries actually pull in is **44 distinct libraries**. The
+~39 other shared objects in `ldd` output — glibc, libstdc++, X11/EGL/GLX/Vulkan,
+glib, dbus, pulse, systemd — are host-provided, as they are under upstream CMake
+too; that is not migration debt. Qt's 4 are host-provided via `rules_qt`.)
+
+### Why not the BCR
+
+My first instinct was to resolve these against the Bazel Central Registry, and
+that was a category error, not merely a matter of taste. **The BCR would
+re-source the dependencies**: different upstream versions, different patch sets,
+different feature configurations than the ones Ladybird pins. That silently
+destroys the baseline the whole migration is built on — if the bits differ, every
+diff measured afterwards is meaningless. This project already contains the
+counterexample: the ICU 73-vs-78 near-miss in the Qt work. Ladybird's curl is
+`brotli+non-http+http2+http3+openssl+websockets+zstd`; the BCR's curl is whatever
+its maintainer packaged. Concretely, of the 44: ~24 have BCR modules, ~20 do not
+— including **skia**, the largest and most feature-specific. And Ladybird carries
+**8 of its own overlay-ports** (angle, cpptrace, highway, libtommath, pdfjs,
+simdutf, vulkan, wuffs) — patched recipes that exist nowhere upstream. A resolver
+that "finds the BCR equivalent" would be optimizing for idiomatic Bazel over
+identical bits, which is backwards for a tool whose value proposition is the
+parity loop.
+
+### The shape that works: Bazel fetches, vcpkg builds
+
+Keep vcpkg as the *recipe* (it encodes the patches, configure flags, and feature
+sets) and give Bazel ownership of fetching, hashing, and sandboxing:
+
+- **`http_file` per distfile in `MODULE.bazel`.** vcpkg portfiles carry `SHA512`
+  (2,710 of 2,856 ports); hex → base64 is exactly Bazel's SRI `integrity`.
+  Verified: zlib's portfile hash, dropped into `http_file`, fetches a file
+  **byte-identical to vcpkg's own `downloads/` copy**. No hand-rehashing, no
+  trust downgrade.
+- **`--x-asset-sources="clear;x-script,<tool> {url} {sha512} {dst};x-block-origin"`.**
+  `x-script` routes every vcpkg fetch to a script that resolves it from
+  Bazel-provided files *by hash*; `x-block-origin` makes vcpkg hard-fail rather
+  than fall back to the network. It is an `x-` (experimental) feature, which is
+  the main risk in this design.
+- **Git-sourced externals need pre-staging, not a network hole.** Asset caching
+  only covers `vcpkg_download_distfile`; `vcpkg_from_git` shells out to `git
+  fetch`, which no asset source can intercept. This looked like it might sink the
+  design. It does not: `vcpkg_from_git` uses `DOWNLOADS/${PORT}-${REF}.tar.gz` if
+  it already exists, so git-sourced deps can be pre-placed as archives and `git`
+  is never invoked.
+
+**Validated on skia** — deliberately the hardest of the 44: not on the BCR,
+GN-built rather than CMake, 12 patches, a specific feature set, and 10 of its own
+git externals. Result: `libskia.so` **byte-identical to the reference build**
+(10,145,257 bytes, `cmp` clean, 2,442 exported symbols matching), built with
+**zero network access** — 15 distfiles served from a pre-fetched index by SHA512,
+no origin fallback. Two of its externals needed pre-staging; Ladybird's feature
+set needs only 3 of the 10 (`VCPKG_BUILD_TYPE=release` prunes spirv-tools and
+spirv-headers; direct3d/dng prune the rest).
+
+### Four things testing caught that reasoning would not have
+
+1. **`x-block-origin` is a total boundary, including vcpkg's own tools.** It
+   intercepted vcpkg provisioning cmake 4.4.0, patchelf, gn, meson and pkgconf
+   for itself. That is the strongest evidence it is a real hermeticity boundary —
+   and it turns the toolchain vcpkg silently provisions into a declarable input,
+   the same hidden-input class as findings 1 and 22.
+2. **Hashes must come from the baseline-resolved portfile, not `ports/` tip.**
+   For **8 of the 47 pins the pin is older than the tip of `ports/`** (35 match,
+   2 have no port dir). `ports/zlib` describes 1.3.2 while Ladybird wants 1.3.1,
+   and using the tip's hash fails with exactly the checksum mismatch Bazel
+   reports. The hash must be read out of the historical portfile the baseline
+   resolves to, via the `versions/` DB `git-tree` (`git cat-file` in the vcpkg
+   checkout). Mechanical, but the difference between working and silently wrong.
+   Relatedly, `vcpkg install` must be passed Ladybird's full 45-entry `overrides`
+   list — bare `vcpkg install <port>` ignores it and resolves the wrong version.
+3. **The vcpkg build's reproducibility depends on a CMake-generated file.** On
+   the first full run, 15 of 21 libraries differed from the reference — same
+   exported symbols, same `.text`/`.data`/`.bss`, but 5 `LOAD` segments instead
+   of 3. Cause: Ladybird's CMake configure writes
+   `Build/full/build-vcpkg-variables.cmake` containing
+   `set(ENV{LDFLAGS} -Wl,-z,noseparate-code)` (a patchelf/binutils-2.43.50
+   workaround), which the custom triplets `include()`. So a *cross-system* input
+   — generated by the CMake step — is load-bearing for byte-parity of the vcpkg
+   step, and the Bazel rule must reproduce it explicitly rather than inherit it.
+   skia was byte-identical anyway because GN passes its own link flags, which is
+   precisely why validating on one library is not enough. I had been about to
+   write this delta off as "timestamps"; it was not. Supplying the file took the
+   tree from 6/21 to 14/21 byte-identical.
+4. **Feature selections on *transitive* deps are part of the pinned config.** The
+   remaining 7 differences were my own test-harness error, and an instructive one:
+   I had hand-written a manifest declaring only `skia` with its feature list,
+   which loses the feature selections Ladybird declares on transitive deps —
+   `libpng[apng]` most visibly, whose absence removes 20 exported symbols
+   (`png_get_acTL`, the APNG API). The manifest must be Ladybird's dependency
+   list *verbatim*, not a hand-derived subset: "same versions" is not enough,
+   it has to be the same feature closure. A resolver that reconstructs the
+   manifest instead of copying it will reintroduce exactly this class of bug.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -638,13 +744,15 @@ so a green harness never spoke to this rule's inputs at all.
   `Ladybird`. Per layer: generate `BUILD.bazel` from the model, aquery, diff,
   triage, fix. Mechanical and delegatable per library once the pattern (AK) is
   set; the two findings above are the shared plumbing to get right first.
-- **Ring 2 (stretch) — real bzlmod deps.** Swap `cc_import` shims for BCR
-  `bazel_dep`s where they exist + `rules_foreign_cc` otherwise, and build a
-  find_package/vcpkg → BCR resolver adapter (the designed-but-unbuilt external
-  resolver plug-in point). This is also the bulk of what stands between the
-  current build and *"can someone else build it on their machine"*: today it
-  needs a local `Build/full` for vcpkg `.so`s and the prebuilt Rust archive.
-  Remaining after Ring 2: `rules_rust` for the 10 crates. (Qt — moc/rcc and the
+- **Ring 2 — Bazel-driven vcpkg (design settled, see finding 23).** `http_file`
+  per distfile in `MODULE.bazel` + `vcpkg install` wrapped so that Bazel owns
+  fetching and vcpkg is only the build recipe. *Not* BCR — see finding 23 for why
+  re-sourcing the deps would destroy the parity baseline this migration is built
+  on. This is the bulk of what stands between the current build and *"can someone
+  else build it on their machine"*: today it needs a local `Build/full` for the
+  vcpkg `.so`s and the prebuilt Rust archive.
+  Remaining after Ring 2: `rules_rust` for the 10 crates (Ladybird's own source,
+  167 crates.io deps in `Cargo.lock` → `crate_universe`). (Qt — moc/rcc and the
   host include paths — is done, via `rules_qt`, now fetched by
   `archive_override` from upstream rather than a local path.)
   The full gap list is in [`examples/ladybird/README.md`](../examples/ladybird/README.md#known-gaps).
@@ -662,7 +770,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical; 22 findings, 3 of them real any2bazel engine fixes with
+byte-identical; 23 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)

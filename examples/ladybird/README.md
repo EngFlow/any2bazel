@@ -72,12 +72,20 @@ ln -sfn "$PWD/Build/full/share/Lagom" "$ER/bazel-out/k8-fastbuild/share"
 Honest inventory of what stops this from being a clone-and-build.
 
 1. **External deps are shims over the CMake build tree, not Bazel deps.**
-   224 vcpkg `.so`s are `cc_import`ed out of `Build/full/vcpkg_installed/`, and
-   the Rust crates come from a 260 MB prebuilt `librust_combined.a` (10 cargo
-   archives pre-merged with `ar`, because they have circular cross-crate symbol
-   references a flat link cannot order). Replacing both with real bzlmod deps
-   (`rules_foreign_cc`/BCR, `rules_rust`) is Ring 2 and the largest remaining
-   piece. Consequence: **you must run the CMake build first.**
+   The 44 external libraries the binaries link are `cc_import`ed out of
+   `Build/full/vcpkg_installed/` — vcpkg builds them from upstream source (47
+   pinned ports, 85 tarballs) and Bazel consumes the output. The Rust crates come
+   from a 260 MB prebuilt `librust_combined.a` (10 cargo archives pre-merged with
+   `ar`, because they have circular cross-crate symbol references a flat link
+   cannot order). Consequence: **you must run the CMake build first.**
+
+   Ring 2's design is settled and validated on skia (byte-identical output, zero
+   network): `http_file` per distfile with hashes lifted from the vcpkg portfiles,
+   then `vcpkg install` wrapped with `x-script` + `x-block-origin` so Bazel owns
+   fetching and vcpkg stays only the build recipe. Deliberately **not** the BCR —
+   re-sourcing the deps would change versions/patches/features and destroy the
+   parity baseline. See finding 23 in
+   [the case study](../../docs/CASE-ladybird-migration.md).
 2. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm`,
    `-L/usr/lib/x86_64-linux-gnu`, and `-L`/`-rpath` into
    `Build/full/vcpkg_installed/`. All three are consequences of (1) plus libdrm
