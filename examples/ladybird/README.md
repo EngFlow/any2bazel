@@ -87,8 +87,17 @@ Honest inventory of what stops this from being a clone-and-build.
    parity baseline. Measured: builds with zero network access, and all 83 shared
    libraries match the reference in content (30 byte-identical, 53 differing only
    in `.dynstr` padding caused by `VCPKG_FIXUP_ELF_RPATH` and the buildtree path
-   length). See finding 23 in
+   length). Then verified by *removal*: with the reference tree moved aside and
+   the independently-built one swapped in, the browser still builds green and
+   renders `--headless=text`/`--headless=layout-tree` byte-identically to CMake.
+   See findings 23 and 24 in
    [the case study](../../docs/CASE-ladybird-migration.md).
+
+   The swap also exposed shim debt: the vcpkg `cc_library(name = "headers")`
+   globs the whole 3,585-file include tree as one target that every compile
+   depends on, so *any* change in the dep tree re-hashes every C++ compile.
+   Correct but far too coarse for a remote cache; wants per-port header targets
+   with per-port `includes=[]` (finding 24).
 2. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm`,
    `-L/usr/lib/x86_64-linux-gnu`, and `-L`/`-rpath` into
    `Build/full/vcpkg_installed/`. All three are consequences of (1) plus libdrm

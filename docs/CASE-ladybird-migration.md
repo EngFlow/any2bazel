@@ -760,6 +760,65 @@ fixed by the sandbox, so this becomes stable; it is also a reminder that
 `VCPKG_FIXUP_ELF_RPATH` makes vcpkg output *build-path-dependent*, which is worth
 knowing before trusting a remote cache.
 
+## Finding 24: swapping the dep tree out from under Bazel — the load-bearing test
+
+Finding 23 compared my Bazel-fetched, vcpkg-built tree against the reference
+*by inspection* (83 `.so`s, section hashes). Inspection answers "do these look
+the same"; it does not answer "can the browser actually be built from mine". So:
+verify by removal. I moved the reference tree
+(`Build/full/vcpkg_installed` → `~/vcpkg_installed.REFERENCE-ASIDE`) and put my
+tree in its place. With the reference gone, a green build and a correct render
+can only come from my tree.
+
+**Result: green.** 2,801 actions, `RC=0`, and the rebuilt `ladybird` renders —
+`--headless=text` *and* `--headless=layout-tree` remain **byte-identical to the
+CMake reference build's output** (48 and 1,564 bytes). `ldd` confirms 44 vcpkg
+`.so`s resolving out of the swapped-in tree. The dependency-provisioning design
+of finding 23 is therefore not just plausible, it is sufficient: Ladybird builds
+and runs against a dependency tree assembled entirely from Bazel-fetched
+distfiles with `x-block-origin` and zero network access.
+
+**What the swap taught that the `.so` diff could not.** Replacing the tree
+invalidated ~2,500 **compile** actions, not just the links. I would have missed
+this entirely by diffing only `.so`s, and my first read — "the headers aren't
+bit-identical" — was wrong in an interesting way. The common set is
+*perfectly* identical: all **3,580** headers present in both trees hash the same.
+The reference tree has **5 extra files** the mine does not, all under
+`include/pkgconf/libpkgconf/`, and nothing in Ladybird includes them.
+
+The cause is not a build difference but a *triplet* difference. vcpkg installs
+build-time tooling ports (`pkgconf`, `gn`, `gperf`, `aclocal`, the `vcpkg-cmake`
+/`vcpkg-make`/`vcpkg-tool-*` helper ports) into the **host** triplet. My run had
+`x64-linux` and `x64-linux-dynamic` as separate output dirs, so the tooling
+landed in the host dir; the reference build put host and target in the same dir,
+so its `x64-linux-dynamic/include` also carries `pkgconf`'s headers. Pure
+spill-over from a shared install root — the target-relevant content matches
+exactly.
+
+But the invalidation is the real finding, and it is a **modelling** bug in my
+overlay, not a reproducibility one: the vcpkg shim declares one
+`cc_library(name = "headers", hdrs = glob(["include/**"]))` — the whole 3,585-file
+tree as a single target that *every* compile depends on. So any change anywhere
+in the tree, including five unused `pkgconf` headers, re-hashes the input of
+every C++ compile in the project. That is correct-but-coarse: it is why a
+swap that changed nothing Ladybird reads still cost a 45-minute rebuild, and it
+is exactly the granularity that will make a remote cache useless (any dep bump
+invalidates everything). It also rhymes with finding 22 — a `glob()` in the
+dependency shim is again the smell. Fixing it means per-port header targets
+(`:png16_headers`, `:skia_headers`, …) with `includes=[]` scoped per port,
+matching what each library actually consumes. Noted as debt, not fixed here:
+the coarse target is what preserves the `-isystem`-equivalence to CMake that
+finding 23's parity baseline rests on, so it should be split *after* the host
+`-isystem` escape in `.bazelrc` is replaced by real per-port `includes`.
+
+**Housekeeping trap, worth recording.** The overlay `BUILD.bazel` lives *inside*
+`vcpkg_installed/x64-linux-dynamic/`, so swapping the tree deletes it and Bazel
+fails with `no such package`. The committed copy under
+`examples/ladybird/workspace/` is the source of truth; copy it in *before*
+building. A dependency shim that lives inside the directory it describes is
+fragile by construction — under a real `repository_rule` the BUILD file is
+generated outside the fetched tree, which is the right shape.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -767,11 +826,14 @@ knowing before trusting a remote cache.
   `Ladybird`. Per layer: generate `BUILD.bazel` from the model, aquery, diff,
   triage, fix. Mechanical and delegatable per library once the pattern (AK) is
   set; the two findings above are the shared plumbing to get right first.
-- **Ring 2 — Bazel-driven vcpkg (design settled, see finding 23).** `http_file`
-  per distfile in `MODULE.bazel` + `vcpkg install` wrapped so that Bazel owns
-  fetching and vcpkg is only the build recipe. *Not* BCR — see finding 23 for why
-  re-sourcing the deps would destroy the parity baseline this migration is built
-  on. This is the bulk of what stands between the current build and *"can someone
+- **Ring 2 — Bazel-driven vcpkg (design settled and validated end to end, see
+  findings 23 and 24).** `http_file` per distfile in `MODULE.bazel` + `vcpkg
+  install` wrapped so that Bazel owns fetching and vcpkg is only the build
+  recipe. *Not* BCR — see finding 23 for why re-sourcing the deps would destroy
+  the parity baseline this migration is built on. Finding 24 closed the loop by
+  swapping the reference tree out and building the browser against the
+  Bazel-fetched one; what remains is packaging this as a `repository_rule`
+  (plus splitting the over-coarse `:headers` target). This is the bulk of what stands between the current build and *"can someone
   else build it on their machine"*: today it needs a local `Build/full` for the
   vcpkg `.so`s and the prebuilt Rust archive.
   Remaining after Ring 2: `rules_rust` for the 10 crates (Ladybird's own source,
@@ -793,7 +855,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical; 23 findings, 3 of them real any2bazel engine fixes with
+byte-identical; 24 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)
