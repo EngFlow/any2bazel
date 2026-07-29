@@ -819,6 +819,47 @@ building. A dependency shim that lives inside the directory it describes is
 fragile by construction — under a real `repository_rule` the BUILD file is
 generated outside the fetched tree, which is the right shape.
 
+## Finding 25: "1,402/1,402 generated files identical" had a blind spot — the filter
+
+Asked the plain question "how do we get rid of the CMake build?", I enumerated
+what is still consumed out of `Build/full` instead of recalling it, and found a
+coverage hole in my own headline number. Four generators were never Bazel-ified
+*and* never appeared in the parity harness, so they could not show up as
+failures — the count was 1,402/1,402 of the files it looked at.
+
+Both the emitter (`emit_root_codegen_bazel.py`) and the harness
+(`bazel_parity_harness.py`) select ninja `CUSTOM_COMMAND`s by the same
+substring: `'Meta/Generators/' in cmd`. One filter, applied twice, so the
+emitter and its checker share a blind spot exactly — the checker cannot catch
+what the emitter drops, which is the worst possible failure mode for a
+generate-then-verify pipeline. Classifying all 740 `CUSTOM_COMMAND`s by tool:
+46 are harness-covered, and the ones the filter hides are
+
+| Hidden generator | Output | Why the filter missed it |
+|---|---|---|
+| `Libraries/LibGfx/TIFFGenerator.py` | `TIFFMetadata.h` + `TIFFTagHandler.cpp` | generator lives in `Libraries/`, not `Meta/Generators/` |
+| `glslangValidator` | 2 `WebContentViewLinux*Shader.h` | not a Python generator at all |
+| `Build/full/bin/flapc` | `interpreter_x86_64.S` | a tool **Ladybird builds itself**, then runs |
+| `Build/full/bin/generate_interpreter_layout` | `Interpreter/layout.conf` | ditto — and it feeds `flapc`, so two chained self-built tools |
+| 21 × `cmake -E copy_if_different` | `share/Lagom/**` (fonts, icons, themes, about-pages, pdf.js) | resource staging, not codegen |
+
+`TIFFTagHandler.cpp` is the sharpest one: it is a *generated source file* that
+Bazel currently **compiles straight out of CMake's build tree** via
+`exports_files` in a `Build/full` shim, so the migration silently depends on
+CMake having produced a `.cpp`, not merely a header. The two self-built tools
+(`flapc`, `generate_interpreter_layout`) are the most interesting, because they
+are the case Bazel handles natively and better than CMake — a host tool built in
+the same graph that produces sources — and they need a real `cc_binary` +
+genrule pair rather than a script genrule.
+
+The lesson generalises past this repo, and it is the sharper form of "check a
+green check's coverage" (finding 20): when the generator and its verifier share
+a selector, the verifier's denominator is the generator's assumption, and a
+number like 1,402/1,402 measures agreement rather than completeness. The fix is
+for the harness to enumerate *all* `CUSTOM_COMMAND`s and explicitly account for
+each one — covered, deliberately excluded (cpack/ctest/lint), or **unhandled** —
+so a missing generator is a visible non-zero count instead of an absence.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -832,10 +873,39 @@ generated outside the fetched tree, which is the right shape.
   recipe. *Not* BCR — see finding 23 for why re-sourcing the deps would destroy
   the parity baseline this migration is built on. Finding 24 closed the loop by
   swapping the reference tree out and building the browser against the
-  Bazel-fetched one; what remains is packaging this as a `repository_rule`
-  (plus splitting the over-coarse `:headers` target). This is the bulk of what stands between the current build and *"can someone
-  else build it on their machine"*: today it needs a local `Build/full` for the
-  vcpkg `.so`s and the prebuilt Rust archive.
+  Bazel-fetched one; what remains is packaging it (plus splitting the over-coarse
+  `:headers` target). This is the bulk of what stands between the current build
+  and *"can someone else build it on their machine"*: today it needs a local
+  `Build/full` for the vcpkg `.so`s and the prebuilt Rust archive.
+
+  **Where the vcpkg invocation goes — decided.** Not a `repository_rule`, which
+  is what I first said reflexively. Repository rules run at load time,
+  single-threaded, unsandboxed, with no remote execution, no remote cache and no
+  fine-grained invalidation; a 45-minute C++ build does not belong there. Split
+  it by what each layer is good at: **fetching** stays at module level
+  (`http_file` per distfile — that is precisely bzlmod's job, and it is what
+  pins the hashes and shares the download cache), while **building** becomes an
+  ordinary build action, so it is sandboxed, cacheable and remotable.
+
+  **And wrapping vcpkg is explicitly a stepping stone, not the destination.**
+  The on-mission answer for a *converter* is to consume vcpkg's resolution
+  rather than its build: `vcpkg depend-info --format=list` already emits the
+  full resolved graph with feature selections (47 ports), and every installed
+  port ships a `.list` manifest enumerating its outputs (6,093 entries, 327
+  libs, 3,791 headers across the tree) — enough to emit one Bazel target per
+  port and build the deps with Bazel's own toolchain. That is the real target
+  state; shelling out to the foreign build system is the thing any2bazel exists
+  to replace. The reason to wrap first is sequencing, not preference: it gets a
+  clone-and-build now, and nothing about it is permanent.
+
+  Worth being explicit about what that later replacement costs, because it is a
+  cost to *my verification method* rather than to any user: rebuilding the deps
+  with Bazel's toolchain changes their flags and therefore their bytes, which
+  destroys the byte-parity baseline findings 23/24 rest on. That is acceptable —
+  Ladybird's CI does not care whether `libpng` is byte-identical, it cares that
+  the browser renders, and finding 24 showed the render comparison is the
+  stronger check anyway. Byte-parity was the right *ratchet* while building the
+  migration; it is not the definition of done.
   Remaining after Ring 2: `rules_rust` for the 10 crates (Ladybird's own source,
   167 crates.io deps in `Cargo.lock` → `crate_universe`). (Qt — moc/rcc and the
   host include paths — is done, via `rules_qt`, now fetched by
@@ -855,7 +925,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical; 24 findings, 3 of them real any2bazel engine fixes with
+byte-identical (but see finding 25 on that denominator); 25 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)

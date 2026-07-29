@@ -9,7 +9,8 @@ This directory is the *artifact*: what you would drop into a Ladybird checkout.
 **What it achieves today:** all five processes (`ladybird` UI, WebContent,
 Compositor, RequestServer, ImageDecoder) are Bazel-built, all 46 code
 generators run under Bazel with output **byte-identical to CMake's**
-(1,402/1,402 files, checked by `Meta/bazel_parity_harness.py`), and the result
+(1,402/1,402 files, checked by `Meta/bazel_parity_harness.py` — see finding 25:
+four generators sit outside that filter), and the result
 renders pages (`--headless=text` matches the CMake reference byte for byte).
 
 **It is not yet a clean-machine build.** See [Known gaps](#known-gaps).
