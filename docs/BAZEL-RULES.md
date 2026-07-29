@@ -24,18 +24,23 @@ failed, so nothing surfaced it. Resolve the version at migration time from the
 registry (`https://bcr.bazel.build/modules/<name>/metadata.json` lists every
 published version) or from the ruleset's tags, and never from recall.
 
-**The version you declare is not the version you get.** Bazel's MVS resolves the
-declared version as a *floor*. Measured on Dolphin:
+**The version you declare is not the version you get.** MVS treats it as a
+*floor*, and the binding floor is usually `bazel_tools` — built into Bazel
+itself, so `.bazelversion` is part of the dependency specification. Same
+one-line `MODULE.bazel` declaring `rules_cc 0.0.16`, three Bazel versions:
 
-| declared `rules_cc` | resolved |
+| Bazel | resolved `rules_cc` |
 |---|---|
-| 0.0.16 | **0.2.17** |
-| 0.0.17 | **0.2.17** |
-| 0.2.22 | 0.2.22 |
+| 7.5.0 | 0.0.16 |
+| 8.4.2 | **0.1.1** |
+| 9.2.0 | **0.2.17** |
 
-`protobuf` (pulled in transitively by `rules_cc` itself) demands 0.2.17, so
-anything below that is silently upgraded. A migration that records what it
-declared has recorded a fiction. Run `bazel mod graph` and record what resolved.
+On 9.2.0 anything below 0.2.17 is inert. So record what resolved, alongside the
+Bazel version (`bazel mod graph`; add `--include_builtin` to see `bazel_tools`),
+and put `common --check_direct_dependencies=error` in `.bazelrc` so a stale
+declared version fails the build instead of warning. Dolphin's `MODULE.bazel`
+fails that check today. This bites version *upgrades* hardest: bumping Bazel
+moves rulesets with no change to `MODULE.bazel`.
 
 The same command shows the transitive cost. Dolphin declares **two** modules and
 resolves **27**, including `rules_kotlin`, `rules_android`, `rules_swift` and
@@ -61,6 +66,7 @@ Ranges, not recommendations. "Declared" is what a `MODULE.bazel` asked for;
 
 Bazel itself: **7.5.0** (VSCode, pinned in `.bazelversion`) and **9.2.0**
 (Dolphin). No migration here has needed a Bazel-version-specific workaround.
+Every "resolved" column above is a fact about 9.2.0, not about the declared file.
 
 ## Written by hand instead of adopting a ruleset
 
