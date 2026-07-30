@@ -2,7 +2,7 @@
 
 The Bazel workspace overlay produced by the any2bazel parity loop for
 [Ladybird](https://ladybird.org) (CMake + vcpkg, C++23). The narrative — why
-each of these files looks the way it does, and the 28 findings the migration
+each of these files looks the way it does, and the 29 findings the migration
 produced — is in [`docs/CASE-ladybird-migration.md`](../../docs/CASE-ladybird-migration.md).
 This directory is the *artifact*: what you would drop into a Ladybird checkout.
 

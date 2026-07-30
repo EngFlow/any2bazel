@@ -1044,6 +1044,36 @@ strategy, it is a corruption strategy — and an append-only log plus a
 content-addressed cache is the shape that survives being killed at an arbitrary
 point.
 
+### Finding 29: `x-script` gets one URL, but portfiles list mirrors
+
+A live failure worth recording, because it is a property of the asset-cache
+interface rather than of my script. `gperf`'s portfile lists **two** URLs
+(`ftpmirror.gnu.org` then `ftp.gnu.org`), and several GNU ports do. But
+`x-asset-sources`'s `x-script` hook is invoked with **one** `{url}` per attempt.
+So when `ftpmirror.gnu.org` started returning 502 (it did, for ~13 minutes, and
+wedged the capture run mid-build), my recorder failed, and vcpkg did the only
+thing it could: fell back to the authoritative source — which is exactly what
+`x-block-origin` forbids in a real build. In other words the multi-mirror
+redundancy that portfiles encode **does not reach the asset-cache script**, so a
+single flaky mirror is enough to break a nominally mirror-redundant fetch.
+
+Two consequences for the design:
+
+- The **capture** must not depend on one mirror being up. It now records the
+  tuple unconditionally (the SHA512 is mirror-independent — that is the whole
+  point of content addressing) and retries known GNU mirrors before failing.
+- For **builds** this is a non-issue, and pleasantly so: once the distfiles are
+  `http_file`s, mirror flakiness is Bazel's problem, and `http_file` takes a
+  *list* of `urls`. So Bazel's fetching model is strictly better here than the
+  asset-cache hook it replaces — which is a small argument for the whole
+  direction of this ring: move fetching to the layer that models it properly.
+
+Also worth noting on process: the wedge was invisible from the outside. The run
+looked alive (a process existed, the log had recent writes) while making no
+progress for 13 minutes, because retrying a 502 forever *is* activity. Liveness
+is not progress, and a poll that only asks "is it running?" cannot tell the
+difference — the thing to watch was the ports counter, not the process.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1109,7 +1139,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 28 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 29 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)

@@ -36,8 +36,23 @@ set -euo pipefail
 # {dst} is a temp name like "foo.tar.gz.12345.part"; strip the suffix vcpkg
 # appends so the recorded filename is the one it finally stores.
 name=\$(basename "\$3"); name=\${name%.part}; name=\${name%.[0-9]*}
+# vcpkg hands x-script ONE url per call even when the portfile lists several
+# mirrors, so if that one mirror is down the script fails and vcpkg falls back to
+# the origin -- which under x-block-origin (the real builds) is a hard failure.
+# Record the tuple regardless (the SHA512 is what matters and it is
+# mirror-independent), and try the known GNU mirrors before giving up. Hit live:
+# ftpmirror.gnu.org returned 502 for ~13 minutes and wedged the capture.
 printf '%s\t%s\t%s\n' "\$1" "\$2" "\$name" >> "$OUT"
-curl -sSL --fail -o "\$3" "\$1"
+if curl -sSL --fail --max-time 120 -o "\$3" "\$1"; then exit 0; fi
+alt=\$(printf '%s' "\$1" | sed \
+  -e 's|https://ftpmirror.gnu.org/gnu/|https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/|' \
+  -e 's|https://ftp.gnu.org/pub/gnu/|https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/|')
+if [ "\$alt" != "\$1" ]; then
+  echo "capture: primary failed, trying mirror \$alt" >&2
+  curl -sSL --fail --max-time 120 -o "\$3" "\$alt" && exit 0
+fi
+echo "capture: FAILED to fetch \$1" >&2
+exit 1
 EOF
 chmod +x "$REC"
 
