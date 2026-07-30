@@ -277,6 +277,163 @@ def test_bazel_recovers_javac_as_javacompile():
                                                "guava/src/com/x/B.java")
 
 
+# ---- depSet resolution (aquery input closures) ------------------------------
+# Regression tests for the DAG walk behind TsProgram's input closure. This path
+# had NO coverage, and the original implementation was unusable on any large
+# graph: on cloudflare/workerd it was OOM-killed at 2.7GB having enumerated 349M
+# artifact IDs, because it counted PATHS through a shared DAG rather than nodes.
+
+def _depset_container(dsets):
+    return {"depSetOfFiles": [dict(d) for d in dsets]}
+
+
+def test_depsets_resolve_transitively():
+    r = extract_bazel.DepsetResolver(_depset_container([
+        {"id": 1, "directArtifactIds": [10], "transitiveDepSetIds": [2, 3]},
+        {"id": 2, "directArtifactIds": [20]},
+        {"id": 3, "directArtifactIds": [30], "transitiveDepSetIds": [4]},
+        {"id": 4, "directArtifactIds": [40]},
+    ]))
+    assert sorted(r.resolve([1])) == [10, 20, 30, 40]
+    # a leaf depSet resolves to just its own artifacts
+    assert sorted(r.resolve([3])) == [30, 40]
+    # unions of several depSets, and unknown ids, are handled
+    assert sorted(r.resolve([2, 4])) == [20, 40]
+    assert r.resolve([999]) == []
+    assert r.resolve([]) == []
+
+
+def test_depsets_dedupe_diamond():
+    """A depSet reachable by two paths must be counted ONCE.
+
+    The original implementation concatenated child LISTS, so a shared node was
+    repeated once per path through the DAG -- counting paths, not nodes.
+    """
+    r = extract_bazel.DepsetResolver(_depset_container([
+        {"id": 1, "transitiveDepSetIds": [2, 3]},
+        {"id": 2, "directArtifactIds": [99], "transitiveDepSetIds": [4]},
+        {"id": 3, "directArtifactIds": [99], "transitiveDepSetIds": [4]},
+        {"id": 4, "directArtifactIds": [99, 100]},
+    ]))
+    assert sorted(r.resolve([1])) == [99, 100]
+
+
+def test_depsets_do_not_blow_up_on_shared_dag():
+    """The workerd blocker, in miniature.
+
+    A chain where every level references the two levels below it has a number of
+    ROOT->LEAF PATHS that grows like Fibonacci, while the node count grows
+    linearly. Path-counting flattening is therefore exponential in the depth: at
+    depth 60 it would enumerate ~1e12 entries. A visited-set walk is linear, so
+    this returns immediately.
+    """
+    depth = 60
+    dsets = [{"id": 1, "directArtifactIds": [1]},
+             {"id": 2, "directArtifactIds": [2]}]
+    for i in range(3, depth + 1):
+        dsets.append({"id": i, "directArtifactIds": [i],
+                      "transitiveDepSetIds": [i - 1, i - 2]})
+    r = extract_bazel.DepsetResolver(_depset_container(dsets))
+    assert sorted(r.resolve([depth])) == list(range(1, depth + 1))
+
+
+def test_depsets_survive_a_cycle():
+    """Defensive: a self- or mutually-referencing depSet must not hang.
+
+    Real aquery output is acyclic, but the original recursion would have
+    recursed forever (RecursionError) on malformed input rather than degrading.
+    """
+    r = extract_bazel.DepsetResolver(_depset_container([
+        {"id": 1, "directArtifactIds": [10], "transitiveDepSetIds": [2]},
+        {"id": 2, "directArtifactIds": [20], "transitiveDepSetIds": [1, 2]},
+    ]))
+    assert sorted(r.resolve([1])) == [10, 20]
+
+
+class _WatchedDepset(dict):
+    """A depSet that records whether anything read its contents."""
+
+    def get(self, key, default=None):
+        if key in ("directArtifactIds", "transitiveDepSetIds"):
+            self["_read"] = True
+        return dict.get(self, key, default)
+
+
+def test_depsets_are_not_indexed_eagerly():
+    """Resolution is on demand: only the depSets actually reached are walked.
+
+    Only the TS path consumes input closures, so a build with no such action
+    (i.e. every C++ project, and workerd) must pay nothing for the rest of the
+    graph. The original implementation indexed ALL depSets up front and threw
+    the result away.
+
+    Checked behaviourally: an unreachable component must never be read. Doing
+    this with a watcher rather than by timing/memory keeps the failure a clean
+    assertion instead of an OOM.
+    """
+    reached = _WatchedDepset({"id": 1, "directArtifactIds": [10]})
+    unreached = _WatchedDepset({"id": 2, "directArtifactIds": [20],
+                                "transitiveDepSetIds": [3]})
+    r = extract_bazel.DepsetResolver({"depSetOfFiles": [reached, unreached]})
+    assert not reached.get("_read") and not unreached.get("_read"), \
+        "resolver walked the DAG at construction time"
+    assert r.resolve([1]) == [10]
+    assert reached.get("_read"), "reached depSet was not read"
+    assert not unreached.get("_read"), \
+        "resolver walked a depSet outside the requested closure"
+
+
+def test_ts_program_splits_into_per_file_tscompile_actions():
+    """TsProgram -> one TsCompile per real .ts source, via the input closure.
+
+    Also covers the filtering: .d.ts (type-only), non-src/ inputs (node_modules,
+    tsconfig) produce no TsCompile action.
+    """
+    aquery = {
+        "artifacts": [
+            {"id": 1, "pathFragmentId": 1},   # src/a.ts        -> emitted
+            {"id": 2, "pathFragmentId": 2},   # src/b.d.ts      -> type-only
+            {"id": 3, "pathFragmentId": 3},   # node_modules/x.ts -> not src/
+            {"id": 4, "pathFragmentId": 4},   # src/sub/c.ts    -> emitted
+        ],
+        "pathFragments": [
+            {"id": 10, "label": "src"},
+            {"id": 1, "label": "a.ts", "parentId": 10},
+            {"id": 2, "label": "b.d.ts", "parentId": 10},
+            {"id": 11, "label": "node_modules"},
+            {"id": 3, "label": "x.ts", "parentId": 11},
+            {"id": 12, "label": "sub", "parentId": 10},
+            {"id": 4, "label": "c.ts", "parentId": 12},
+        ],
+        "targets": [{"id": 1, "label": "//:ts"}],
+        # the sources arrive through a TRANSITIVE depSet, not a flat one
+        "depSetOfFiles": [
+            {"id": 1, "directArtifactIds": [1, 2], "transitiveDepSetIds": [2]},
+            {"id": 2, "directArtifactIds": [3, 4]},
+        ],
+        "actions": [{
+            "mnemonic": "TsProgram", "targetId": 1, "inputDepSetIds": [1],
+            "arguments": ["tsc", "--outDir",
+                          "bazel-out/k8-fastbuild/bin/out-build"],
+        }],
+    }
+    with tempfile.TemporaryDirectory() as root:
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(aquery, f)
+        b = extract_bazel.extract(aq_path, "/repo")
+        t = b.targets["<tscompile>"]
+        assert all(a.mnemonic == "TsCompile" for a in t.actions)
+        assert sorted(a.inputs[0] for a in t.actions) == ["src/a.ts",
+                                                          "src/sub/c.ts"]
+        outs = {a.inputs[0]: a.outputs for a in t.actions}
+        assert outs["src/a.ts"] == ("out-build/a.js", "out-build/a.js.map")
+        assert outs["src/sub/c.ts"] == ("out-build/sub/c.js",
+                                        "out-build/sub/c.js.map")
+        # role is set by the extractor and must not be demoted to AGGREGATE
+        assert t.role.value == "production", t.role
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
