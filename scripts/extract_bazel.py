@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from model import (Action, BuildSystem, CanonicalModel, Target, TargetKind,
                    TargetRole)
@@ -109,31 +109,54 @@ def _is_real_compile(args) -> bool:
     return any(a.endswith(_REAL_SOURCE_EXTS) for a in args)
 
 
-def _build_depset_index(container: dict) -> Dict[int, List[int]]:
-    """Flatten each depSetOfFiles to a list of leaf artifact IDs.
+class DepsetResolver:
+    """Resolves an action's `inputDepSetIds` to its leaf artifact IDs.
 
     Bazel aquery represents an action's input closure as a DAG of depSets
-    (`directArtifactIds` + `transitiveDepSetIds`). For TsProgram there's one
-    flat depSet, but we handle the general case so the extractor works for any
-    future custom rule that shares depSets via transitivity.
+    (`directArtifactIds` + `transitiveDepSetIds`), heavily shared between
+    actions. Two properties of that DAG make the obvious implementation
+    unusable, and both were learned the hard way on cloudflare/workerd, whose
+    //src/... graph has 722 C++ actions over 2052 depSets:
+
+    * **It is a DAG, not a tree.** A depSet reachable by k distinct paths gets
+      visited k times, so concatenating child results counts *paths*, not
+      *nodes*. On workerd (2052 depSets) that reached 349M artifact IDs and
+      2.7GB RSS before the OOM killer; the deduplicated closure of the whole
+      graph is 5.6M IDs, and the largest single closure is 13k.
+    * **Only a couple of actions ever need it.** Just the TS path consumes
+      input closures. Eagerly indexing all depSets did the work for every one
+      of them (all of it discarded on a project with no TS actions at all).
+
+    So: walk the DAG on demand with a visited set (linear in nodes+edges, no
+    revisits), and don't memoize whole closures -- the overlap between closures
+    is exactly what made materializing them expensive. `resolve()` is called
+    once per consuming action, which is a handful of times per build.
     """
-    dsets = {d["id"]: d for d in container.get("depSetOfFiles", [])}
-    cache: Dict[int, List[int]] = {}
 
-    def flatten(did: int) -> List[int]:
-        if did in cache:
-            return cache[did]
-        d = dsets.get(did)
-        if d is None:
-            cache[did] = []
-            return []
-        out = list(d.get("directArtifactIds", []))
-        for tid in d.get("transitiveDepSetIds", []):
-            out.extend(flatten(tid))
-        cache[did] = out
-        return out
+    def __init__(self, container: dict):
+        self._dsets = {d["id"]: d for d in container.get("depSetOfFiles", [])}
 
-    return {did: flatten(did) for did in dsets}
+    def resolve(self, dsids: Iterable[int]) -> List[int]:
+        """Leaf artifact IDs of the union of `dsids`, deduped, first-seen order.
+
+        Order is deterministic (so model output is reproducible) but carries no
+        meaning -- callers key artifacts by path, not position.
+        """
+        out: Dict[int, None] = {}       # ordered set
+        seen: set = set()
+        stack = list(dsids)
+        while stack:
+            did = stack.pop()
+            if did in seen:
+                continue
+            seen.add(did)
+            d = self._dsets.get(did)
+            if d is None:
+                continue
+            for aid in d.get("directArtifactIds", []):
+                out[aid] = None
+            stack.extend(d.get("transitiveDepSetIds", []))
+        return list(out)
 
 
 def _out_dir_from_args(args) -> str:
@@ -187,22 +210,15 @@ def _ts_output_paths(src_relpath: str, out_dir: str) -> List[str]:
 
 def _extract_ts_program(action: dict, out_dir: str,
                         artifacts: Dict[int, str],
-                        depsets: Dict[int, List[int]]) -> List[Action]:
+                        depsets: DepsetResolver) -> List[Action]:
     """Split one TsProgram action into per-source TsCompile actions.
 
     Mirrors the npm side's `<tscompile>` structure (per-file). Only .ts inputs
     under src/ that emit .js are considered; type-only .d.ts inputs and
     node_modules/type_deps inputs are filtered out.
     """
-    input_ids: List[int] = []
-    for dsid in action.get("inputDepSetIds", []):
-        input_ids.extend(depsets.get(dsid, []))
-    seen = set()
     actions: List[Action] = []
-    for aid in input_ids:
-        if aid in seen:
-            continue
-        seen.add(aid)
+    for aid in depsets.resolve(action.get("inputDepSetIds", [])):
         path = artifacts.get(aid, "")
         if not path.startswith("src/") or not path.endswith(".ts"):
             continue
@@ -226,7 +242,7 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
 
     artifacts = _build_path_index(container)
     labels = _label_index(container)
-    depsets = _build_depset_index(container)
+    depsets = DepsetResolver(container)
 
     model = CanonicalModel(build_system=BuildSystem.BAZEL, repo_root=repo_root)
     by_target: Dict[str, Target] = {}
