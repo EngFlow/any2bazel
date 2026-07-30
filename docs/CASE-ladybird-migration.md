@@ -1015,6 +1015,35 @@ silently undercounting. A generator that only reports what it found cannot repor
 what it missed — which is why the third thing I build after an emitter and its
 verifier is a comparison against ground truth that neither of them produced.
 
+### The vcpkg build action, and what "resumable" actually means
+
+Part 2 is `vcpkg.bzl`'s `vcpkg_tree` rule plus `Meta/vcpkg_build.sh`. The
+placement argument is above (finding 28 / the Ring 2 plan): fetching at module
+level, building as an ordinary action. One detail worth keeping: the sha512→file
+index is **written by Bazel** and passed as a declared input, so the mapping the
+asset-cache script resolves through is part of the action's inputs rather than
+ambient state on the machine.
+
+The operational lesson came from breaking it. A sandbox restart killed the
+capture run at 27/78 ports after ~50 minutes, and my first "resumable" retry
+simply kept the whole scratch root — which failed worse: ports that were
+mid-install when the process died had left files on disk that were **not** in
+vcpkg's status database, so the retry died with `File exists` on libpng and
+libwebp. The distinction that matters:
+
+- `downloads/` **is** resumable: content-addressed, and each file is either
+  complete or absent. Keeping it is the entire benefit of resuming.
+- the install tree and `buildtrees/` are **not**: they carry
+  partially-applied state with no transaction around it.
+
+So: keep `dl/`, discard `out/` and `bt/`. With a warm downloads directory the
+restart reached 7/78 in forty seconds. Generalised: when resuming a long foreign
+build, keep only the parts that are content-addressed, and re-derive everything
+that is a mutation of shared state. "Just don't delete anything" is not a resume
+strategy, it is a corruption strategy — and an append-only log plus a
+content-addressed cache is the shape that survives being killed at an arbitrary
+point.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
