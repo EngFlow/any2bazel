@@ -13,13 +13,13 @@ package. Emits the COMPLETE Libraries/LibWeb/BUILD.bazel on stdout -- loads,
 package(), the codegen macro calls and the cc_library -- so the checked-in file
 is reproducible rather than a hand-spliced copy of this block.
 """
-import json, os, re
+import json, os, re, sys
 
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODEL = os.path.join(ROOT, "model.cmake.full.json")
 PKG_PREFIX = "Libraries/LibWeb/"
 GEN_PREFIX = "Build/full/Libraries/LibWeb/"
-VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+VCPKG = "//Meta/vcpkg"
 RUST_PKG = "//Build/full/cargo/build/x86_64-unknown-linux-gnu/release"
 
 GLOBAL_DEFINES = {
@@ -65,14 +65,11 @@ def genrule_outputs():
 
 
 def vcpkg_available():
-    so, ar = set(), set()
-    lib = os.path.join(ROOT, "Build/full/vcpkg_installed/x64-linux-dynamic/lib")
-    for f in os.listdir(lib):
-        if f.startswith("lib") and ".so" in f:
-            so.add(f[3:].split(".so")[0])
-        elif f.startswith("lib") and f.endswith(".a"):
-            ar.add(f[3:-2])
-    return so, ar
+    """See emit_build_bazel.vcpkg_available: the shim package is the source of
+    truth for which external deps have a Bazel label."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import emit_build_bazel
+    return emit_build_bazel.vcpkg_available()
 
 
 def target_srcs(t):
@@ -195,7 +192,16 @@ def main():
         if i == GEN_PREFIX.rstrip("/"):
             continue  # LibWeb's own gendir -> includes=[".."]
         if "vcpkg_installed" in i:
-            copt_toks += ["-isystem", i]
+            # Carried by the //Meta/vcpkg:<port> dep as system_includes; see
+            # emit_build_bazel.py for why this is not a copt.
+            pass
+        elif i.startswith("/"):
+            # Absolute system include root (/usr/include/libdrm). Bazel rejects a
+            # path outside the execution root even as -isystem, so these live as
+            # a global CPLUS_INCLUDE_PATH in .bazelrc -- same rule the root
+            # emitter applies. It was already absent from the checked-in BUILD
+            # file; this makes the emitter agree instead of drifting.
+            pass
         else:
             copt_toks.append("-I" + i)
 

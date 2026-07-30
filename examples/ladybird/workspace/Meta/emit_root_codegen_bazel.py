@@ -48,7 +48,7 @@ import re, os, sys, shlex
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FULL = ROOT + "/Build/full"
 LIBWEB_CD = FULL + "/Libraries/LibWeb"
-VCPKG_PKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+VCPKG_PKG = "//:vcpkg_installed_exec"
 
 # A python generator command is one that runs a .py under Meta/Generators (the
 # bulk) or one of the generators that live next to the library they serve.
@@ -329,7 +329,7 @@ def emit_flap(layout, flap):
     # runtime libs are real inputs of this action. srcs (not tools) because they
     # are data for the exec-config binary, staged at their execroot paths so the
     # relative rpath in .bazelrc resolves inside the sandbox.
-    print('        srcs = [%r],' % (VCPKG_PKG + ':runtime_libs'))
+    print('        srcs = [%r],' % VCPKG_PKG)
     print('        cmd = "$(location //:generate_interpreter_layout) > $@",')
     print('    )')
     extra = (' ' + ' '.join(flap['extra'])) if flap['extra'] else ''

@@ -2,7 +2,7 @@
 
 The Bazel workspace overlay produced by the any2bazel parity loop for
 [Ladybird](https://ladybird.org) (CMake + vcpkg, C++23). The narrative — why
-each of these files looks the way it does, and the 32 findings the migration
+each of these files looks the way it does, and the 33 findings the migration
 produced — is in [`docs/CASE-ladybird-migration.md`](../../docs/CASE-ladybird-migration.md).
 This directory is the *artifact*: what you would drop into a Ladybird checkout.
 
@@ -14,8 +14,10 @@ every one of the build's 586 ninja `CUSTOM_COMMAND`s — 51 covered, 535 exclude
 with a stated reason, **0 unhandled**), the result renders pages
 (`--headless=text` and `--headless=layout-tree` match the CMake reference byte
 for byte), and **the 77 vcpkg dependencies are fetched and built by Bazel with
-zero network access** — swapped in for the CMake-built tree and still rendering
-byte-identically (findings 30–32).
+zero network access**, then *consumed* from Bazel's own output tree: with the
+CMake vcpkg tree deleted from the machine, a clean build of all six binaries
+still renders `--headless=layout-tree` byte-identically to the reference
+(findings 30–33).
 
 **It is not yet a clean-machine build.** See [Known gaps](#known-gaps).
 
@@ -38,7 +40,8 @@ byte-identically (findings 30–32).
 | `Meta/emit_*.py` | The emitters. They read CMake's `build.ninja` + the File API codemodel and write the four generated files above |
 | `Meta/bazel_parity_harness.py` | Buckets every ninja `CUSTOM_COMMAND` as covered / excluded-with-reason / unhandled, re-runs the covered ones and byte-compares against CMake's tree. Non-zero unhandled is a failure |
 | `Meta/BUILD.bazel` | `//Meta:generators` filegroup (the generator scripts, as genrule inputs) |
-| `Build/full/**/BUILD.bazel` | Shims over the *reference CMake build tree*: vcpkg `cc_import`s, prebuilt Rust archives, and the `flapc` binary (a cargo crate). **These are the Ring 2 debt.** No generated *source* is shimmed any more — Bazel produces all of it |
+| `Meta/vcpkg/BUILD.bazel` | The 41 `vcpkg_lib` targets Ladybird's libraries depend on, backed by `//:vcpkg_installed`. Hand-written and stable (one target per port); this is the whole interface between Ladybird and its dependencies |
+| `Build/full/**/BUILD.bazel` | Shims over the *reference CMake build tree*: the prebuilt Rust archives and the `flapc` binary (a cargo crate). **This is the remaining Ring 2 debt** — the vcpkg shims are gone, and no generated *source* is shimmed either |
 
 The four generated files are reproducible: re-running each emitter against the
 same `Build/full` reproduces them byte for byte — **on the same machine**. They
@@ -50,8 +53,10 @@ adds `-I/usr/include/libdrm`), which is gap 3 below, not an emitter bug.
 
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
-# 1. Reference CMake build (also materializes the 696 generated files the
-#    parity harness diffs against, and the vcpkg/rust outputs Ring 2 will replace).
+# 1. Reference CMake build. Still needed for the RUST artifacts (gap 1) and for
+#    the 696 generated files the parity harness diffs against. NOT for vcpkg any
+#    more: Bazel fetches and builds the whole dep tree itself, and the build has
+#    been verified with Build/full/vcpkg_installed deleted.
 cmake --preset default -B Build/full -DENABLE_GUI_TARGETS=ON && ninja -C Build/full
 # 1b. Merge the per-crate cargo archives into the one combined archive the Rust
 #     shim cc_imports (see gap 1). They have circular cross-crate references, so
@@ -62,9 +67,10 @@ cmake --preset default -B Build/full -DENABLE_GUI_TARGETS=ON && ninja -C Build/f
 # 2. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism (gap 7)
-# 2b. Build the vcpkg dependency tree — Bazel fetches all 76 distfiles and builds
-#     all 77 ports with zero network access. (The cc_import shims still read
-#     Build/full/vcpkg_installed, see gap 1; this proves the tree is Bazel's.)
+# 2b. The vcpkg dependency tree — Bazel fetches all 76 distfiles and builds all 77
+#     ports with zero network access. Not a separate step any more: the libraries
+#     depend on it through //Meta/vcpkg:<port>, so step 4 builds it. Build it
+#     alone if you want to time it (~45 min cold).
 bazel build //:vcpkg_installed
 # 3. Regenerate the BUILD files from the reference build (optional — they are checked in).
 python3 Meta/emit_build_bazel.py > BUILD.bazel
@@ -113,13 +119,41 @@ Honest inventory of what stops this from being a clone-and-build.
    `--headless=text`/`--headless=layout-tree` byte-identically, with JS running.
    Findings 30–32.
 
-   What is left is plumbing, and it is why you still need the CMake build: the 34
-   `cc_import` shims read files out of `Build/full/vcpkg_installed/`, and
-   `cc_import` takes a *file* while `vcpkg_tree` produces a declared *directory*.
-   Rewiring them needs per-file outputs or a different shim shape. The Rust crates
-   are still a 260 MB prebuilt `librust_combined.a` (10 cargo archives pre-merged
-   with `ar`, because they have circular cross-crate references a flat link cannot
-   order). Consequence: **you must still run the CMake build first.**
+   **The plumbing now lands too: nothing reads the CMake vcpkg tree any more.**
+   The 34 `cc_import` shims are gone. `cc_import` takes a *file* and `vcpkg_tree`
+   declares a *directory*, so instead of enumerating ~40 per-file outputs, the
+   deps are consumed through `//Meta/vcpkg:<port>` (`vcpkg_lib`, 41 targets): a
+   rule returning a `CcInfo` whose compilation context carries the tree as a
+   header input plus `-isystem <tree>/<triplet>/include`, and whose linking
+   context carries `-L<tree>/lib -l<port>` with **the tree itself as
+   `additional_inputs`** — which is what makes the directory a declared input of
+   every link that depends on it. Unlike `cc_import` this also fixes the SONAME
+   problem for free (`cc_import` stages `libfmt.so` under its *file* name while
+   the loader asks for `libfmt.so.12`; a search path into the real tree has every
+   version symlink in place). The tree attr is pinned `cfg = "exec"` in both
+   configurations, so the 45-minute build happens **once** rather than once per
+   configuration for byte-identical output.
+
+   Verified by **removal**, the only test that counts here: `Build/full/vcpkg_installed`
+   moved off the machine, `bazel clean`, then all 6 binaries rebuilt from scratch
+   (4,390 actions) — Bazel built the 76 ports itself, and `--headless=layout-tree`
+   is byte-identical to the CMake reference. `ldd` resolves 46 libraries out of
+   Bazel's output tree and **0** out of `Build/full`. The finding-32 control
+   agrees: the `libSDL3` the binary loads has the 58 PulseAudio symbols only
+   Bazel's tree has. The four global `.bazelrc` escapes into `Build/full`
+   (`-isystem`, `-L`, `-rpath-link`, `-rpath`, each duplicated as `--host_*`) are
+   deleted, not relocated.
+
+   That also closes part of the shim-granularity debt below: the vcpkg include
+   dirs are no longer a *global* `-isystem` every TU gets whether it asked or not.
+   `include/skia`, `include/harfbuzz` and `include/libxml2` now ride on the port
+   that owns them, so a TU including `<skia/...>` must depend on `//Meta/vcpkg:skia`.
+
+   What remains is Rust: the crates are still a 260 MB prebuilt
+   `librust_combined.a` (10 cargo archives pre-merged with `ar`, because they have
+   circular cross-crate references a flat link cannot order), and `flapc` is still
+   the reference build's binary. Consequence: **you must still run the CMake build
+   first — but for Rust, no longer for vcpkg.**
 
    Wrapping vcpkg is explicitly a stepping stone, not the destination. It keeps
    vcpkg as the *recipe* (it encodes the patches, configure flags and feature sets
@@ -133,11 +167,11 @@ Honest inventory of what stops this from being a clone-and-build.
    and the real fix is building the deps with Bazel's own toolchain and declared
    sysroot.
 
-   The swap also exposed shim debt: the vcpkg `cc_library(name = "headers")`
-   globs the whole 3,585-file include tree as one target that every compile
-   depends on, so *any* change in the dep tree re-hashes every C++ compile.
-   Correct but far too coarse for a remote cache; wants per-port header targets
-   with per-port `includes=[]` (finding 24).
+   Remaining shim debt: each `vcpkg_lib` still declares the *whole tree* as its
+   header input, so any change in the dep tree re-hashes every C++ compile. The
+   include *paths* are now per-port; the input *set* is not. Making it per-port
+   needs the tree split into per-port outputs, which vcpkg's `.list` manifests
+   would give us (finding 24) — worth doing for a remote cache, invisible locally.
 2. **The exec configuration's flags are a duplicated list.** Now that Bazel
    *runs* a tool it built (`//:generate_interpreter_layout`), that tool and the AK
    it links are built in the exec configuration, a separate flag namespace that

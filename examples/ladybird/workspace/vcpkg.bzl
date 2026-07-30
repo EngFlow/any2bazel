@@ -16,6 +16,9 @@
 # (`depend-info` + each port's .list manifest) and build the deps with Bazel's
 # own toolchain. See docs/CASE-ladybird-migration.md findings 23/24/28.
 
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
+
 def _vcpkg_tree_impl(ctx):
     out = ctx.actions.declare_directory(ctx.attr.install_root)
 
@@ -114,4 +117,131 @@ vcpkg_tree = rule(
             cfg = "exec",
         ),
     },
+)
+
+# ---------------------------------------------------------------------------
+# Consuming the tree: why not cc_import.
+#
+# The 34 shims were `cc_import(shared_library = "lib/libfmt.so")`, which needs a
+# FILE label -- and vcpkg_tree declares a DIRECTORY. So every shim still read the
+# CMake reference tree, and the whole Bazel-built tree above was dead weight: a
+# target you could build but not consume. That was the last thing between "we
+# fetch and build the deps" and "you can clone this and build it".
+#
+# The fix is to stop pretending the tree is a set of files Bazel knows the names
+# of, and hand the linker what it already understands: a search path. vcpkg_lib
+# returns a CcInfo whose
+#
+#   compilation context = the tree as a header input + `-isystem <tree>/include`
+#   linking context     = `-L<tree>/lib -l<name>` plus the TREE as
+#                         additional_inputs
+#
+# additional_inputs is the load-bearing part: it makes the directory a declared
+# input of every link that (transitively) depends on this lib, so the sandbox
+# contains it and `-L` resolves. No per-file outputs to enumerate, and -- unlike
+# cc_import -- no SONAME problem: cc_import stages libfmt.so into _solib_k8 under
+# its FILE name while the loader asks for libfmt.so.12, whereas a search path
+# into the real tree has every symlink and version in place, exactly as the
+# dynamic linker expects.
+#
+# Still a wrapper around a foreign build, and still not what the destination
+# looks like (deps built by Bazel's own toolchain, per finding 24/28). But the
+# host escape is gone: nothing here names Build/full.
+# ---------------------------------------------------------------------------
+
+def _vcpkg_lib_impl(ctx):
+    tree = ctx.file.tree
+
+    # vcpkg installs into <install root>/<triplet>/, so the tree artifact has one
+    # more level than the include/ + lib/ the compiler wants.
+    root = tree.path + "/" + ctx.attr.triplet
+    includes = [root + "/" + d for d in ctx.attr.include_dirs]
+
+    # -l<name> for a shared lib, or the archive's path for a static one. Static
+    # libs go on the link line by path rather than -l<name>: -l prefers the .so
+    # when both exist in the same directory, and for woff2 only the .a exists.
+    flags = ["-L" + root + "/lib"]
+    for n in ctx.attr.shared:
+        flags.append("-l" + n)
+    for n in ctx.attr.static:
+        flags.append(root + "/lib/lib" + n + ".a")
+
+    # rpath so a binary Bazel RUNS during the build (a genrule tool) finds the
+    # .so at its execroot-relative path -- the same reason the old .bazelrc had a
+    # relative -rpath, except the path is now Bazel's own output tree.
+    flags.append("-Wl,-rpath," + root + "/lib")
+
+    # -rpath-link lets ld follow each .so's own DT_NEEDED (avif->libyuv,
+    # cpptrace->libdwarf) without those becoming link inputs of ours.
+    flags.append("-Wl,-rpath-link," + root + "/lib")
+
+    return [
+        DefaultInfo(files = depset([tree]), runfiles = ctx.runfiles(files = [tree])),
+        CcInfo(
+            compilation_context = cc_common.create_compilation_context(
+                headers = depset([tree]),
+                # system_includes, not includes: third-party headers must be
+                # -isystem so Ladybird's -Werror does not fire inside them
+                # (openssl/tls1.h alone trips -Wcast-qual).
+                system_includes = depset(includes),
+            ),
+            linking_context = cc_common.create_linking_context(
+                linker_inputs = depset([cc_common.create_linker_input(
+                    owner = ctx.label,
+                    user_link_flags = flags,
+                    additional_inputs = depset([tree]),
+                )]),
+            ),
+        ),
+    ]
+
+vcpkg_lib = rule(
+    implementation = _vcpkg_lib_impl,
+    doc = """A linkable dep backed by a directory-output vcpkg tree.
+
+    One target per port-ish group; the C++ rules see an ordinary CcInfo, so
+    consumers just put it in deps like any cc_library.""",
+    attrs = {
+        "tree": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            # Pinned to the EXEC configuration on purpose, in BOTH configs.
+            # vcpkg picks its own triplet and never sees Bazel's flags, so the
+            # tree is not configuration-dependent -- but its output PATH is, and
+            # a target-config copy plus an exec-config copy is the same
+            # 45-minute build done twice for byte-identical output. Pinning it
+            # gives one tree that both configs link against. The honest limit:
+            # this is only sound because host == target here; a real
+            # cross-compile has to plumb the triplet through anyway.
+            cfg = "exec",
+            doc = "The vcpkg_tree target (a single directory artifact).",
+        ),
+        "shared": attr.string_list(doc = "Library names to link as -l<name>."),
+        "static": attr.string_list(
+            doc = "Library names whose lib<name>.a is put on the link line by path.",
+        ),
+        "include_dirs": attr.string_list(
+            default = ["include"],
+            doc = "Dirs under <tree>/<triplet>/ added as -isystem.",
+        ),
+        "triplet": attr.string(
+            default = "x64-linux-dynamic",
+            doc = "The vcpkg triplet subdirectory inside the tree.",
+        ),
+    },
+)
+
+def _vcpkg_tree_for_exec_impl(ctx):
+    """The tree, forced into the EXEC configuration.
+
+    A genrule that RUNS an exec-config binary linked against these .so files
+    needs the tree staged in its sandbox -- but as srcs it would arrive in the
+    TARGET configuration, at a different bazel-out path than the one baked into
+    that binary's rpath, and would build the 45-minute tree a SECOND time. This
+    one-attribute rule with cfg = "exec" is the transition."""
+    return [DefaultInfo(files = depset(ctx.files.tree))]
+
+vcpkg_tree_for_exec = rule(
+    implementation = _vcpkg_tree_for_exec_impl,
+    attrs = {"tree": attr.label(allow_files = True, cfg = "exec", mandatory = True)},
 )

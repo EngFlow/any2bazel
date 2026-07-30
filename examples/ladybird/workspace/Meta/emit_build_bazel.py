@@ -15,8 +15,7 @@ from collections import defaultdict
 
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODEL = os.path.join(ROOT, "model.cmake.full.json")
-VCPKG_LIB = os.path.join(ROOT, "Build/full/vcpkg_installed/x64-linux-dynamic/lib")
-VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+VCPKG = "//Meta/vcpkg"
 RUST_PKG = "//Build/full/cargo/build/x86_64-unknown-linux-gnu/release"
 
 # Global defines already set in .bazelrc; do not re-emit per target.
@@ -70,11 +69,17 @@ def load():
 def is_lib(t): return t.get("kind") in ("shared_library", "static_library", "object_library")
 
 def vcpkg_available():
-    so, ar = set(), set()
-    for f in os.listdir(VCPKG_LIB):
-        if f.startswith("lib") and ".so" in f: so.add(f[3:].split(".so")[0])
-        elif f.startswith("lib") and f.endswith(".a"): ar.add(f[3:-2])
-    return so, ar
+    """The library names the vcpkg shim package declares a target for.
+
+    Read out of Meta/vcpkg/BUILD.bazel rather than by listing the CMake tree's
+    lib/ dir, so (a) the emitter does not need a built vcpkg tree at all, and
+    (b) emitter and shim cannot drift: a dep the shim does not declare comes out
+    as an UNKNOWN in the emitted BUILD file instead of a dangling label."""
+    txt = open(os.path.join(ROOT, "Meta/vcpkg/BUILD.bazel")).read()
+    names = set(re.findall(r"name = \"([^\"]+)\"", txt))
+    names |= set(re.findall(r"\"([A-Za-z0-9_]+)\"", txt.split("SHARED = [", 1)[1]
+                            .split("]", 1)[0]))
+    return names, names
 
 def lagom_to_target(name, targets):
     stem = name[len("lagom-"):]
@@ -243,10 +248,74 @@ ROOT_TARGETS = [
 # Emitted after the Qt autogen rules, since it consumes them.
 QT_TARGETS = ["ladybird"]
 
+# Ring 2's own targets: the vcpkg tree build action and its inputs. Emitted
+# rather than hand-appended, because a hand-appended tail is a file the emitter
+# would silently truncate on the next run -- exactly the drift this project keeps
+# finding. The per-port cc deps that CONSUME this tree live in
+# Meta/vcpkg/BUILD.bazel, which is hand-written and stable (one target per port).
+VCPKG_TAIL = """
+# ---------------------------------------------------------------------------
+# Ring 2: build the vcpkg dependency tree AS A BAZEL ACTION, with zero network.
+#
+# Every download is resolved by SHA512 out of the 76 http_files Bazel fetched
+# (vcpkg_index.bzl, generated from the capture); x-block-origin makes a miss a
+# hard error rather than a silent fetch, which is what makes the hermeticity
+# claim checkable rather than aspirational.
+#
+# The 34 external deps are consumed from this output via //Meta/vcpkg:<port>
+# (vcpkg_lib, see vcpkg.bzl). Nothing in the build reads the CMake reference tree
+# any more.
+vcpkg_tree(
+    name = "vcpkg_installed",
+    distfiles = VCPKG_DISTFILE_INDEX,
+    source_dir = ".",
+    source_root = ":vcpkg_source_inputs",
+    triplet = "x64-linux-dynamic",
+    # Resume cache: makes a killed 45-minute build cheap to restart. Absolute by
+    # necessity (the action's cwd is the execroot) and therefore a host escape --
+    # it is a build-speed affordance, not part of the dependency graph.
+    cache_dir = "/home/ubuntu/.cache/vcpkg-bazel",
+    vcpkg_root = "Build/vcpkg",
+    vcpkg_tree = "//Build/vcpkg:tree",
+)
+
+# The tree, forced into the exec configuration. //:generate_interpreter_layout is
+# run as a genrule tool, so Bazel builds it in the exec config and it needs the
+# .so files staged at the exec-config path baked into its rpath -- see the rule's
+# doc for why a plain srcs entry would both miss and rebuild the tree.
+vcpkg_tree_for_exec(
+    name = "vcpkg_installed_exec",
+    tree = ":vcpkg_installed",
+)
+
+# The manifest + overlays the build action needs, declared as inputs rather than
+# read out of the ambient checkout (finding 23: the manifest is used VERBATIM,
+# never reconstructed -- a hand-derived dep list loses feature selections on
+# transitive deps, and libpng[apng] alone is 20 exported symbols).
+filegroup(
+    name = "vcpkg_source_inputs",
+    srcs = ["vcpkg.json", "vcpkg-configuration.json"] + glob([
+        "Meta/CMake/vcpkg/overlay-ports/**",
+        "Meta/CMake/vcpkg/release-triplets/**",
+        "Meta/CMake/vcpkg/base-triplets/**",
+        # The 4 git-sourced externals. vcpkg_from_git bypasses asset caching
+        # entirely (it shells out to `git fetch`, which no asset source
+        # intercepts) but DOES honour a pre-placed downloads/<PORT>-<REF>.tar.gz,
+        # so these are staged there by the driver. Discovered by difference
+        # against what a completed run leaves in downloads/, not by parsing --
+        # skia reaches ten externals through its own declare_external_from_git
+        # wrapper and angle's are behind ${URL}/${REF} (finding 30).
+        "Meta/CMake/vcpkg/git-archives/**",
+    ], allow_empty = True),
+)
+"""
+
 
 ALL_LOADS = '''load("@rules_qt//qt:defs.bzl", "qt_cc_moc", "qt_cc_rcc", "qt_qrc")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":codegen_root.bzl", "root_codegen")
+load(":vcpkg.bzl", "vcpkg_tree", "vcpkg_tree_for_exec")
+load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -286,7 +355,7 @@ cc_library(
     ],
 )
 
-VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+VCPKG = "//Meta/vcpkg"
 '''
 
 AK_BLOCK_HEAD = '''
@@ -427,7 +496,13 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
                 # (mirroring CMake's find_package include dirs).
                 continue
             if "vcpkg_installed" in i:
-                copt_toks += ["-isystem", i]  # third-party: suppress -Werror
+                # Not a copt any more. The vcpkg include dirs (include/,
+                # include/skia, include/harfbuzz, include/libxml2) are carried by
+                # the //Meta/vcpkg:<port> dep as system_includes, so the include
+                # path arrives WITH the dep edge -- a target that includes
+                # <skia/...> without depending on skia now fails to compile,
+                # which is the whole point of declaring inputs.
+                pass
             else:
                 copt_toks.append("-I" + i)
         if copt_toks:
@@ -475,6 +550,7 @@ def main():
     for name in QT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar,
                     extra_srcs=[":qt_moc", ":qt_rcc"])
+    print(VCPKG_TAIL, end="")
 
 
 def lib_hdr_glob(name, srcs):

@@ -1,7 +1,7 @@
 load("@rules_qt//qt:defs.bzl", "qt_cc_moc", "qt_cc_rcc", "qt_qrc")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":codegen_root.bzl", "root_codegen")
-load(":vcpkg.bzl", "vcpkg_tree")
+load(":vcpkg.bzl", "vcpkg_tree", "vcpkg_tree_for_exec")
 load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
 package(default_visibility = ["//visibility:public"])
@@ -40,7 +40,7 @@ cc_library(
     ],
 )
 
-VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+VCPKG = "//Meta/vcpkg"
 
 
 # Configure-generated headers live in Build/full/AK; expose as AK/*.h via a copy.
@@ -129,11 +129,11 @@ cc_library(
         '//:LibCore',
         '//:LibCrypto',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:brotlicommon',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:brotlidec',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:brotlienc',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:z',
+        '//Meta/vcpkg:brotlicommon',
+        '//Meta/vcpkg:brotlidec',
+        '//Meta/vcpkg:brotlienc',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:z',
     ],
 )
 
@@ -232,12 +232,11 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibCrypto/**/*.h"], allow_empty = True),
     local_defines = ['LibCrypto_EXPORTS'],
-    copts = ['-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
     deps = [
         '//:AK',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:tommath',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:tommath',
     ],
 )
 
@@ -258,7 +257,7 @@ cc_library(
         '//:LibSync',
         '//:LibThreading',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
+        '//Meta/vcpkg:crypto',
     ],
 )
 
@@ -276,7 +275,7 @@ cc_library(
         '//:AK',
         '//:LibCore',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:sqlite3',
+        '//Meta/vcpkg:sqlite3',
     ],
 )
 
@@ -345,7 +344,7 @@ cc_library(
         '//:LibSync',
         '//:LibThreading',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:cpptrace',
+        '//Meta/vcpkg:cpptrace',
     ],
 )
 
@@ -414,7 +413,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibGfx/**/*.h"], allow_empty = True),
     local_defines = ['LibGfx_EXPORTS', 'SK_CODEC_DECODES_BMP', 'SK_CODEC_DECODES_GIF', 'SK_CODEC_DECODES_WBMP', 'SK_DISABLE_TRACING', 'SK_ENABLE_AVX512_OPTS', 'SK_ENABLE_PRECOMPILE', 'SK_FONTMGR_ANDROID_AVAILABLE', 'SK_FONTMGR_FCI_AVAILABLE', 'SK_FONTMGR_FONTCONFIG_AVAILABLE', 'SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMBEDDED_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMPTY_AVAILABLE', 'SK_GAMMA_APPLY_TO_A8', 'SK_GANESH', 'SK_HAS_WUFFS_LIBRARY', 'SK_R32_SHIFT=16', 'SK_TYPEFACE_FACTORY_FREETYPE', 'SK_USE_PERFETTO', 'SK_VULKAN', 'SK_XML'],
-    copts = ['-IBuild/full/Libraries/LibGfx', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/harfbuzz', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
+    copts = ['-IBuild/full/Libraries/LibGfx'],
     linkopts = ['-ldl', '-lpthread', '-lvulkan'],
     deps = [
         '//:AK',
@@ -429,19 +428,19 @@ cc_library(
         '//:all_source_headers',
         '//Build/full/Libraries:rust_ffi_headers',
         '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libgfx_rust',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:brotlidec',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:expat',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:fontconfig',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:freetype',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:harfbuzz',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:icuuc',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:jpeg',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:png16',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:skia',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:woff2common',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:woff2dec',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:z',
+        '//Meta/vcpkg:brotlidec',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:expat',
+        '//Meta/vcpkg:fontconfig',
+        '//Meta/vcpkg:freetype',
+        '//Meta/vcpkg:harfbuzz',
+        '//Meta/vcpkg:icuuc',
+        '//Meta/vcpkg:jpeg',
+        '//Meta/vcpkg:png16',
+        '//Meta/vcpkg:skia',
+        '//Meta/vcpkg:woff2common',
+        '//Meta/vcpkg:woff2dec',
+        '//Meta/vcpkg:z',
     ],
 )
 
@@ -482,8 +481,8 @@ cc_library(
         '//:LibURL',
         '//:LibUnicode',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:ssl',
     ],
 )
 
@@ -551,7 +550,6 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibGfx/**/*.h"], allow_empty = True),
     local_defines = ['AVIF_DLL', 'HWY_SHARED_DEFINE', 'LibImageDecoders_EXPORTS'],
-    copts = ['-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -565,16 +563,16 @@ cc_library(
         '//:LibTextCodec',
         '//:LibUnicode',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:avif',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:jpeg',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:jxl',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:png16',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:webp',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:webpdecoder',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:webpdemux',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:webpmux',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:z',
+        '//Meta/vcpkg:avif',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:jpeg',
+        '//Meta/vcpkg:jxl',
+        '//Meta/vcpkg:png16',
+        '//Meta/vcpkg:webp',
+        '//Meta/vcpkg:webpdecoder',
+        '//Meta/vcpkg:webpdemux',
+        '//Meta/vcpkg:webpmux',
+        '//Meta/vcpkg:z',
     ],
 )
 
@@ -865,8 +863,8 @@ cc_library(
         '//:all_source_headers',
         '//Build/full/Libraries:rust_ffi_headers',
         '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libjs_rust',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:simdjson',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:simdjson',
     ],
 )
 
@@ -935,7 +933,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibMedia/**/*.h"], allow_empty = True),
     local_defines = ['LIBMEDIA_AUDIO_BACKEND=1', 'LibMedia_EXPORTS', '_REENTRANT'],
-    copts = ['-fvisibility=hidden', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
+    copts = ['-fvisibility=hidden'],
     linkopts = ['-lpulse', '-lvulkan'],
     deps = [
         '//:AK',
@@ -947,11 +945,11 @@ cc_library(
         '//:LibThreading',
         '//:LibUnicode',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:avcodec',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:avformat',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:avutil',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:swresample',
+        '//Meta/vcpkg:avcodec',
+        '//Meta/vcpkg:avformat',
+        '//Meta/vcpkg:avutil',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:swresample',
     ],
 )
 
@@ -1059,8 +1057,8 @@ cc_library(
         '//:LibCrypto',
         '//:LibFileSystem',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:ssl',
     ],
 )
 
@@ -1114,7 +1112,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibURL/**/*.h"], allow_empty = True),
     local_defines = ['ENABLE_RUST', 'LibURL_EXPORTS'],
-    copts = ['-IBuild/full/Libraries/LibURL', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
+    copts = ['-IBuild/full/Libraries/LibURL'],
     deps = [
         '//:AK',
         '//:LibRegex',
@@ -1123,7 +1121,7 @@ cc_library(
         '//:all_source_headers',
         '//Build/full/Libraries:rust_ffi_headers',
         '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:liburl_rust',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:psl',
+        '//Meta/vcpkg:psl',
     ],
 )
 
@@ -1165,9 +1163,9 @@ cc_library(
         '//:all_source_headers',
         '//Build/full/Libraries:rust_ffi_headers',
         '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libunicode_rust',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:icudata',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:icui18n',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:icuuc',
+        '//Meta/vcpkg:icudata',
+        '//Meta/vcpkg:icui18n',
+        '//Meta/vcpkg:icuuc',
     ],
 )
 
@@ -1238,8 +1236,8 @@ cc_library(
         '//:LibThreading',
         '//:LibURL',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:ssl',
     ],
 )
 
@@ -1252,11 +1250,11 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibXML/**/*.h"], allow_empty = True),
     local_defines = ['LibXML_EXPORTS'],
-    copts = ['-fvisibility=hidden', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/libxml2'],
+    copts = ['-fvisibility=hidden'],
     deps = [
         '//:AK',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:xml2',
+        '//Meta/vcpkg:xml2',
     ],
 )
 
@@ -1401,9 +1399,9 @@ cc_library(
         '//:LibURL',
         '//:LibUnicode',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:fontconfig',
         '//Libraries/LibWeb:LibWeb',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:fontconfig',
     ],
 )
 
@@ -1526,7 +1524,7 @@ cc_library(
     ],
     hdrs = glob(["Services/Compositor/**/*.h"], allow_empty = True),
     local_defines = ['SK_CODEC_DECODES_BMP', 'SK_CODEC_DECODES_GIF', 'SK_CODEC_DECODES_WBMP', 'SK_DISABLE_TRACING', 'SK_ENABLE_AVX512_OPTS', 'SK_ENABLE_PRECOMPILE', 'SK_FONTMGR_ANDROID_AVAILABLE', 'SK_FONTMGR_FCI_AVAILABLE', 'SK_FONTMGR_FONTCONFIG_AVAILABLE', 'SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMBEDDED_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMPTY_AVAILABLE', 'SK_GAMMA_APPLY_TO_A8', 'SK_GANESH', 'SK_HAS_WUFFS_LIBRARY', 'SK_R32_SHIFT=16', 'SK_TYPEFACE_FACTORY_FREETYPE', 'SK_USE_PERFETTO', 'SK_VULKAN', 'SK_XML'],
-    copts = ['-IBuild/full', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
+    copts = ['-IBuild/full'],
     deps = [
         '//:LibCore',
         '//:LibGfx',
@@ -1622,9 +1620,9 @@ cc_binary(
         '//:LibWebSocket',
         '//:all_source_headers',
         '//:requestserverservice',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:curl',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:curl',
+        '//Meta/vcpkg:ssl',
     ],
 )
 
@@ -1649,13 +1647,13 @@ cc_binary(
         '//:LibWebView',
         '//:all_source_headers',
         '//:compositorservice',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:expat',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:fontconfig',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:freetype',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:libEGL_angle',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:libGLESv2_angle',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:skia',
         '//Libraries/LibWeb:LibWeb',
+        '//Meta/vcpkg:expat',
+        '//Meta/vcpkg:fontconfig',
+        '//Meta/vcpkg:freetype',
+        '//Meta/vcpkg:libEGL_angle',
+        '//Meta/vcpkg:libGLESv2_angle',
+        '//Meta/vcpkg:skia',
     ],
 )
 
@@ -1688,9 +1686,9 @@ cc_binary(
         '//:LibWebView',
         '//:all_source_headers',
         '//:webworkerservice',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
         '//Libraries/LibWeb:LibWeb',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:ssl',
     ],
 )
 
@@ -1728,10 +1726,10 @@ cc_binary(
         '//:LibWebView',
         '//:all_source_headers',
         '//:webcontentservice',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:SDL3',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
         '//Libraries/LibWeb:LibWeb',
+        '//Meta/vcpkg:SDL3',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:ssl',
     ],
 )
 
@@ -1817,9 +1815,9 @@ cc_binary(
         '//:LibWakeLock',
         '//:LibWebView',
         '//:all_source_headers',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:crypto',
-        '//Build/full/vcpkg_installed/x64-linux-dynamic:ssl',
         '//Libraries/LibWeb:LibWeb',
+        '//Meta/vcpkg:crypto',
+        '//Meta/vcpkg:ssl',
         '@qt//:QtCore',
         '@qt//:QtGui',
         '@qt//:QtWidgets',
@@ -1835,9 +1833,9 @@ cc_binary(
 # hard error rather than a silent fetch, which is what makes the hermeticity
 # claim checkable rather than aspirational.
 #
-# NB the cc_import shims in Build/full/vcpkg_installed/... still point at the
-# CMake reference tree. Swapping them onto this output is the next step; this
-# target is what makes that swap possible, and building it proves the boundary.
+# The 34 external deps are consumed from this output via //Meta/vcpkg:<port>
+# (vcpkg_lib, see vcpkg.bzl). Nothing in the build reads the CMake reference tree
+# any more.
 vcpkg_tree(
     name = "vcpkg_installed",
     distfiles = VCPKG_DISTFILE_INDEX,
@@ -1850,6 +1848,15 @@ vcpkg_tree(
     cache_dir = "/home/ubuntu/.cache/vcpkg-bazel",
     vcpkg_root = "Build/vcpkg",
     vcpkg_tree = "//Build/vcpkg:tree",
+)
+
+# The tree, forced into the exec configuration. //:generate_interpreter_layout is
+# run as a genrule tool, so Bazel builds it in the exec config and it needs the
+# .so files staged at the exec-config path baked into its rpath -- see the rule's
+# doc for why a plain srcs entry would both miss and rebuild the tree.
+vcpkg_tree_for_exec(
+    name = "vcpkg_installed_exec",
+    tree = ":vcpkg_installed",
 )
 
 # The manifest + overlays the build action needs, declared as inputs rather than

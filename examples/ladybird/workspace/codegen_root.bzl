@@ -136,7 +136,7 @@ def root_codegen():
         name = 'gen_interpreter_layout',
         outs = ['Libraries/LibJS/Interpreter/layout.conf'],
         tools = ["//:generate_interpreter_layout"],
-        srcs = ['//Build/full/vcpkg_installed/x64-linux-dynamic:runtime_libs'],
+        srcs = ['//:vcpkg_installed_exec'],
         cmd = "$(location //:generate_interpreter_layout) > $@",
     )
     native.genrule(

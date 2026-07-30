@@ -31,9 +31,12 @@ build --cxxopt=-I. --cxxopt=-ILibraries --cxxopt=-IServices
 # cc_librarys under Build/full/*/BUILD.bazel, which ARE declared).
 # Verified: //:ladybird + all 5 services build, and --headless=text and
 # --headless=layout-tree are byte-identical to the CMake reference without them.
-# vcpkg headers as SYSTEM includes (matches CMake's -isystem: suppresses -Werror
-# in third-party headers like openssl/tls1.h cast-qual).
-build --cxxopt=-isystem --cxxopt=Build/full/vcpkg_installed/x64-linux-dynamic/include
+# NOTE: deliberately NO global -isystem for the vcpkg include root. It used to be
+# here (mirroring CMake's single -isystem) and it meant every TU could include any
+# third-party header without declaring the dep. The vcpkg include dirs now ride on
+# the //Meta/vcpkg:<port> dep edges as system_includes, so a TU that includes
+# <skia/...> has to depend on skia -- and third-party headers are still -isystem,
+# so -Werror stays suppressed inside them.
 
 # NDEBUG (CMake RelWithDebInfo).
 # Reference build is CMake RelWithDebInfo (-O2 -g). Match its optimization so
@@ -48,14 +51,12 @@ build --cxxopt=-D_FILE_OFFSET_BITS=64 --cxxopt=-D_FORTIFY_SOURCE=3
 build --cxxopt=-fstack-protector-strong --cxxopt=-march=native --cxxopt=-fdiagnostics-color=always
 build --copt=-fPIC
 
-# Link: let ld resolve the transitive DT_NEEDED of the vcpkg .so shims
+# Let ld resolve the transitive DT_NEEDED of the vcpkg .so files
 # (avif->libyuv, cpptrace->libdwarf, ...) which are not themselves link inputs.
-# -rpath-link makes ld follow NEEDED at link time; -rpath makes the built
-# binary find them at run time (matches CMake's install-rpath to the vcpkg lib).
 build --linkopt=-Wl,--allow-shlib-undefined
-build --linkopt=-LBuild/full/vcpkg_installed/x64-linux-dynamic/lib
-build --linkopt=-Wl,-rpath-link,Build/full/vcpkg_installed/x64-linux-dynamic/lib
-build --linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+# The -L / -rpath-link / -rpath into the vcpkg lib dir are GONE: each
+# //Meta/vcpkg:<port> dep contributes them itself, pointing at Bazel's own output
+# tree, and declares that tree as an input of the link so the sandbox has it.
 # The prebuilt Rust crate archives each bundle an identical copy of the rust
 # allocator shim (__rust_realloc/__rust_alloc_zeroed/...). The reference build
 # isolates them by linking each crate into its own .so; our combined-archive
@@ -102,7 +103,6 @@ build --host_cxxopt=-Wno-unqualified-std-cast-call --host_cxxopt=-Wvla --host_cx
 build --host_cxxopt=-Wno-stringop-overflow --host_cxxopt=-Wno-dangling-reference
 build --host_cxxopt=-fstack-clash-protection
 build --host_cxxopt=-I. --host_cxxopt=-ILibraries --host_cxxopt=-IServices
-build --host_cxxopt=-isystem --host_cxxopt=Build/full/vcpkg_installed/x64-linux-dynamic/include
 build --host_cxxopt=-O2 --host_cxxopt=-g
 build --host_cxxopt=-DNDEBUG
 build --host_cxxopt=-DUSE_VULKAN=1 --host_cxxopt=-DUSE_FONTCONFIG=1
@@ -111,9 +111,6 @@ build --host_cxxopt=-D_FILE_OFFSET_BITS=64 --host_cxxopt=-D_FORTIFY_SOURCE=3
 build --host_cxxopt=-fstack-protector-strong --host_cxxopt=-march=native --host_cxxopt=-fdiagnostics-color=always
 build --host_copt=-fPIC
 build --host_linkopt=-Wl,--allow-shlib-undefined
-build --host_linkopt=-LBuild/full/vcpkg_installed/x64-linux-dynamic/lib
-build --host_linkopt=-Wl,-rpath-link,Build/full/vcpkg_installed/x64-linux-dynamic/lib
-build --host_linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
 build --host_linkopt=-Wl,--allow-multiple-definition
 build --host_linkopt=-L/usr/lib/x86_64-linux-gnu
 build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm

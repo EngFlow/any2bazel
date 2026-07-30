@@ -1193,10 +1193,9 @@ that makes this mean anything: the swapped-in `libSDL3` carries 58 `PULSEAUDIO_*
 symbols the reference build does not have, so "which tree is loaded" is decidable
 from the artifact rather than from my belief about it — and it is Bazel's.
 
-One structural gap remains before the shims can *point* at this target: `cc_import`
-takes a file, and `vcpkg_tree` produces a declared **directory**, so rewiring the
-34 `cc_import`s means either per-file outputs or a different shim shape. That is
-plumbing; the dependency tree itself is now Bazel's.
+One structural gap remained before the shims could *point* at this target:
+`cc_import` takes a file, and `vcpkg_tree` produces a declared **directory**.
+Finding 33 resolves it — by dropping `cc_import` rather than feeding it.
 
 ## Finding 32: the byte-diff found a host leak that byte-parity would have hidden
 
@@ -1233,6 +1232,73 @@ inherits the host sniffing along with the recipe. (Inert here — Ladybird uses 
 for gamepad input, not audio — but "inert today" is a property of the consumer, not
 of the build.)
 
+## Finding 33: `cc_import` wants a file, so stop importing and describe the link
+
+The tree was buildable and unusable. `vcpkg_tree` declares a **directory** output
+(one action, 5,018 files, names not knowable at analysis time); `cc_import` takes
+a **file** per attribute. So all 34 shims kept reading the CMake reference tree,
+and `//:vcpkg_installed` was a target you could build but not consume — the
+migration's last host escape survived precisely because the two Bazel concepts
+did not typecheck against each other.
+
+The two obvious ways out are both bad. Declaring ~40 per-file outputs means
+hand-maintaining a list of `.so` names *and their version suffixes*
+(`libavcodec.so.61.19.101`) that changes on every dep bump, i.e. re-encoding
+vcpkg's output in Starlark. Unpacking the directory into a shim package doubles
+the bytes and adds a copy of a 400 MB tree to every build.
+
+The third way is to stop modelling the deps as *imported files* and model them as
+what the linker actually consumes: **a search path**. `vcpkg_lib` returns a
+`CcInfo` directly —
+
+- compilation context: the tree artifact as a header input, plus
+  `-isystem <tree>/<triplet>/include` (and `include/skia` etc. for the ports whose
+  headers are not at the root);
+- linking context: `-L<tree>/lib -l<port>`, with **the tree as
+  `additional_inputs`**.
+
+`additional_inputs` is the load-bearing part: it makes the directory a declared
+input of every link that transitively depends on the port, so the sandbox
+contains it and `-L` resolves. Nothing is enumerated, nothing is copied, and the
+dep bump story is "rebuild the tree".
+
+It is also *more* correct than `cc_import` was, in a way I did not anticipate.
+`cc_import` stages a `shared_library` into `_solib_k8` under its **file** name
+(`libfmt.so`) while the dynamic loader asks for the **SONAME** (`libfmt.so.12`),
+so runfiles alone never satisfied a binary Bazel *runs* during the build — which
+is why the old setup needed a `runtime_libs` filegroup plus a relative `-rpath`
+in `.bazelrc` to paper over it. A search path into the real tree has every
+version symlink already in place, because vcpkg put them there.
+
+**The configuration trap.** A 45-minute action reachable from both the target and
+the exec configuration is built **twice**, for byte-identical output — vcpkg picks
+its own triplet and never sees Bazel's flags, so the tree is not
+configuration-dependent, but its output *path* is. Worse, a genrule running an
+exec-config tool cannot find the target-config copy at the path baked into its
+rpath. Pinning `vcpkg_lib`'s tree attr to `cfg = "exec"` in *both* configurations
+gives one tree both link against, and a one-attribute `vcpkg_tree_for_exec`
+transition hands genrules the same copy. Sound only because host == target here;
+a real cross-compile has to plumb the triplet through anyway.
+
+Two things fell out that are worth more than the plumbing. The vcpkg include root
+was a **global** `-isystem` in `.bazelrc`, so every TU could include any
+third-party header without declaring the dep — the same undeclared-input hole
+finding 1 caught for generated headers, hiding in the flags file rather than in a
+BUILD rule. Now `include/skia` arrives *with* the `//Meta/vcpkg:skia` edge, so
+including `<skia/...>` without the dep fails to compile. And the old shim
+`BUILD.bazel` lived **inside** `Build/full/vcpkg_installed/`, i.e. inside the very
+directory it described: swapping the tree deleted the package that consumed it.
+The interface to the deps now lives at `//Meta/vcpkg`, outside anything
+replaceable.
+
+Verified by removal, since inspection has been wrong before: the CMake vcpkg tree
+moved off the machine, `bazel clean`, 4,390 actions from scratch, all six binaries
+relinked, `--headless=layout-tree` byte-identical to the reference. `ldd` resolves
+46 libraries from Bazel's output tree and 0 from `Build/full`; the finding-32
+control (58 PulseAudio symbols = Bazel's SDL3, 0 = CMake's) confirms which tree is
+loaded. The four `.bazelrc` escapes are deleted rather than relocated. vcpkg is no
+longer a reason you need a CMake build first — Rust is the only one left.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1246,10 +1312,10 @@ of the build.)
   recipe. *Not* BCR — see finding 23 for why re-sourcing the deps would destroy
   the parity baseline this migration is built on. Finding 24 closed the loop by
   swapping the reference tree out and building the browser against the
-  Bazel-fetched one; what remains is packaging it (plus splitting the over-coarse
-  `:headers` target). This is the bulk of what stands between the current build
-  and *"can someone else build it on their machine"*: today it needs a local
-  `Build/full` for the vcpkg `.so`s and the prebuilt Rust archive.
+  Bazel-fetched one; finding 33 then packaged it, so the build no longer needs a
+  local `Build/full` for the vcpkg `.so`s at all. What stands between this and
+  *"can someone else build it on their machine"* is now Rust alone: the prebuilt
+  crate archive and `flapc`.
 
   **Where the vcpkg invocation goes — decided.** Not a `repository_rule`, which
   is what I first said reflexively. Repository rules run at load time,
@@ -1298,7 +1364,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 32 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 33 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)
