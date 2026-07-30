@@ -9,4 +9,7 @@ cc_library(
     hdrs = glob(["**/*.h"], allow_empty = True),
     includes = ["."],
 )
-exports_files(['Compositor/WebGLCommandReplayer.cpp'])
+# NOTE: no exports_files here any more. WebGLCommandReplayer.cpp used to be
+# compiled straight out of CMake's tree; it is now a genrule output in the root
+# package (`:Services/Compositor/WebGLCommandReplayer.cpp`, see codegen_root.bzl).
+# Verified by removal: deleting this line keeps //:Compositor green.

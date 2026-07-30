@@ -860,6 +860,103 @@ for the harness to enumerate *all* `CUSTOM_COMMAND`s and explicitly account for
 each one — covered, deliberately excluded (cpack/ctest/lint), or **unhandled** —
 so a missing generator is a visible non-zero count instead of an absence.
 
+## Finding 26: the exec configuration is a correctness boundary CMake does not have
+
+Closing finding 25's gap meant Bazel had to *run a tool it builds*
+(`generate_interpreter_layout`, which prints struct offsets that `flapc` bakes
+into the LibJS interpreter assembly). That immediately hit something CMake has no
+equivalent of: a tool run by a genrule is built in the **exec configuration**, a
+separate flag namespace that `--cxxopt`/`--copt`/`--linkopt` do not reach. With
+none of them applied, `<AK/kmalloc.h>` did not even resolve — there was no `-I.`.
+
+Every global flag therefore has to be repeated as `--host_cxxopt`/`--host_copt`/
+`--host_linkopt`, plus `--host_compilation_mode=fastbuild`, because the exec
+config defaults to `opt`, whose `-D_FORTIFY_SOURCE=1` collides with Ladybird's
+`=3` under `-Werror`. The duplicated list is ugly (README gap 2; the right fix is
+a shared `.bzl` list or a real toolchain, not more `--host_*` lines) — but the
+*split* is the point, and here it is a correctness requirement rather than
+bookkeeping: the tool emits struct offsets and sizes that get compiled into
+assembly used by target code, so if the tool sees different defines or ABI flags
+than its consumer, the result is silent memory corruption at run time, not a
+build error.
+
+This is a case where Bazel is straightforwardly *better* than the CMake it
+replaces, and it is worth stating plainly because most of this case study is the
+opposite direction. CMake compiles host tools and target libraries from one flat
+variable set: convenient, and it means a host/target skew is *unrepresentable* in
+the model and therefore invisible right up until someone cross-compiles. Bazel
+forces the two namespaces apart, which is what makes the duplication visible at
+all. Making the mirror explicit is the fix; the exec/target distinction is the
+feature.
+
+Two smaller results from the same work:
+
+- **`flapc` is a Rust crate, not a C++ program.** I had assumed C++ when I wrote
+  the task up; `Libraries/LibJS/Flap` is 51 `.rs` files with a crates.io
+  dependency, so building it needs `rules_rust` + crate universe — the deferred
+  Rust ring, not a new debt class. The right split was to separate the chain:
+  `generate_interpreter_layout` **is** a genuine Bazel `cc_binary` built and run
+  in-graph, while `flapc` is consumed as the reference cargo binary declared as a
+  genrule `tools` input. Either way `interpreter_x86_64.S` is now **Bazel's own
+  output**, byte-identical to CMake's, instead of a checked-in artifact compiled
+  out of CMake's tree.
+- **No generated *source* is shimmed out of `Build/full` any more.** The
+  `exports_files` entries for `TIFFTagHandler.cpp`, `Op.cpp`,
+  `HSTSPreloadData.cpp`, `interpreter_x86_64.S` and `WebGLCommandReplayer.cpp`
+  are gone, as is the `qt_autogen_headers` glob. Each removal was verified by
+  deleting the shim and confirming the build stayed green, not by assuming.
+
+### Finding 27: a second nondeterminism in the same function, found by the accounting
+
+The new bucket accounting immediately earned its keep by exposing a *second*
+hash-order bug in the very function I had already patched once (the `sorted()`
+fix filed as ladybird#10899). `dictionaries_in_dependency_order` iterates a
+**set** of dependency names, so two dictionaries that do not depend on each other
+— `AudioConfiguration` and `VideoConfiguration`, both reached from
+`MediaConfiguration` — are emitted in hash order, and `MediaCapabilities.h`
+varies with `PYTHONHASHSEED`. Reproduced directly: seeds 0/2/7 give one order,
+seeds 1/42 the other. It is clean on the seed CMake happened to use, so a single
+run could never have caught it, and it sat behind a green 1,402/1,402 for weeks.
+
+The general lesson: **a topological sort constrains dependency-before-dependent
+and nothing else.** Sibling order among independent nodes is unconstrained, so
+any topological sort over an unordered container is a latent nondeterminism, and
+one `sorted()` fix in a function does not make that function deterministic.
+Fixed in `examples/ladybird/patches/`, verified across seeds.
+
+Also worth recording, because it is the same class of bug as the finding-25
+filter: the harness's own new `bin/flapc` pattern was initially **unanchored**,
+so it matched the *cargo command that builds flapc* (which names `bin/flapc` as a
+copy destination), ran a full cargo build as if it were a generator, and reported
+`NO_OUTS`. A "which tool is this?" test has to match the tool being *invoked*
+(start of command, or after `&&`), not merely mentioned — and note it was the new
+per-command reporting that surfaced it, where the old count would have absorbed
+it silently.
+
+### Verification of this work (done in my own tree, not the subagent's)
+
+Independently re-verified rather than taken on report, in a checkout at a
+*different* Ladybird revision than the one the work was done against:
+
+- All four emitters reproduce their committed output byte-for-byte from my
+  `Build/full` — except one line, which is the interesting part: my regenerated
+  `LibWeb/BUILD.bazel` adds `-I/usr/include/libdrm` where the committed file has
+  none. So the emitters are faithful but their output is **host-dependent**
+  (libdrm's include path leaks into a generated `copts`), which is the same
+  host-escape debt as README gap 3 rather than an emitter bug — but it does mean
+  "the generated files are reproducible" holds only *per machine*.
+- All six newly generated files byte-identical to CMake's (`cmp`).
+- `bazel build` of all five binaries green (2,849 actions), and `--headless=text`
+  / `--headless=layout-tree` byte-identical to `Build/full/bin/Ladybird` on a page
+  exercising grid/flex/tables/entities/JS.
+- The harness: 586 `CUSTOM_COMMAND`s, 51 covered, 535 excluded, **0 unhandled**,
+  1,408/1,408 identical. And I checked the *teeth*, not just the green: deleting
+  the TIFF entry from `COVERED` makes it appear as `UNHANDLED` and exits 1 —
+  the exact failure that used to be silent.
+- One dead shim the subagent left behind (`exports_files` for
+  `WebGLCommandReplayer.cpp`, no longer referenced) removed after confirming by
+  removal that `//:Compositor` stays green.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -925,7 +1022,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical (but see finding 25 on that denominator); 25 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 27 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)

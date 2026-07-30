@@ -2,7 +2,7 @@
 
 The Bazel workspace overlay produced by the any2bazel parity loop for
 [Ladybird](https://ladybird.org) (CMake + vcpkg, C++23). The narrative — why
-each of these files looks the way it does, and the 21 findings the migration
+each of these files looks the way it does, and the 27 findings the migration
 produced — is in [`docs/CASE-ladybird-migration.md`](../../docs/CASE-ladybird-migration.md).
 This directory is the *artifact*: what you would drop into a Ladybird checkout.
 
@@ -35,7 +35,10 @@ for byte).
 | `Build/full/**/BUILD.bazel` | Shims over the *reference CMake build tree*: vcpkg `cc_import`s, prebuilt Rust archives, and the `flapc` binary (a cargo crate). **These are the Ring 2 debt.** No generated *source* is shimmed any more — Bazel produces all of it |
 
 The four generated files are reproducible: re-running each emitter against the
-same `Build/full` reproduces them byte for byte.
+same `Build/full` reproduces them byte for byte — **on the same machine**. They
+are not host-independent: a host include path can leak into a generated `copts`
+(regenerating `Libraries/LibWeb/BUILD.bazel` on a machine with libdrm headers
+adds `-I/usr/include/libdrm`), which is gap 3 below, not an emitter bug.
 
 ## Reproducing
 
