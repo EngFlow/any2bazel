@@ -47,6 +47,7 @@ Usage:
   emit_vcpkg_bazel.py --report    # what resolved, what did not, what is unexpanded
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,10 @@ ROOT = os.environ.get(
     "LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VCPKG = os.environ.get("VCPKG_ROOT", os.path.join(ROOT, "Build/vcpkg"))
 OVERLAY = os.path.join(ROOT, "Meta/CMake/vcpkg/overlay-ports")
+
+
+class VcpkgUnavailable(Exception):
+    """No usable vcpkg checkout, so the static portfile parse cannot run."""
 
 
 def git(*args):
@@ -129,11 +134,12 @@ def closure_ports():
         out = (out.stdout or "") + (out.stderr or "")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         detail = getattr(e, "stderr", "") or str(e)
-        sys.stderr.write("error: vcpkg depend-info failed: %s\n" % detail.strip())
-        sys.stderr.write("Refusing to fall back to the manifest's overrides "
-                         "alone: that silently UNDERCOUNTS the closure (39 of 81 "
-                         "distfiles), which is worse than failing.\n")
-        sys.exit(2)
+        # Raise rather than sys.exit: whether this is fatal is the CALLER's call.
+        # Without a capture it is fatal, because falling back to the manifest's
+        # overrides alone silently UNDERCOUNTS the closure (39 of 81 distfiles),
+        # which is worse than failing (finding 28). With a capture it is not fatal
+        # at all -- the static parse is only a cross-check there.
+        raise VcpkgUnavailable(detail.strip())
     ports = set()
     for line in out.splitlines():
         name, _, deps = line.partition(":")
@@ -313,31 +319,75 @@ def sri(sha512_hex):
     return "sha512-" + base64.b64encode(bytes.fromhex(sha512_hex)).decode()
 
 
-def bazel_name(filename):
-    return "vcpkg_" + re.sub(r'[^A-Za-z0-9_]', '_', filename)
+def bazel_name(filename, sha512_hex):
+    """A Bazel repo name that is unique per DISTFILE, not per filename.
+
+    Two distinct distfiles can share a basename (vcpkg's downloads/ is flat and
+    it disambiguates with a hash tag for exactly this reason), and a repo-name
+    collision in MODULE.bazel is a silent wrong-content bug: the second
+    http_file just loses. So the identity in the name is the hash."""
+    return "vcpkg_%s_%s" % (
+        re.sub(r'[^A-Za-z0-9_]', '_', filename), sha512_hex[:12])
+
+
+def canonical_filename(dst, sha512_hex):
+    """vcpkg's temp download path -> the filename the portfile actually asked for.
+
+    vcpkg mangles the name it hands x-script in TWO ways, and both have to be
+    undone here (finding 30). Neither is guesswork; both are in
+    scripts/cmake/vcpkg_download_distfile.cmake.
+
+      1. An in-flight download goes to "<final>.<pid>.part", renamed on success.
+
+      2. If a file already exists at "<final>" whose hash does NOT match the
+         expected SHA512, vcpkg does not overwrite it -- it splices the first 8
+         hex chars of the expected hash in before the extension and retries there
+         (`string(SUBSTRING "${arg_SHA512}" 0 8 hash)`, line 80). So one failed
+         earlier attempt that left a 0-byte file behind renames every subsequent
+         request for that distfile: "giflib-6.1.3.tar.gz" came through as
+         "giflib-6-fb1d6319.1.3.tar.gz". Note where the tag lands: CMake's
+         "extension" is everything from the FIRST dot, so it is spliced after
+         "giflib-6" -- mid-version, not before ".tar.gz".
+
+    Undoing (2) needs the hash, which is why this takes the sha512.
+    """
+    name = os.path.basename(dst)
+    name = re.sub(r'\.\d+\.part$', '', name)
+    return name.replace("-" + sha512_hex[:8].lower(), "", 1)
 
 
 def load_capture(path):
-    """Read a capture TSV (url, sha512, filename) -> the distfile map.
+    """Read a capture TSV (url, sha512, dst) -> {sha512: (url, filename, ...)}.
 
     This is the exact, authoritative path: every tuple came from vcpkg itself
     resolving a real download, so there are no unexpanded variables and no
     guessed URL shapes. `port` is unknown per row (the asset cache does not see
     it), which only affects the comment on the emitted rule.
+
+    Keyed by SHA512, deliberately. Keying by filename (the first version of this)
+    was wrong twice over: vcpkg's mangling (see canonical_filename) makes one
+    distfile arrive under two names, so a filename-keyed map emitted 83 rules for
+    79 distinct files -- 4 phantom http_files, each of which would fetch a URL and
+    then fail its own integrity check. And what this feeds is a sha->label index,
+    so the filename was never the identity in the first place.
     """
     out = {}
-    with open(path) as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
+    with open(path, "rb") as f:
+        for raw in f.read().split(b"\n"):
+            # A capture killed mid-write can leave a hole of NULs at the head of
+            # the file: it is append-only across restarts, and the O_APPEND
+            # offset survives a truncation the writes do not.
+            line = raw.lstrip(b"\x00").strip()
+            if not line:
+                continue
+            parts = line.decode("utf-8", "replace").split("\t")
             if len(parts) != 3:
                 continue
-            url, sha, name = parts
-            if len(sha) != 128:
+            url, sha, dst = parts
+            if not re.fullmatch(r'[0-9a-fA-F]{128}', sha):
                 continue
-            # vcpkg downloads to "<name>.<pid>.part" and renames on success, so
-            # strip that suffix; the stored name is what the index must key on.
-            name = re.sub(r'\.\d+\.part$', '', name)
-            out[name] = (url, sha.lower(), "captured", "capture")
+            sha = sha.lower()
+            out[sha] = (url, canonical_filename(dst, sha), "captured", "capture")
     return out
 
 
@@ -354,11 +404,58 @@ def collect():
             if "${" in name or "${" in url:
                 unexpanded.append((port, name, url))
                 continue
-            distfiles[name] = (url, sha, port, source)
+            # Keyed by sha512, same as the capture: one distfile, one key.
+            distfiles[sha.lower()] = (url, name, port, source)
         ext = git_externals_in_portfile(text)
         if ext:
             externals[port] = ext
     return distfiles, externals, unresolved, unexpanded
+
+
+def observed_git_archives(downloads_dir, distfiles):
+    """The archives in a completed run's downloads/ that the asset cache never saw.
+
+    vcpkg_from_git shells out to `git fetch` + `git archive`, which NO asset
+    source intercepts, so these are invisible to the capture by construction --
+    and equally invisible to the static parse, for the usual reason: skia reaches
+    them through its own `declare_external_from_git` wrapper (10 of them) and
+    angle's are behind `${URL}`/`${REF}`. Static parsing reported 2; the real
+    number is 4. So identify them the same way as everything else here: by
+    DIFFERENCE against what actually landed on disk, not by prediction.
+
+    Returns (archives, byproducts): archives are what a hermetic build must
+    pre-place at downloads/<PORT>-<REF>.tar.gz; byproducts are files vcpkg's
+    downloads/ accumulates that are not inputs at all (parsetab.py is PLY's
+    generated parse table, written by angle's build, not fetched).
+    """
+    have = set(distfiles)
+    archives, byproducts = [], []
+    for name in sorted(os.listdir(downloads_dir)):
+        path = os.path.join(downloads_dir, name)
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            continue
+        h = hashlib.sha512(open(path, "rb").read()).hexdigest()
+        if h in have:
+            continue
+        (archives if name.endswith(".tar.gz") else byproducts).append((name, h))
+    return archives, byproducts
+
+
+def emit_git_archives(archives):
+    sys.stdout.write(HEADER)
+    print('load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")')
+    print()
+    print("# %d git-sourced externals. vcpkg_from_git bypasses asset caching"
+          % len(archives))
+    print("# entirely, but DOES honour a pre-placed downloads/<PORT>-<REF>.tar.gz,")
+    print("# which is what these become. The SHA512 is of the `git archive` output,")
+    print("# so it is only stable because git archive is deterministic for a fixed")
+    print("# ref -- verified by two independent runs producing identical bytes.")
+    print()
+    print("VCPKG_GIT_ARCHIVES = {")
+    for name, sha in archives:
+        print("    %r: %r," % (name, sha))
+    print("}")
 
 
 HEADER = "# AUTO-GENERATED by Meta/emit_vcpkg_bazel.py — do not edit.\n"
@@ -374,10 +471,10 @@ def emit_distfiles(distfiles):
     print("# re-hashed here, so this is not a trust downgrade.")
     print()
     print("def vcpkg_distfiles():")
-    for name in sorted(distfiles):
-        url, sha, port, _src = distfiles[name]
+    for sha, (url, name, port, _src) in sorted(
+            distfiles.items(), key=lambda kv: (kv[1][1], kv[0])):
         print("    http_file(")
-        print("        name = %r," % bazel_name(name))
+        print("        name = %r," % bazel_name(name, sha))
         print("        urls = [%r]," % url)
         print("        downloaded_file_path = %r," % name)
         print("        integrity = %r,  # %s" % (sri(sha), port))
@@ -391,10 +488,10 @@ def emit_index(distfiles):
     print("# this map, so vcpkg never reaches the network (x-block-origin).")
     print()
     print("VCPKG_DISTFILE_INDEX = {")
-    for name in sorted(distfiles):
-        _url, sha, port, _src = distfiles[name]
+    for sha, (_url, name, port, _src) in sorted(
+            distfiles.items(), key=lambda kv: (kv[1][1], kv[0])):
         print("    %r: %r,  # %s" % (
-            sha, "@%s//file:%s" % (bazel_name(name), name), port))
+            sha, "@%s//file:%s" % (bazel_name(name, sha), name), port))
     print("}")
 
 
@@ -421,17 +518,77 @@ def report(distfiles, externals, unresolved, unexpanded):
 
 
 def main():
-    distfiles, externals, unresolved, unexpanded = collect()
+    # With --assets the capture is authoritative and the static parse is only a
+    # cross-check, so a missing vcpkg checkout must NOT be fatal: the whole point
+    # of committing the capture is that a consumer can regenerate the Bazel rules
+    # from the pin alone, with no vcpkg, no CMake and no network. Without --assets
+    # the static parse IS the output, and then failing loudly is right (finding
+    # 28: refusing to silently undercount the closure).
+    if "--assets" in sys.argv:
+        try:
+            distfiles, externals, unresolved, unexpanded = collect()
+        except VcpkgUnavailable as e:
+            sys.stderr.write(
+                "note: no local vcpkg checkout, so the static cross-check is "
+                "unavailable (%s).\n      The capture is authoritative; emitting "
+                "from it alone.\n" % e)
+            distfiles, externals, unresolved, unexpanded = {}, {}, [], []
+    else:
+        try:
+            distfiles, externals, unresolved, unexpanded = collect()
+        except VcpkgUnavailable as e:
+            sys.stderr.write("error: vcpkg depend-info failed: %s\n" % e)
+            sys.stderr.write(
+                "Refusing to fall back to the manifest's overrides alone: that "
+                "silently UNDERCOUNTS the closure (39 of 81 distfiles), which is "
+                "worse than failing. Pass --assets <capture.tsv> to emit from the "
+                "committed pin instead, which needs no vcpkg at all.\n")
+            return 2
     if "--assets" in sys.argv:
         cap = load_capture(sys.argv[sys.argv.index("--assets") + 1])
-        # The capture wins wherever it has an entry: it is what vcpkg actually
-        # asked for. Static results only fill in what a capture might miss.
-        merged = dict(distfiles)
-        merged.update(cap)
-        sys.stderr.write("capture: %d distfiles (static parse had %d; union %d)\n"
-                         % (len(cap), len(distfiles), len(merged)))
-        distfiles, unexpanded = merged, []
-    if "--distfiles" in sys.argv:
+        # The capture REPLACES the static parse rather than being unioned with it.
+        # Unioning looks safer and is not: a portfile is a program, so the static
+        # regex cannot see through the platform branches it is full of, and every
+        # static-only row here turned out to be a Windows-only fetch
+        # (libiconv/pthreads/dirent are behind `if(VCPKG_TARGET_IS_WINDOWS)`).
+        # Those are not distfiles this build needs; emitting them adds downloads
+        # that can break the build when an unrelated upstream URL rots, in
+        # exchange for nothing. Meanwhile the union covered none of the 5 files
+        # the capture genuinely misses -- the static parse misses those too. So
+        # the instrument wins outright, and the shortfall is REPORTED.
+        static_only = sorted(set(distfiles) - set(cap))
+        sys.stderr.write("capture: %d distfiles (static parse had %d)\n"
+                         % (len(cap), len(distfiles)))
+        if static_only:
+            sys.stderr.write(
+                "  dropping %d static-only entries vcpkg never asked for on this "
+                "platform:\n" % len(static_only))
+            for sha in static_only:
+                sys.stderr.write("    %-40s %s\n"
+                                 % (distfiles[sha][1], distfiles[sha][2]))
+        distfiles, unexpanded = cap, []
+    if "--git-archives" in sys.argv:
+        dl = sys.argv[sys.argv.index("--git-archives") + 1]
+        archives, byproducts = observed_git_archives(dl, distfiles)
+        # Cross-check the static parse against the observation, and say so when
+        # it fell short -- the point of finding 25: a green check has to be
+        # compared against something IT did not produce.
+        static = set()
+        for port, ext in externals.items():
+            for _url, ref in ext:
+                if "${" not in ref:
+                    static.add("%s-%s.tar.gz" % (port, ref))
+        observed = set(n for n, _h in archives)
+        sys.stderr.write("git archives: %d observed, static parse predicted %d\n"
+                         % (len(observed), len(static)))
+        for n in sorted(observed - static):
+            sys.stderr.write("    MISSED BY STATIC PARSE: %s\n" % n)
+        for n in sorted(static - observed):
+            sys.stderr.write("    predicted but never fetched: %s\n" % n)
+        for n, _h in byproducts:
+            sys.stderr.write("    byproduct, not an input: %s\n" % n)
+        emit_git_archives(archives)
+    elif "--distfiles" in sys.argv:
         emit_distfiles(distfiles)
     elif "--index" in sys.argv:
         emit_index(distfiles)

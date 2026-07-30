@@ -1074,6 +1074,92 @@ progress for 13 minutes, because retrying a 502 forever *is* activity. Liveness
 is not progress, and a poll that only asks "is it running?" cannot tell the
 difference — the thing to watch was the ports counter, not the process.
 
+## Finding 30: the capture completed, and 4 of its 79 rules were phantoms
+
+The capture from finding 28 finally ran to completion: **76 distfiles**, against a
+ground-truth download set of 81. Two cheap wins first, then the interesting part.
+
+`vcpkg install --only-downloads` exists. A capture wants the *fetches*, not the
+45-minute build, and without that flag the run takes ~50 minutes and each
+interruption costs everything (which is how the first two attempts died). With it
+the same 76 distfiles land in **1.9 minutes**. Fifty minutes of build were being
+paid for to observe a two-minute fetch — worth checking `--help` before building
+a resume protocol around a runtime you never had to accept.
+
+And the 5-file shortfall is not a shortfall. Diffed against ground truth it is
+exactly: **4 `vcpkg_from_git` archives**, which bypass asset caching entirely (the
+finding-23 note), and **`parsetab.py`** — PLY's generated parse table, *written by*
+angle's build into `downloads/`, never fetched at all. 76 + 4 + 1 = 81, with
+nothing unexplained. So `downloads/` is not a download directory; it is a
+download directory *plus a scratch dir*, and treating everything in it as an input
+would have pinned a build byproduct as a dependency.
+
+### The bug: one distfile, two names, two rules
+
+Emitting from the capture produced **83 `http_file` rules for 79 distinct files**.
+Four distfiles appeared twice, under names like `giflib-6.1.3.tar.gz` *and*
+`giflib-6-fb1d6319.1.3.tar.gz`. The duplicates are not harmless noise: each
+phantom rule fetches a real URL and then fails its own `integrity` check, so the
+generated `MODULE.bazel` is broken on a clean machine — and broken in the worst
+place, module resolution, before any of it can be debugged.
+
+The cause is a chain of three things, none of which I would have predicted:
+
+1. My recorder used `curl -o "$dst"`, which **creates the destination before it
+   knows the transfer will fail**. When finding 29's dead mirror 404'd, a 0-byte
+   file was left in `downloads/`.
+2. vcpkg's `vcpkg_download_distfile` never overwrites an existing file with the
+   wrong hash. It splices the expected SHA512's first 8 hex chars in before the
+   extension and retries *there* (`string(SUBSTRING "${arg_SHA512}" 0 8 hash)`).
+   So one dead mirror **renamed four unrelated distfiles** for the rest of the run.
+3. My reader keyed its map by **filename**, so the two names became two entries.
+
+Note where the tag lands: CMake's "extension" is everything from the *first* dot,
+so it goes after `giflib-6` — mid-version, not before `.tar.gz`. A plausible fix
+("strip the tag before the extension") would not have worked, and the naive
+`${name%.[0-9]*}` in my bash recorder silently truncated `giflib-6.1.3.tar.gz` to
+`giflib-6.1` when the name arrived *without* a `.part` suffix. Two bugs in one
+line of shell.
+
+Three corrections, each at the right layer:
+
+- **The recorder records `{dst}` raw.** It cannot correctly normalise the name —
+  undoing the hash-tag splice *requires the hash* — and a lossy record cannot be
+  repaired after the fact. Interpretation moved to
+  `emit_vcpkg_bazel.canonical_filename()`, where it is unit-tested against both
+  manglings (`tests/test_emit_vcpkg.py`, 10 tests). **Capture cheaply and dumbly;
+  interpret where you can test.**
+- **The capture leaves no partial file.** `rm -f "$dst"` on failure, so a fetch
+  failure cannot rename a later success.
+- **The distfile map is keyed by SHA512, not filename.** This is the real lesson:
+  the artifact it feeds is a `sha512 → label` index, so the hash was *always* the
+  identity and the filename was always incidental metadata. The bug is what
+  happens when a map is keyed by the field that reads most naturally to a human
+  rather than the one the system actually uses. The repo names now carry a hash
+  suffix too, for the same reason — `downloads/` is flat and vcpkg disambiguates
+  colliding basenames itself, and a duplicate repo name in `MODULE.bazel` is
+  *silent*: the second definition just loses.
+
+### And the static parse was still hiding one
+
+While checking the git archives I compared the emitter's *prediction* against the
+observed set: it reported **2**, the truth is **4**. `skia` reaches ten of its
+externals through its own `declare_external_from_git` wrapper, and angle's are
+behind `${URL}`/`${REF}` — invisible to a regex for precisely the finding-28
+reason. So these are now discovered the same way as everything else here: by
+**difference against what landed on disk**, with the static prediction printed
+next to the observation so a shortfall is loud. (`git archive` output is
+byte-identical across two independent runs and two vcpkg roots, so pinning its
+SHA512 is sound.)
+
+The union of "static parse" and "capture" is also gone. It looked like the safe
+choice and was not: every static-only row turned out to be a **Windows-only**
+fetch (`libiconv`, `pthreads`, `dirent`, each behind
+`if(VCPKG_TARGET_IS_WINDOWS)`), so unioning added three downloads this build never
+makes — three more URLs that can rot — while covering *none* of the five files the
+capture genuinely misses. When one source is an instrument and the other is a
+guess, "use both" is not conservative; it is just the guess with extra steps.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1139,7 +1225,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 29 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 30 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)
