@@ -2,7 +2,7 @@
 
 The Bazel workspace overlay produced by the any2bazel parity loop for
 [Ladybird](https://ladybird.org) (CMake + vcpkg, C++23). The narrative — why
-each of these files looks the way it does, and the 30 findings the migration
+each of these files looks the way it does, and the 32 findings the migration
 produced — is in [`docs/CASE-ladybird-migration.md`](../../docs/CASE-ladybird-migration.md).
 This directory is the *artifact*: what you would drop into a Ladybird checkout.
 
@@ -11,9 +11,11 @@ Compositor, RequestServer, ImageDecoder) are Bazel-built, all 51 code
 generators run under Bazel with output **byte-identical to CMake's**
 (1,408/1,408 files, checked by `Meta/bazel_parity_harness.py`, which accounts for
 every one of the build's 586 ninja `CUSTOM_COMMAND`s — 51 covered, 535 excluded
-with a stated reason, **0 unhandled**), and the result renders pages
+with a stated reason, **0 unhandled**), the result renders pages
 (`--headless=text` and `--headless=layout-tree` match the CMake reference byte
-for byte).
+for byte), and **the 77 vcpkg dependencies are fetched and built by Bazel with
+zero network access** — swapped in for the CMake-built tree and still rendering
+byte-identically (findings 30–32).
 
 **It is not yet a clean-machine build.** See [Known gaps](#known-gaps).
 
@@ -23,7 +25,11 @@ for byte).
 
 | Path | What it is |
 |------|-----------|
-| `MODULE.bazel` | bzlmod deps: `rules_cc`, `platforms`, `rules_qt` (fetched from upstream, see below) |
+| `MODULE.bazel` | bzlmod deps: `rules_cc`, `platforms`, `rules_shell`, `rules_qt` (fetched from upstream, see below), plus the 76 vcpkg distfile repos via a generated module extension |
+| `Meta/vcpkg_assets.tsv` | **The dependency pin.** 76 `(url, sha512, dst)` rows captured from vcpkg itself via its `x-script` asset hook. Everything below is generated from this, with no vcpkg, no CMake and no network |
+| `vcpkg_distfiles.bzl`, `vcpkg_index.bzl`, `vcpkg_extension.bzl`, `vcpkg_git_archives.bzl` | One `http_file` per distfile, the sha512→label index the asset script resolves through, the module extension that creates the repos, and the 4 `vcpkg_from_git` archives. **Generated** by `Meta/emit_vcpkg_bazel.py` |
+| `vcpkg.bzl`, `Meta/vcpkg_build.sh` | `vcpkg_tree`: builds the whole dep tree as an ordinary Bazel action with `x-block-origin`, so it reaches the network zero times. Deliberately not a `repository_rule` |
+| `Meta/vcpkg_capture_assets.sh` | Records the pin, by *being* vcpkg's asset cache. The one run allowed to fetch |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
@@ -56,11 +62,19 @@ cmake --preset default -B Build/full -DENABLE_GUI_TARGETS=ON && ninja -C Build/f
 # 2. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism (gap 7)
+# 2b. Build the vcpkg dependency tree — Bazel fetches all 76 distfiles and builds
+#     all 77 ports with zero network access. (The cc_import shims still read
+#     Build/full/vcpkg_installed, see gap 1; this proves the tree is Bazel's.)
+bazel build //:vcpkg_installed
 # 3. Regenerate the BUILD files from the reference build (optional — they are checked in).
 python3 Meta/emit_build_bazel.py > BUILD.bazel
 python3 Meta/emit_codegen_bazel.py Libraries/LibWeb > Libraries/LibWeb/codegen.bzl
 python3 Meta/emit_root_codegen_bazel.py > codegen_root.bzl
 python3 Meta/emit_libweb_bazel.py > Libraries/LibWeb/BUILD.bazel
+# The vcpkg rules regenerate from the committed capture alone — no vcpkg, no network.
+python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --distfiles > vcpkg_distfiles.bzl
+python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --index     > vcpkg_index.bzl
+python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --extension > vcpkg_extension.bzl
 # 4. Build, and check every generator against CMake.
 bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder //:Compositor
 python3 Meta/bazel_parity_harness.py     # expects 1408/1408 identical, 0 UNHANDLED
@@ -86,27 +100,38 @@ ln -sfn "$PWD/Build/full/share/Lagom" "$ER/bazel-out/k8-fastbuild/share"
 
 Honest inventory of what stops this from being a clone-and-build.
 
-1. **External deps are shims over the CMake build tree, not Bazel deps.**
-   The 44 external libraries the binaries link are `cc_import`ed out of
-   `Build/full/vcpkg_installed/` — vcpkg builds them from upstream source (47
-   pinned ports, 85 tarballs) and Bazel consumes the output. The Rust crates come
-   from a 260 MB prebuilt `librust_combined.a` (10 cargo archives pre-merged with
-   `ar`, because they have circular cross-crate symbol references a flat link
-   cannot order). Consequence: **you must run the CMake build first.**
+1. **External deps: Bazel now fetches AND builds them; the shims still read the
+   CMake tree.** `bazel build //:vcpkg_installed` fetches all 76 distfiles as
+   `http_file`s (hashes from a committed capture of what vcpkg actually
+   downloads) and builds all 77 ports with `x-block-origin` — **zero network
+   access**. Verified against CMake's reference tree, not merely built: identical
+   5,018-file listing, 4,740 byte-identical including *every* header/`.cmake`/`.pc`,
+   and all 179 differing binaries have byte-identical exported symbol tables (the
+   diffs are embedded build paths — traced to a 74-byte `.dynstr` delta, plus
+   `__FILE__` strings). Then verified by **removal**: reference tree moved out of
+   the build path, Bazel's put in its place, all 5 binaries relink and render
+   `--headless=text`/`--headless=layout-tree` byte-identically, with JS running.
+   Findings 30–32.
 
-   Ring 2's design is settled and validated on the **whole dependency tree**:
-   `http_file` per distfile with hashes lifted from the vcpkg portfiles, then
-   `vcpkg install` wrapped with `x-script` + `x-block-origin` so Bazel owns
-   fetching and vcpkg stays only the build recipe. Deliberately **not** the BCR —
-   re-sourcing the deps would change versions/patches/features and destroy the
-   parity baseline. Measured: builds with zero network access, and all 83 shared
-   libraries match the reference in content (30 byte-identical, 53 differing only
-   in `.dynstr` padding caused by `VCPKG_FIXUP_ELF_RPATH` and the buildtree path
-   length). Then verified by *removal*: with the reference tree moved aside and
-   the independently-built one swapped in, the browser still builds green and
-   renders `--headless=text`/`--headless=layout-tree` byte-identically to CMake.
-   See findings 23 and 24 in
-   [the case study](../../docs/CASE-ladybird-migration.md).
+   What is left is plumbing, and it is why you still need the CMake build: the 34
+   `cc_import` shims read files out of `Build/full/vcpkg_installed/`, and
+   `cc_import` takes a *file* while `vcpkg_tree` produces a declared *directory*.
+   Rewiring them needs per-file outputs or a different shim shape. The Rust crates
+   are still a 260 MB prebuilt `librust_combined.a` (10 cargo archives pre-merged
+   with `ar`, because they have circular cross-crate references a flat link cannot
+   order). Consequence: **you must still run the CMake build first.**
+
+   Wrapping vcpkg is explicitly a stepping stone, not the destination. It keeps
+   vcpkg as the *recipe* (it encodes the patches, configure flags and feature sets
+   Ladybird pins) while Bazel owns fetching, hashing and sandboxing — deliberately
+   not the BCR, which would change versions/patches/features and destroy the
+   parity baseline. But that baseline is weaker than it looks: finding 32 caught
+   the reference `libSDL3` missing a PulseAudio driver that Bazel's has, because
+   `libpulse-dev` was installed on this machine 29 minutes *after* the reference
+   built SDL3 — SDL's CMake sniffs the host, ungated by any vcpkg feature. So
+   byte-parity against a vcpkg tree is a function of the host's `-dev` packages,
+   and the real fix is building the deps with Bazel's own toolchain and declared
+   sysroot.
 
    The swap also exposed shim debt: the vcpkg `cc_library(name = "headers")`
    globs the whole 3,585-file include tree as one target that every compile

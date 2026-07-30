@@ -1160,6 +1160,79 @@ makes — three more URLs that can rot — while covering *none* of the five fil
 capture genuinely misses. When one source is an instrument and the other is a
 guess, "use both" is not conservative; it is just the guess with extra steps.
 
+## Finding 31: Bazel builds the dependency tree, and it is the same tree
+
+The end of Ring 2's main line. `bazel build //:vcpkg_installed` now builds all 77
+vcpkg ports from the 76 Bazel-fetched distfiles with `x-block-origin`, reaching
+the network **zero times**, and the result was checked against CMake's reference
+tree rather than admired:
+
+- **5,018 files, and the file lists are identical.** Not one path only in Bazel's
+  tree, not one only in the reference (the sole difference is the shim
+  `BUILD.bazel` I added to the reference myself).
+- **4,740 of 5,018 files are byte-identical**, including **every** header,
+  `.cmake` and `.pc` file — 0 differences in anything a compiler consumes as text.
+- Of the 278 that differ: **77 are `.spdx.json`** SBOMs, differing in a random
+  UUID and a timestamp, and **179 are binaries** whose *exported symbol tables are
+  byte-identical, all 179 of them*. The remaining 22 are `.list` manifests and
+  similar bookkeeping.
+- The binary differences are the embedded absolute build path, and I confirmed the
+  mechanism rather than assuming it: `libfontconfig`'s `.dynstr` is exactly 74
+  bytes larger, holding the one differing string (`bazel-out/...` vs
+  `Build/release/...`), which shifts every subsequent offset and accounts for all
+  471 differing `.text` bytes. `.rodata` is byte-identical there; in ffmpeg the
+  same cause appears in `.rodata` instead, as `__FILE__` strings from buildtrees.
+  Both trees produce 3 LOAD segments, so finding 24's `build-vcpkg-variables.cmake`
+  LDFLAGS input is correctly in play.
+
+Then the actual test, which is removal, not inspection (finding 24's rule): move
+the reference tree out of the build path entirely, put Bazel's output in its place,
+rebuild. All five binaries relink, `--headless=text` and `--headless=layout-tree`
+are **byte-identical** to the CMake reference, and JavaScript runs. The control
+that makes this mean anything: the swapped-in `libSDL3` carries 58 `PULSEAUDIO_*`
+symbols the reference build does not have, so "which tree is loaded" is decidable
+from the artifact rather than from my belief about it — and it is Bazel's.
+
+One structural gap remains before the shims can *point* at this target: `cc_import`
+takes a file, and `vcpkg_tree` produces a declared **directory**, so rewiring the
+34 `cc_import`s means either per-file outputs or a different shim shape. That is
+plumbing; the dependency tree itself is now Bazel's.
+
+## Finding 32: the byte-diff found a host leak that byte-parity would have hidden
+
+The 179-binary ABI check turned up one library where the *local* symbols differed
+in a way paths could not explain: Bazel's `libSDL3.so` has 89 extra local symbols,
+72 of them PulseAudio, and a `PULSEAUDIO_*` driver the reference build lacks
+entirely (`DISKAUDIO`, `DUMMYAUDIO` in the reference; those plus `PULSEAUDIO` in
+Bazel's). The exported ABI is identical — 1,272/1,272 — so nothing downstream
+notices, which is exactly what makes it worth writing down.
+
+The cause is not Bazel. `sdl3`'s portfile does not mention pulse at all; SDL's own
+CMake sniffs the host for `libpulse-dev` and silently compiles in a driver if it
+finds one. And the timestamps settle it: SDL3 was built at 15:56, `libpulse-dev`
+landed on this machine at 16:25, twenty-nine minutes later. **The reference tree
+and the Bazel tree were built from identical inputs on the same machine and are
+not the same tree, because the host changed underneath them.** Two things follow.
+
+First, this is a defect in the *reference*, not in Bazel's build — the CMake tree
+is the one that is stale, and no amount of comparing Bazel against it would have
+revealed that. It only showed up because the comparison was
+symbol-by-symbol against ground truth rather than "does it differ, y/n": a
+same-size, same-section binary with an identical export table looked like just
+another path diff.
+
+Second, it is a concrete instance of the argument for the on-mission direction.
+Byte-parity against a vcpkg-built tree is a *baseline*, not a *goal*: the baseline
+is itself a function of whatever `-dev` packages the host happened to have, so
+chasing it exactly would mean pinning the host, which is the thing the migration is
+trying to eliminate. libjpeg-turbo and libvpx show the harmless version of the same
+class (27 and 38 assembler `FILE` symbols each, balanced on both sides, pure
+paths). SDL3 shows the harmful version. Building the deps with Bazel's own
+toolchain and declared sysroot is what actually closes it; wrapping `vcpkg install`
+inherits the host sniffing along with the recipe. (Inert here — Ladybird uses SDL3
+for gamepad input, not audio — but "inert today" is a property of the consumer, not
+of the build.)
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1225,7 +1298,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 30 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 32 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)
