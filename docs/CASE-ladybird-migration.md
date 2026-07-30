@@ -957,6 +957,64 @@ Independently re-verified rather than taken on report, in a checkout at a
   `WebGLCommandReplayer.cpp`, no longer referenced) removed after confirming by
   removal that `//:Compositor` stays green.
 
+## Finding 28: portfiles are programs, so predict nothing — instrument vcpkg
+
+Ring 2 part 1 is Bazel owning the *fetch*: one `http_file` per upstream distfile,
+`integrity` lifted from vcpkg's own published SHA512. The obvious implementation
+is to parse `portfile.cmake`. I wrote that, and it plateaus at **54 of 81
+distfiles** — not because of missing regex cases, but because portfiles are CMake
+**programs**, not manifests. `curl` derives `${curl_version}` from the version;
+`angle` carries its own `${ANGLE_COMMIT}`; `libpsl` computes a `${short_hash}`;
+`vcpkg-tool-gn` assembles `${download_urls}` per platform. Resolving those needs
+a CMake interpreter — which is to say, it needs to *be* vcpkg.
+
+So the authoritative input is a **capture**, not a parse. `x-asset-sources`'s
+`x-script` hook hands a script the fully-expanded `{url} {sha512} {dst}` for every
+single download — exactly the tuple an `http_file` needs. `Meta/vcpkg_capture_assets.sh`
+records them by acting as vcpkg's asset cache. This is the same
+instrument-don't-predict tactic as the npm extractor (`scripts/npm_instrument`),
+for the same underlying reason: **a build script's inputs are only knowable by
+running it.** Validated against the known-good download set: 29/29 captured
+hashes are a strict subset of ground truth, with zero filename mismatches once the
+`.<pid>.part` suffix vcpkg downloads through is stripped. The capture run is the
+one run allowed to touch the network; its output *is* the pin, and every later
+build is hermetic against it.
+
+That is the design lesson. The process lesson is sharper, and it is the same one
+as finding 25 wearing different clothes.
+
+### Four bugs, all of them absences
+
+Each was found by diffing my emitter's output against **what vcpkg actually
+downloaded**, never by reading my own output — which looked plausible at every
+intermediate stage.
+
+1. **Emitting the manifest's 45 `overrides` covered 39 of 81 distfiles.** vcpkg
+   downloads for the whole transitive **closure** (77 ports): zstd, libtiff,
+   openh264, opus, theora, ogg, vorbis, libvpx, libyuv, lcms, ngtcp2/nghttp3,
+   xz, libidn2, libunistring, icu, plus vcpkg's own provisioned tooling (cmake,
+   ninja, meson, gn, patchelf, pkgconf, gperf, automake). Versions now come from
+   the closure via `vcpkg depend-info` — vcpkg's own resolver, deliberately not a
+   reimplementation — with `baseline.json` supplying transitive versions.
+2. **vcpkg has four version keys, and I read two.** Date-versioned ports use
+   `version-date`; reading only `version`/`version-semver` resolved **nothing**
+   for `egl-registry`, `opengl-registry`, `libedit` and all eight `vcpkg-*`
+   tooling ports.
+3. **URLs and filenames interpolate `${VERSION}`.** Taken literally they produce
+   filenames containing the characters `${VERSION}`, matching no real download.
+4. **`vcpkg_from_gitlab` and `vcpkg_from_sourceforge` were unhandled entirely** —
+   4 and 3 uses respectively (counted, not assumed).
+
+Not one of these produced a *wrong value*. Every single one produced an
+**absence**: an unresolved port simply vanishes from the output, and the emitter
+still prints a confident list. "39 distfiles" reads exactly as well as "81" if you
+never compare against the truth. So the emitter now reports unresolved ports and
+unexpanded variables as explicit non-zero counts, exits non-zero on either, and
+**refuses** to fall back to overrides-only when `depend-info` fails rather than
+silently undercounting. A generator that only reports what it found cannot report
+what it missed — which is why the third thing I build after an emitter and its
+verifier is a comparison against ground truth that neither of them produced.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1022,7 +1080,7 @@ binary fail while the Bazel one renders.
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 27 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 28 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)
