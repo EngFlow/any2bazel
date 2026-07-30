@@ -11,3 +11,11 @@ filegroup(
         "Utils/**/*.py",
     ]),
 )
+
+# The vcpkg_tree action's driver (see //:vcpkg.bzl). It resolves every download
+# by SHA512 out of a Bazel-written index and runs vcpkg with x-block-origin, so
+# the dependency build reaches the network zero times.
+sh_binary(
+    name = "vcpkg_build",
+    srcs = ["vcpkg_build.sh"],
+)
