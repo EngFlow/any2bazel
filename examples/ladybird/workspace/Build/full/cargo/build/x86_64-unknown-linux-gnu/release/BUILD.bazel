@@ -22,3 +22,13 @@ RUST_CRATES = [
     alias(name = c, actual = ":rust_combined")
     for c in RUST_CRATES
 ]
+
+# flapc: the Flap-DSL -> interpreter-assembly compiler, a Rust binary this
+# project builds itself (Libraries/LibJS/Flap). Bazel now RUNS it as a declared
+# genrule tool (see gen_interpreter_asm in codegen_root.bzl) so the generated
+# interpreter_x86_64.S is Bazel's own output instead of a file copied out of
+# CMake's build tree. Building flapc from source needs rules_rust + a crate
+# universe for its crates.io dep, which is the same Rust ring the archives above
+# are waiting on -- so for now the binary itself comes from the reference cargo
+# build, exactly like those archives.
+exports_files(["flapc"])

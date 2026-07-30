@@ -27,6 +27,18 @@ GLOBAL_DEFINES = {
 }
 # System libs with no vcpkg .so (linked via linkopts on the final binary).
 SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan", "pulse"}
+# Qt6 CMake target -> rules_qt label.
+QT_MAP = {
+    "Qt6Core": "@qt//:QtCore",
+    "Qt6Gui": "@qt//:QtGui",
+    "Qt6Widgets": "@qt//:QtWidgets",
+}
+
+# CMake's AUTOMOC/AUTORCC output, prebuilt under Build/full/<target>_autogen.
+# Bazel runs moc/rcc itself (qt_cc_moc / qt_cc_rcc), so these are dropped from
+# srcs and the autogen include roots from copts.
+AUTOGEN_MARKER = "_autogen/"
+
 # Libs that export extern "C" FFI consumed by the prebuilt Rust archive and
 # also consume it back (a static-archive <-> static-archive cycle GNU ld can't
 # resolve in one pass). Whole-archive them so every FFI symbol is present
@@ -77,7 +89,7 @@ def target_srcs(t):
     for a in t["actions"]:
         if a["mnemonic"] != "CppCompile": continue
         srcs += [i for i in a["inputs"] if i.endswith((".cpp", ".c", ".cc", ".S"))]
-    return sorted(set(srcs))
+    return sorted(s for s in set(srcs) if AUTOGEN_MARKER not in s)
 
 def target_defines(t, name):
     defs = set()
@@ -108,7 +120,9 @@ def target_private_includes(t):
                 if p in globalroots:
                     pass
                 elif p.startswith(ROOT):
-                    incs.append(os.path.relpath(p, ROOT))
+                    rel = os.path.relpath(p, ROOT)
+                    if AUTOGEN_MARKER not in rel + "/":
+                        incs.append(rel)
                 elif p.startswith("/"):
                     incs.append(p)  # system include (e.g. /usr/include/libdrm)
                 i += 1
@@ -148,16 +162,44 @@ def dep_label(d, targets, so, ar):
     # Qt6 + GL: system .so under /usr/lib; CMake finds them via find_package.
     # Map the CMake target name to the -l library name; the /usr/lib search
     # path is a global -L in .bazelrc.
-    SYS_MAP = {"Qt6Core": "Qt6Core", "Qt6Gui": "Qt6Gui", "Qt6Widgets": "Qt6Widgets",
-               "GLX": "GLX", "OpenGL": "OpenGL"}
+    # Qt6 is a real Bazel dep via rules_qt: its qt.local_repo discovers the host
+    # SDK through qmake, so moc/rcc and the Qt cc_librarys all come from one SDK.
+    if nm in QT_MAP:
+        return QT_MAP[nm]
+    SYS_MAP = {"GLX": "GLX", "OpenGL": "OpenGL"}
     if nm in SYS_MAP:
         return ("SYS", SYS_MAP[nm])
     return ("UNKNOWN", nm)
 
+# Generated sources that BAZEL now produces itself (a genrule output in the root
+# package, listed in codegen_root.bzl). A model src under Build/full naming one
+# of these must become the root-package label ':<path>' -- i.e. the genrule's
+# output -- NOT a Build/full shim. Sourced from the codegen emitter so the two
+# cannot drift: whatever it generates is what we consume.
+def bazel_generated_root_srcs():
+    sys.path.insert(0, os.path.join(ROOT, "Meta"))
+    import emit_root_codegen_bazel as codegen
+    outs = set()
+    for py, cd, declared, produced in codegen.parse():
+        _name, d = codegen.convert(py, cd, declared, produced)
+        outs.update(d["outs"])
+    _layout, flap = codegen.parse_flap()
+    if flap:
+        outs.add(flap["out"])
+    for sh in codegen.parse_glslang():
+        outs.add(sh["out"])
+    return outs
+
+GENERATED_BY_BAZEL = bazel_generated_root_srcs()
+
 def _emit_srcs(srcs):
     print("    srcs = [")
     for s in srcs:
-        if s.startswith("Build/full/Libraries/LibWeb/"):
+        rel = s[len("Build/full/"):] if s.startswith("Build/full/") else None
+        if rel is not None and rel in GENERATED_BY_BAZEL:
+            # Bazel generates this file; consume its genrule output.
+            print(f"        {':' + rel!r},")
+        elif s.startswith("Build/full/Libraries/LibWeb/"):
             lab = "//Libraries/LibWeb:" + s[len("Build/full/Libraries/LibWeb/"):]
             print(f"        {lab!r},")
         elif s.startswith("Build/full/Libraries/"):
@@ -174,17 +216,167 @@ def _emit_srcs(srcs):
     print("    ],")
 
 
-def main():
-    targets = load()
-    so, ar = vcpkg_available()
-    libs = {n: t for n, t in targets.items() if t.get("role") == "production" and is_lib(t)}
-    exes = {n: t for n, t in targets.items()
-            if t.get("role") == "production" and t.get("kind") == "executable"}
-    only = sys.argv[1:] if len(sys.argv) > 1 else sorted(libs)
-    for name in only:
+# The root package's target set, in emission order. AK and the Qt autogen rules
+# are emitted by hand-written blocks (below) because they are not one-to-one with
+# a CMake target: AK needs the configure-generated Build/full/AK headers copied
+# into an include root, and Qt's moc/rcc come from rules_qt instead of CMake's
+# prebuilt ladybird_autogen. Everything else is emitted straight from the model.
+#
+# LibWeb lives in its own package (//Libraries/LibWeb, emit_libweb_bazel.py) and
+# the Lib*Test*/JavaScriptTestRunnerMain targets are test scaffolding, so neither
+# appears here.
+ROOT_TARGETS = [
+    "LibCompress", "LibCore", "LibCrypto", "LibDNS", "LibDatabase", "LibDiff",
+    "LibFileSystem", "LibGC", "LibGfx", "LibHTTP", "LibIPC",
+    "LibImageDecoderClient", "LibImageDecoders", "LibJS", "LibMain", "LibMedia",
+    "LibRegex", "LibRequests", "LibSandbox", "LibSync", "LibSyntax", "LibTLS",
+    "LibTextCodec", "LibThreading", "LibURL", "LibUnicode", "LibWakeLock",
+    "LibWasm", "LibWebSocket", "LibXML", "LibDevTools", "LibWebView",
+    "webcontentservice", "requestserverservice", "imagedecoderservice",
+    "compositorservice", "webworkerservice", "ImageDecoder", "RequestServer",
+    "Compositor", "WebWorker", "WebContent",
+    # Host tool: emits the struct offsets flapc consumes (see codegen_root.bzl).
+    # Bazel builds it in the same graph and runs it as a genrule tool -- the case
+    # Bazel does natively and CMake has to bolt on.
+    "generate_interpreter_layout",
+]
+# Emitted after the Qt autogen rules, since it consumes them.
+QT_TARGETS = ["ladybird"]
+
+
+ALL_LOADS = '''load("@rules_qt//qt:defs.bzl", "qt_cc_moc", "qt_cc_rcc", "qt_qrc")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load(":codegen_root.bzl", "root_codegen")
+
+package(default_visibility = ["//visibility:public"])
+
+# %d generator genrules for this package: the IPC endpoints, LibJS Bytecode/Op,
+# LibHTTP's HSTS table, the Compositor WebGL replayer, the TIFF tag tables, the
+# two SPIR-V shader headers and the Flap interpreter assembly. Bazel now
+# GENERATES all of them instead of consuming CMake's prebuilt copies from
+# Build/full.
+root_codegen()
+
+'''
+
+ALL_SOURCE_HEADERS = '''# Mirror CMake's global -ILibraries -IServices -I. : every TU can include any
+# in-tree header (<LibGfx/Palette.h>) whether or not there's a dep edge. CMake
+# compiles with the whole source tree present; Bazel sandboxes to declared
+# inputs, so we expose all source headers as one hdrs library that every
+# cc_library depends on. (Generated headers arrive via their own genrule/import
+# targets; this is source-tree headers only.)
+cc_library(
+    name = "all_source_headers",
+    hdrs = glob([
+        "AK/**/*.h",
+        "Libraries/**/*.h",
+        "Services/**/*.h",
+        "UI/**/*.h",
+    ], allow_empty = True),
+    deps = [
+        # Bazel-generated headers (the genrules above) come FIRST so they win
+        # over the CMake copies; the Build/full roots below now only supply what
+        # Bazel does not yet generate (Rust FFI headers, CMake's
+        # generate_export_header Export.h).
+        ":generated_libraries_headers",
+        ":generated_services_headers",
+        ":generated_shader_headers",
+        "//Build/full/Libraries:generated_lib_headers",
+        "//Build/full/Services:generated_service_headers",
+    ],
+)
+
+VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+'''
+
+AK_BLOCK_HEAD = '''
+# Configure-generated headers live in Build/full/AK; expose as AK/*.h via a copy.
+genrule(
+    name = "ak_gen_headers",
+    srcs = ["Build/full/AK/Debug.h", "Build/full/AK/Backtrace.h"],
+    outs = ["genroot/AK/Debug.h", "genroot/AK/Backtrace.h"],
+    cmd = "mkdir -p $(RULEDIR)/genroot/AK && " +
+          "cp $(location Build/full/AK/Debug.h) $(RULEDIR)/genroot/AK/Debug.h && " +
+          "cp $(location Build/full/AK/Backtrace.h) $(RULEDIR)/genroot/AK/Backtrace.h",
+)
+
+cc_library(
+    name = "AK",
+'''
+
+AK_BLOCK_TAIL = '''    hdrs = glob(["AK/*.h"]) + [":ak_gen_headers"],
+    # AK-private defines (CMake PRIVATE) — local_defines so they don't leak to
+    # consumers. FMT_SHARED/AK_HAS_CPPTRACE only affect AK's own TUs.
+    local_defines = [
+        "AK_EXPORTS",
+        "AK_HAS_CPPTRACE=1",
+        "FMT_SHARED",
+    ],
+    includes = ["genroot"],
+    deps = [
+        VCPKG + ":fmt",
+        VCPKG + ":simdutf",
+        VCPKG + ":mimalloc",
+        VCPKG + ":cpptrace",
+    ],
+)
+'''
+
+
+def emit_qt_autogen(moc_hdrs):
+    print()
+    print("# === Qt6 autogen via rules_qt ===")
+    print("# qt_cc_moc runs moc over the Q_OBJECT headers; it takes the Qt include dirs")
+    print("# from the toolchain's own CcInfo and stages the full header set, so no -I flags")
+    print("# or header filegroups are hand-maintained here. qt_cc_rcc compiles the .qrc.")
+    print("qt_cc_moc(")
+    print('    name = "qt_moc",')
+    print("    hdrs = [%s]," % ", ".join('"%s"' % h for h in moc_hdrs))
+    print(")")
+    print()
+    print("qt_qrc(")
+    print('    name = "qt_qrc",')
+    print('    srcs = ["UI/Qt/ladybird.qrc"],')
+    print('    data = ["UI/Icons/ladybird.png"],')
+    print(")")
+    print()
+    print("qt_cc_rcc(")
+    print('    name = "qt_rcc",')
+    print('    srcs = [":qt_qrc"],')
+    print(")")
+    print()
+
+
+def moc_headers():
+    """UI/Qt headers with Q_OBJECT, i.e. the ones CMake's AUTOMOC would moc.
+
+    GeolocationProviderQt.h is excluded: it is only compiled when Qt6::Positioning
+    is found, which this configuration does not have (the model shows no
+    GeolocationProviderQt.cpp compile), so mocking it would be a target Bazel
+    builds and CMake does not.
+    """
+    qt_dir = os.path.join(ROOT, "UI/Qt")
+    hdrs = []
+    for f in sorted(os.listdir(qt_dir)):
+        if not f.endswith(".h"):
+            continue
+        if "Q_OBJECT" not in open(os.path.join(qt_dir, f), errors="ignore").read():
+            continue
+        hdrs.append("UI/Qt/" + f)
+    return [h for h in hdrs if not h.endswith("GeolocationProviderQt.h")]
+
+
+def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
+                extra_srcs=()):
+    """Emit one cc_library/cc_binary from the model.
+
+    body_only: emit only `name =` + `srcs =` (AK's hand-written block supplies
+    its hdrs/defines/deps, because its include root is a genrule).
+    """
+    if True:
         is_exe = name in exes
         if name not in libs and not is_exe:
-            print(f"# {name}: not a production lib/exe", file=sys.stderr); continue
+            print(f"# {name}: not a production lib/exe", file=sys.stderr); return
         t = exes[name] if is_exe else libs[name]
         srcs = target_srcs(t)
         embeds = target_embed_inputs(t)
@@ -208,12 +400,16 @@ def main():
             else:
                 deps.append(lab)
         rule = "cc_binary" if is_exe else "cc_library"
-        print(f"# === {name} ({t['kind']}, {len(srcs)} TU) ===")
+        if header:
+            print(f"# === {name} ({t['kind']}, {len(srcs)} TU) ===")
         if rustdeps: print(f"#   RUST deps (deferred): {rustdeps}")
         if unknown: print(f"#   UNKNOWN deps: {unknown}")
-        print(f"{rule}(")
-        print(f"    name = {name!r},")
-        _emit_srcs(srcs)
+        if not body_only:
+            print(f"{rule}(")
+            print(f"    name = {name!r},")
+        _emit_srcs(list(extra_srcs) + srcs)
+        if body_only:
+            return
         if not is_exe:
             print(f'    hdrs = glob(["{lib_hdr_glob(name, srcs)}/**/*.h"], allow_empty = True),')
             if name in ALWAYSLINK_LIBS:
@@ -250,10 +446,45 @@ def main():
         print(")")
         print()
 
+
+def main():
+    targets = load()
+    so, ar = vcpkg_available()
+    libs = {n: t for n, t in targets.items() if t.get("role") == "production" and is_lib(t)}
+    exes = {n: t for n, t in targets.items()
+            if t.get("role") == "production" and t.get("kind") == "executable"}
+    if len(sys.argv) > 1:
+        # Explicit target list: emit just those bodies (for inspection/diffing).
+        for name in sys.argv[1:]:
+            emit_target(name, targets, libs, exes, so, ar)
+        return
+
+    sys.path.insert(0, os.path.join(ROOT, "Meta"))
+    import emit_root_codegen_bazel as codegen
+    n_codegen = (len(codegen.parse()) + len(codegen.parse_glslang())
+                 + (2 if all(codegen.parse_flap()) else 0))
+
+    print(ALL_LOADS % n_codegen, end="")
+    print(ALL_SOURCE_HEADERS)
+    print(AK_BLOCK_HEAD, end="")
+    emit_target("AK", targets, libs, exes, so, ar, header=False, body_only=True)
+    print(AK_BLOCK_TAIL, end="")
+    for name in ROOT_TARGETS:
+        emit_target(name, targets, libs, exes, so, ar)
+    emit_qt_autogen(moc_headers())
+    for name in QT_TARGETS:
+        emit_target(name, targets, libs, exes, so, ar,
+                    extra_srcs=[":qt_moc", ":qt_rcc"])
+
+
 def lib_hdr_glob(name, srcs):
-    # infer the source dir from the first src (Libraries/LibX or Services/X)
-    if srcs:
-        return os.path.dirname(srcs[0]).split("/")[0] + "/" + srcs[0].split("/")[1]
+    # Infer the source dir from the first IN-TREE src (Libraries/LibX,
+    # Services/X). Generated srcs live under Build/full and must not be used:
+    # they would make the glob "Build/full/**/*.h", i.e. every CMake-generated
+    # header, undeclared-input hole and all.
+    for s in srcs:
+        if not s.startswith("Build/"):
+            return s.split("/")[0] + "/" + s.split("/")[1]
     return name
 
 if __name__ == "__main__":

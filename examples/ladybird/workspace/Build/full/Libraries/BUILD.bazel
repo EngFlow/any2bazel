@@ -19,4 +19,10 @@ cc_library(
     includes = ["."],
 )
 
-exports_files(['LibGfx/ImageFormats/TIFFTagHandler.cpp', 'LibHTTP/HSTSPreloadData.cpp', 'LibJS/Bytecode/Op.cpp', 'LibJS/Interpreter/interpreter_x86_64.S'])
+# NOTE: no exports_files here any more. TIFFTagHandler.cpp, HSTSPreloadData.cpp,
+# Op.cpp and interpreter_x86_64.S used to be exported from CMake's build tree and
+# COMPILED straight into Bazel's libraries -- so the migration silently depended
+# on CMake having produced those .cpp/.S files. Bazel now generates all four
+# itself (codegen_root.bzl: gen_TIFFMetadata, gen_HSTSPreloadData, gen_Op,
+# gen_interpreter_asm) and the consumers reference the genrule outputs. Verified
+# by removal: deleting these entries keeps the build green.

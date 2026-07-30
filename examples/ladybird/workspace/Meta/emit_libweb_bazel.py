@@ -9,7 +9,9 @@ Libraries (source root) and bazel-bin/Libraries (genfiles root) on the search
 path. The 688/692 generated src/hdr lists live in generated_srcs.bzl.
 
 Mirrors Meta/emit_build_bazel.py for defines/flags/deps; paths rebased to the
-package. Emits the cc_library block on stdout for splicing into BUILD.bazel.
+package. Emits the COMPLETE Libraries/LibWeb/BUILD.bazel on stdout -- loads,
+package(), the codegen macro calls and the cc_library -- so the checked-in file
+is reproducible rather than a hand-spliced copy of this block.
 """
 import json, os, re
 
@@ -26,6 +28,23 @@ GLOBAL_DEFINES = {
     "NDEBUG",
 }
 SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan"}
+
+# LibWeb exports extern "C" FFI that the prebuilt Rust archive consumes and also
+# consumes it back (a static-archive <-> static-archive cycle GNU ld cannot
+# resolve in one pass); whole-archive it so every FFI symbol is present before
+# the rust archive references it. Same reason as //:LibUnicode in
+# emit_build_bazel.py's ALWAYSLINK_LIBS.
+ALWAYSLINK = True
+
+PRELUDE = '''load("@rules_cc//cc:defs.bzl", "cc_library")
+load(":codegen.bzl", "libweb_codegen", "libweb_bindings_codegen")
+load(":generated_srcs.bzl", "LIBWEB_GENERATED_SRCS", "LIBWEB_GENERATED_HDRS")
+
+package(default_visibility = ["//visibility:public"])
+
+libweb_codegen()
+libweb_bindings_codegen()
+'''
 
 
 def global_flags():
@@ -181,7 +200,7 @@ def main():
             copt_toks.append("-I" + i)
 
     deps.append("//:all_source_headers")
-    out = []
+    out = [PRELUDE]
     out.append(f"# === LibWeb ({t['kind']}, {len(all_srcs)} TU: "
                f"{len(checked_in)} checked-in + {len(all_srcs)-len(checked_in)} generated) ===")
     if unknown:
@@ -194,8 +213,15 @@ def main():
     for s in sorted(checked_in):
         out.append(f"        {s!r},")
     out.append("    ] + LIBWEB_GENERATED_SRCS,")
-    out.append('    hdrs = glob(["**/*.h"], allow_empty = True) + LIBWEB_GENERATED_HDRS,')
+    # exclude= keeps a generated header that ALSO exists in the source tree
+    # (a stale CMake copy, or one checked in) from being globbed as a source
+    # hdr: the genrule output must win, or a consumer can compile against a
+    # different header than the one Bazel generated.
+    out.append('    hdrs = glob(["**/*.h"], exclude = LIBWEB_GENERATED_HDRS, '
+               'allow_empty = True) + LIBWEB_GENERATED_HDRS,')
     out.append('    includes = [".."],')
+    if ALWAYSLINK:
+        out.append("    alwayslink = True,")
     if defs:
         out.append("    local_defines = %r," % defs)
     if copt_toks:
