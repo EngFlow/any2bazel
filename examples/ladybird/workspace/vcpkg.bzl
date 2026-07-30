@@ -61,6 +61,13 @@ def _vcpkg_tree_impl(ctx):
             "requires-network": "0",
         },
         use_default_shell_env = True,
+        # An opt-in, ABI-hash-keyed resume cache. Off by default: a run that
+        # restores prebuilt archives proves nothing about building from source.
+        # It is passed as an explicit env entry rather than inherited, so that
+        # whether the cache is in play is visible in the action -- an interrupted
+        # 45-minute build needs to be resumable (a sandbox restart killed this at
+        # 57/76 ports, twice), but not invisibly so.
+        env = {"VCPKG_BAZEL_CACHE": ctx.attr.cache_dir} if ctx.attr.cache_dir else {},
     )
     return [DefaultInfo(files = depset([out]))]
 
@@ -91,6 +98,16 @@ vcpkg_tree = rule(
             doc = "Directory to produce, the vcpkg_installed/ equivalent.",
         ),
         "triplet": attr.string(default = "x64-linux-dynamic"),
+        "cache_dir": attr.string(
+            doc = """Optional absolute path for vcpkg's ABI-hash-keyed binary cache.
+
+            Set it and an interrupted build resumes from the ports it already
+            finished; leave it empty for the genuine from-source build. Safe to
+            keep across interruptions for the same reason downloads/ is: the key
+            is a digest of each port's source, features, triplet, toolchain and
+            its dependencies' hashes, so it is content-addressed. The install tree
+            and buildtrees are NOT, and are still discarded on every run.""",
+        ),
         "_build": attr.label(
             default = "//Meta:vcpkg_build",
             executable = True,

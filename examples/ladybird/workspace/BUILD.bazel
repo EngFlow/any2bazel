@@ -1844,6 +1844,10 @@ vcpkg_tree(
     source_dir = ".",
     source_root = ":vcpkg_source_inputs",
     triplet = "x64-linux-dynamic",
+    # Resume cache: makes a killed 45-minute build cheap to restart. Absolute by
+    # necessity (the action's cwd is the execroot) and therefore a host escape --
+    # it is a build-speed affordance, not part of the dependency graph.
+    cache_dir = "/home/ubuntu/.cache/vcpkg-bazel",
     vcpkg_root = "Build/vcpkg",
     vcpkg_tree = "//Build/vcpkg:tree",
 )
