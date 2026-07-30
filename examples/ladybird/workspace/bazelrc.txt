@@ -66,3 +66,54 @@ build --linkopt=-L/usr/lib/x86_64-linux-gnu
 # System includes for find_package deps that are still host-provided (libdrm).
 # Qt6 no longer appears here: it comes from rules_qt as a real Bazel dep.
 build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm
+
+# --- exec (host) configuration ---------------------------------------------
+# Every flag above is a --cxxopt/--copt/--linkopt, which Bazel applies only to
+# the TARGET configuration. //:generate_interpreter_layout is run as a genrule
+# tool, so Bazel builds it (and the AK it links) in the EXEC configuration,
+# a separate flag namespace that would otherwise get none of the above -- not
+# even -I. , so <AK/kmalloc.h> would not resolve.
+#
+# Mirroring is a CORRECTNESS requirement here, not a convenience: that tool
+# prints struct offsets/sizes that flapc bakes into the interpreter assembly,
+# so it must see the same headers with the same defines (NDEBUG, _FORTIFY_SOURCE,
+# USE_VULKAN, ...) and the same ABI flags as the code that will use those
+# offsets. A host/target flag skew here is silent memory corruption at run time,
+# which is exactly what CMake's single flat flag namespace hides: there, "host
+# tool" and "target library" are compiled by the same variables by default.
+# The exec config defaults to --host_compilation_mode=opt, whose opt feature
+# adds -D_FORTIFY_SOURCE=1; our -D_FORTIFY_SOURCE=3 then collides (redefined,
+# and -Werror). Put the exec config in the same compilation mode as the target
+# build so the two flag namespaces really do agree.
+build --host_compilation_mode=fastbuild
+
+build --host_cxxopt=-Wcast-qual --host_cxxopt=-Wformat=2 --host_cxxopt=-Wimplicit-fallthrough
+build --host_cxxopt=-Wlogical-op --host_cxxopt=-Wmissing-declarations
+build --host_cxxopt=-Wmissing-field-initializers --host_cxxopt=-Wsuggest-override
+build --host_cxxopt=-Wno-expansion-to-defined --host_cxxopt=-Wno-invalid-offsetof
+build --host_cxxopt=-Wno-maybe-uninitialized --host_cxxopt=-Wno-shorten-64-to-32
+build --host_cxxopt=-Wno-unknown-warning-option --host_cxxopt=-Wno-unused-command-line-argument
+build --host_cxxopt=-Wno-user-defined-literals --host_cxxopt=-Werror --host_cxxopt=-Wall --host_cxxopt=-Wextra
+build --host_cxxopt=-fno-exceptions --host_cxxopt=-ffp-contract=off --host_cxxopt=-fstrict-flex-arrays=2
+build --host_cxxopt=-fstack-protector-strong --host_cxxopt=-fsigned-char
+build --host_cxxopt=-ftrivial-auto-var-init=zero --host_cxxopt=-fno-semantic-interposition
+build --host_cxxopt=-fvisibility-inlines-hidden --host_cxxopt=-Wno-literal-suffix
+build --host_cxxopt=-Wno-unqualified-std-cast-call --host_cxxopt=-Wvla --host_cxxopt=-Wno-array-bounds
+build --host_cxxopt=-Wno-stringop-overflow --host_cxxopt=-Wno-dangling-reference
+build --host_cxxopt=-fstack-clash-protection
+build --host_cxxopt=-I. --host_cxxopt=-ILibraries --host_cxxopt=-IServices
+build --host_cxxopt=-isystem --host_cxxopt=Build/full/vcpkg_installed/x64-linux-dynamic/include
+build --host_cxxopt=-O2 --host_cxxopt=-g
+build --host_cxxopt=-DNDEBUG
+build --host_cxxopt=-DUSE_VULKAN=1 --host_cxxopt=-DUSE_FONTCONFIG=1
+build --host_cxxopt=-DUSE_VULKAN_DMABUF_IMAGES=1 --host_cxxopt=-DENABLE_COMPILETIME_FORMAT_CHECK
+build --host_cxxopt=-D_FILE_OFFSET_BITS=64 --host_cxxopt=-D_FORTIFY_SOURCE=3
+build --host_cxxopt=-fstack-protector-strong --host_cxxopt=-march=native --host_cxxopt=-fdiagnostics-color=always
+build --host_copt=-fPIC
+build --host_linkopt=-Wl,--allow-shlib-undefined
+build --host_linkopt=-LBuild/full/vcpkg_installed/x64-linux-dynamic/lib
+build --host_linkopt=-Wl,-rpath-link,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+build --host_linkopt=-Wl,-rpath,Build/full/vcpkg_installed/x64-linux-dynamic/lib
+build --host_linkopt=-Wl,--allow-multiple-definition
+build --host_linkopt=-L/usr/lib/x86_64-linux-gnu
+build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm

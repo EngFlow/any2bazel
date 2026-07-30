@@ -4,9 +4,11 @@ load(":codegen_root.bzl", "root_codegen")
 
 package(default_visibility = ["//visibility:public"])
 
-# 19 Python-generator genrules for this package (IPC endpoints, LibJS
-# Bytecode/Op, LibHTTP HSTS table, Compositor WebGL replayer). Bazel now
-# GENERATES these instead of consuming CMake's prebuilt copies from Build/full.
+# 24 generator genrules for this package: the IPC endpoints, LibJS Bytecode/Op,
+# LibHTTP's HSTS table, the Compositor WebGL replayer, the TIFF tag tables, the
+# two SPIR-V shader headers and the Flap interpreter assembly. Bazel now
+# GENERATES all of them instead of consuming CMake's prebuilt copies from
+# Build/full.
 root_codegen()
 
 # Mirror CMake's global -ILibraries -IServices -I. : every TU can include any
@@ -24,19 +26,20 @@ cc_library(
         "UI/**/*.h",
     ], allow_empty = True),
     deps = [
-        # Bazel-generated headers (19 genrules above) come FIRST so they win over
-        # the CMake copies; the Build/full roots below now only supply what Bazel
-        # does not yet generate (Rust FFI headers, CMake's generate_export_header
-        # Export.h, Qt moc output).
+        # Bazel-generated headers (the genrules above) come FIRST so they win
+        # over the CMake copies; the Build/full roots below now only supply what
+        # Bazel does not yet generate (Rust FFI headers, CMake's
+        # generate_export_header Export.h).
         ":generated_libraries_headers",
         ":generated_services_headers",
+        ":generated_shader_headers",
         "//Build/full/Libraries:generated_lib_headers",
         "//Build/full/Services:generated_service_headers",
-        "//Build/full/UI:qt_autogen_headers",
     ],
 )
 
 VCPKG = "//Build/full/vcpkg_installed/x64-linux-dynamic"
+
 
 # Configure-generated headers live in Build/full/AK; expose as AK/*.h via a copy.
 genrule(
@@ -51,44 +54,44 @@ genrule(
 cc_library(
     name = "AK",
     srcs = [
-        "AK/Assertions.cpp",
-        "AK/Base64.cpp",
-        "AK/ByteString.cpp",
-        "AK/ByteStringImpl.cpp",
-        "AK/CircularBuffer.cpp",
-        "AK/ConstrainedStream.cpp",
-        "AK/CountingStream.cpp",
-        "AK/Error.cpp",
-        "AK/FFIHelpers.cpp",
-        "AK/FlyString.cpp",
-        "AK/Format.cpp",
-        "AK/GenericLexer.cpp",
-        "AK/Hex.cpp",
-        "AK/JsonArray.cpp",
-        "AK/JsonObject.cpp",
-        "AK/JsonParser.cpp",
-        "AK/JsonValue.cpp",
-        "AK/LexicalPath.cpp",
-        "AK/MemoryStream.cpp",
-        "AK/NumberFormat.cpp",
-        "AK/OptionParser.cpp",
-        "AK/Random.cpp",
-        "AK/StackInfo.cpp",
-        "AK/Stream.cpp",
-        "AK/String.cpp",
-        "AK/StringBase.cpp",
-        "AK/StringBuilder.cpp",
-        "AK/StringConversions.cpp",
-        "AK/StringUtils.cpp",
-        "AK/StringView.cpp",
-        "AK/Time.cpp",
-        "AK/Utf16FlyString.cpp",
-        "AK/Utf16String.cpp",
-        "AK/Utf16StringBuilder.cpp",
-        "AK/Utf16StringData.cpp",
-        "AK/Utf16View.cpp",
-        "AK/Utf8View.cpp",
-        "AK/kmalloc.cpp",
+        'AK/Assertions.cpp',
+        'AK/Base64.cpp',
+        'AK/ByteString.cpp',
+        'AK/ByteStringImpl.cpp',
+        'AK/CircularBuffer.cpp',
+        'AK/ConstrainedStream.cpp',
+        'AK/CountingStream.cpp',
+        'AK/Error.cpp',
+        'AK/FFIHelpers.cpp',
+        'AK/FlyString.cpp',
+        'AK/Format.cpp',
+        'AK/GenericLexer.cpp',
+        'AK/Hex.cpp',
+        'AK/JsonArray.cpp',
+        'AK/JsonObject.cpp',
+        'AK/JsonParser.cpp',
+        'AK/JsonValue.cpp',
+        'AK/LexicalPath.cpp',
+        'AK/MemoryStream.cpp',
+        'AK/NumberFormat.cpp',
+        'AK/OptionParser.cpp',
+        'AK/Random.cpp',
+        'AK/StackInfo.cpp',
+        'AK/Stream.cpp',
+        'AK/String.cpp',
+        'AK/StringBase.cpp',
+        'AK/StringBuilder.cpp',
+        'AK/StringConversions.cpp',
+        'AK/StringUtils.cpp',
+        'AK/StringView.cpp',
+        'AK/Time.cpp',
+        'AK/Utf16FlyString.cpp',
+        'AK/Utf16String.cpp',
+        'AK/Utf16StringBuilder.cpp',
+        'AK/Utf16StringData.cpp',
+        'AK/Utf16View.cpp',
+        'AK/Utf8View.cpp',
+        'AK/kmalloc.cpp',
     ],
     hdrs = glob(["AK/*.h"]) + [":ak_gen_headers"],
     # AK-private defines (CMake PRIVATE) — local_defines so they don't leak to
@@ -118,6 +121,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibCompress/**/*.h"], allow_empty = True),
     local_defines = ['BROTLI_SHARED_COMPILATION', 'LibCompress_EXPORTS'],
+    linkopts = ['-lm', '-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -181,6 +185,7 @@ cc_library(
     hdrs = glob(["Libraries/LibCore/**/*.h"], allow_empty = True),
     local_defines = ['LibCore_EXPORTS'],
     copts = ['-fvisibility=hidden'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibSync',
@@ -243,6 +248,7 @@ cc_library(
     hdrs = glob(["Libraries/LibDNS/**/*.h"], allow_empty = True),
     local_defines = ['LibDNS_EXPORTS'],
     copts = ['-fvisibility=hidden'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -263,6 +269,7 @@ cc_library(
     hdrs = glob(["Libraries/LibDatabase/**/*.h"], allow_empty = True),
     local_defines = ['LibDatabase_EXPORTS'],
     copts = ['-fvisibility=hidden'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -294,6 +301,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibFileSystem/**/*.h"], allow_empty = True),
     local_defines = ['LibFileSystem_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -328,6 +336,7 @@ cc_library(
     hdrs = glob(["Libraries/LibGC/**/*.h"], allow_empty = True),
     local_defines = ['LIBGC_HAS_CPPTRACE=1', 'LibGC_EXPORTS'],
     copts = ['-fvisibility=hidden'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -403,7 +412,8 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibGfx/**/*.h"], allow_empty = True),
     local_defines = ['LibGfx_EXPORTS', 'SK_CODEC_DECODES_BMP', 'SK_CODEC_DECODES_GIF', 'SK_CODEC_DECODES_WBMP', 'SK_DISABLE_TRACING', 'SK_ENABLE_AVX512_OPTS', 'SK_ENABLE_PRECOMPILE', 'SK_FONTMGR_ANDROID_AVAILABLE', 'SK_FONTMGR_FCI_AVAILABLE', 'SK_FONTMGR_FONTCONFIG_AVAILABLE', 'SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMBEDDED_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMPTY_AVAILABLE', 'SK_GAMMA_APPLY_TO_A8', 'SK_GANESH', 'SK_HAS_WUFFS_LIBRARY', 'SK_R32_SHIFT=16', 'SK_TYPEFACE_FACTORY_FREETYPE', 'SK_USE_PERFETTO', 'SK_VULKAN', 'SK_XML'],
-    copts = ['-I/usr/include/libdrm', '-IBuild/full/Libraries/LibGfx', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/harfbuzz', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
+    copts = ['-IBuild/full/Libraries/LibGfx', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/harfbuzz', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
+    linkopts = ['-ldl', '-lpthread', '-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCompress',
@@ -437,7 +447,7 @@ cc_library(
 cc_library(
     name = 'LibHTTP',
     srcs = [
-        'Libraries/LibHTTP/HSTSPreloadData.cpp',
+        ':Libraries/LibHTTP/HSTSPreloadData.cpp',
         'Libraries/LibHTTP/Cache/CacheEntry.cpp',
         'Libraries/LibHTTP/Cache/CacheIndex.cpp',
         'Libraries/LibHTTP/Cache/DiskCache.cpp',
@@ -453,8 +463,9 @@ cc_library(
         'Libraries/LibHTTP/HttpRequest.cpp',
         'Libraries/LibHTTP/Method.cpp',
     ],
-    hdrs = glob(["Build/full/**/*.h"], allow_empty = True),
+    hdrs = glob(["Libraries/LibHTTP/**/*.h"], allow_empty = True),
     local_defines = ['LibHTTP_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCompress',
@@ -491,6 +502,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibIPC/**/*.h"], allow_empty = True),
     local_defines = ['LibIPC_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -509,7 +521,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibImageDecoderClient/**/*.h"], allow_empty = True),
     local_defines = ['LibImageDecoderClient_EXPORTS'],
-    copts = ['-I/usr/include/libdrm'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -523,7 +535,7 @@ cc_library(
 cc_library(
     name = 'LibImageDecoders',
     srcs = [
-        '//Build/full/Libraries:LibGfx/ImageFormats/TIFFTagHandler.cpp',
+        ':Libraries/LibGfx/ImageFormats/TIFFTagHandler.cpp',
         'Libraries/LibGfx/ImageFormats/AVIFLoader.cpp',
         'Libraries/LibGfx/ImageFormats/BMPLoader.cpp',
         'Libraries/LibGfx/ImageFormats/ExifReader.cpp',
@@ -535,9 +547,10 @@ cc_library(
         'Libraries/LibGfx/ImageFormats/PNGLoader.cpp',
         'Libraries/LibGfx/ImageFormats/WebPLoader.cpp',
     ],
-    hdrs = glob(["Build/full/**/*.h"], allow_empty = True),
+    hdrs = glob(["Libraries/LibGfx/**/*.h"], allow_empty = True),
     local_defines = ['AVIF_DLL', 'HWY_SHARED_DEFINE', 'LibImageDecoders_EXPORTS'],
-    copts = ['-I/usr/include/libdrm', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
+    copts = ['-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCompress',
@@ -567,8 +580,8 @@ cc_library(
 cc_library(
     name = 'LibJS',
     srcs = [
-        'Libraries/LibJS/Bytecode/Op.cpp',
-        '//Build/full/Libraries:LibJS/Interpreter/interpreter_x86_64.S',
+        ':Libraries/LibJS/Bytecode/Op.cpp',
+        ':Libraries/LibJS/Interpreter/interpreter_x86_64.S',
         'Libraries/LibJS/Bytecode/Executable.cpp',
         'Libraries/LibJS/Bytecode/IdentifierTable.cpp',
         'Libraries/LibJS/Bytecode/Instruction.cpp',
@@ -830,10 +843,11 @@ cc_library(
         'Libraries/LibJS/SyntaxHighlighter.cpp',
         'Libraries/LibJS/SyntheticModule.cpp',
     ],
-    hdrs = glob(["Build/full/**/*.h"], allow_empty = True),
+    hdrs = glob(["Libraries/LibJS/**/*.h"], allow_empty = True),
     local_defines = ['LibJS_EXPORTS', 'SIMDJSON_DEVELOPMENT_CHECKS', 'SIMDJSON_THREADS_ENABLED=1'],
     additional_compiler_inputs = ['Libraries/LibJS/Runtime/JavaScriptImplementations/AbstractOperations.js', 'Libraries/LibJS/Runtime/JavaScriptImplementations/ArrayConstructor.js'],
     copts = ['-fno-omit-frame-pointer', '-fvisibility=hidden', '-IBuild/full/Libraries/LibJS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -868,7 +882,6 @@ cc_library(
 )
 
 # === LibMedia (shared_library, 45 TU) ===
-#   UNKNOWN deps: ['pulse']
 cc_library(
     name = 'LibMedia',
     srcs = [
@@ -919,9 +932,9 @@ cc_library(
         'Libraries/LibMedia/VideoFrame.cpp',
     ],
     hdrs = glob(["Libraries/LibMedia/**/*.h"], allow_empty = True),
-    linkopts = ['-lpulse'],
     local_defines = ['LIBMEDIA_AUDIO_BACKEND=1', 'LibMedia_EXPORTS', '_REENTRANT'],
-    copts = ['-fvisibility=hidden', '-I/usr/include/libdrm', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
+    copts = ['-fvisibility=hidden', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include'],
+    linkopts = ['-lpulse', '-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -971,6 +984,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibRequests/**/*.h"], allow_empty = True),
     local_defines = ['LibRequests_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1036,6 +1050,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibTLS/**/*.h"], allow_empty = True),
     local_defines = ['LibTLS_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1074,6 +1089,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibThreading/**/*.h"], allow_empty = True),
     local_defines = ['LibThreading_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1141,6 +1157,7 @@ cc_library(
     alwayslink = True,
     local_defines = ['LibUnicode_EXPORTS'],
     copts = ['-IBuild/full/Libraries/LibUnicode'],
+    linkopts = ['-ldl'],
     deps = [
         '//:AK',
         '//:all_source_headers',
@@ -1184,6 +1201,7 @@ cc_library(
     hdrs = glob(["Libraries/LibWasm/**/*.h"], allow_empty = True),
     local_defines = ['LibWasm_EXPORTS', 'WASM_COMPILED_FAULT_RECOVERY_SUPPORTED=1', 'WASM_CRANELIFT=1', 'WASM_CRANELIFT_COMPILER_PATH=\\"/home/ubuntu/ladybird-work/Build/full/bin/cranelift-compiler\\"'],
     copts = ['-fvisibility=hidden', '-IBuild/full/Libraries/LibWasm'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1206,6 +1224,7 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibWebSocket/**/*.h"], allow_empty = True),
     local_defines = ['LibWebSocket_EXPORTS'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1282,6 +1301,7 @@ cc_library(
     hdrs = glob(["Libraries/LibDevTools/**/*.h"], allow_empty = True),
     local_defines = ['LibDevTools_EXPORTS'],
     copts = ['-fvisibility=hidden'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1356,7 +1376,8 @@ cc_library(
     ],
     hdrs = glob(["Libraries/LibWebView/**/*.h"], allow_empty = True),
     local_defines = ['LibWebView_EXPORTS'],
-    copts = ['-fvisibility=hidden', '-I/usr/include/libdrm'],
+    copts = ['-fvisibility=hidden'],
+    linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1399,7 +1420,7 @@ cc_library(
         'Services/WebContent/WebUIConnection.cpp',
     ],
     hdrs = glob(["Services/WebContent/**/*.h"], allow_empty = True),
-    copts = ['-I/usr/include/libdrm', '-IBuild/full'],
+    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1468,7 +1489,7 @@ cc_library(
         'Services/ImageDecoder/ConnectionFromClient.cpp',
     ],
     hdrs = glob(["Services/ImageDecoder/**/*.h"], allow_empty = True),
-    copts = ['-I/usr/include/libdrm', '-IBuild/full'],
+    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1488,7 +1509,7 @@ cc_library(
     name = 'compositorservice',
     srcs = [
         '//Libraries/LibWeb:WebGL/GLFunctions.cpp',
-        'Services/Compositor/WebGLCommandReplayer.cpp',
+        ':Services/Compositor/WebGLCommandReplayer.cpp',
         'Services/Compositor/BackingStoreManager.cpp',
         'Services/Compositor/CanvasHost.cpp',
         'Services/Compositor/CompositorState.cpp',
@@ -1501,9 +1522,9 @@ cc_library(
         'Services/Compositor/ViewportScrollbarController.cpp',
         'Services/Compositor/WebGLObjectMap.cpp',
     ],
-    hdrs = glob(["Build/full/**/*.h"], allow_empty = True),
+    hdrs = glob(["Services/Compositor/**/*.h"], allow_empty = True),
     local_defines = ['SK_CODEC_DECODES_BMP', 'SK_CODEC_DECODES_GIF', 'SK_CODEC_DECODES_WBMP', 'SK_DISABLE_TRACING', 'SK_ENABLE_AVX512_OPTS', 'SK_ENABLE_PRECOMPILE', 'SK_FONTMGR_ANDROID_AVAILABLE', 'SK_FONTMGR_FCI_AVAILABLE', 'SK_FONTMGR_FONTCONFIG_AVAILABLE', 'SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMBEDDED_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMPTY_AVAILABLE', 'SK_GAMMA_APPLY_TO_A8', 'SK_GANESH', 'SK_HAS_WUFFS_LIBRARY', 'SK_R32_SHIFT=16', 'SK_TYPEFACE_FACTORY_FREETYPE', 'SK_USE_PERFETTO', 'SK_VULKAN', 'SK_XML'],
-    copts = ['-I/usr/include/libdrm', '-IBuild/full', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
+    copts = ['-IBuild/full', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
     deps = [
         '//:LibCore',
         '//:LibGfx',
@@ -1525,7 +1546,7 @@ cc_library(
         'Services/WebWorker/WorkerHost.cpp',
     ],
     hdrs = glob(["Services/WebWorker/**/*.h"], allow_empty = True),
-    copts = ['-I/usr/include/libdrm', '-IBuild/full'],
+    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1643,7 +1664,7 @@ cc_binary(
         'Services/RendererSandboxLinux.cpp',
         'Services/WebWorker/main.cpp',
     ],
-    copts = ['-fPIE', '-I/usr/include/libdrm'],
+    copts = ['-fPIE'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1678,7 +1699,7 @@ cc_binary(
         'Services/RendererSandboxLinux.cpp',
         'Services/WebContent/main.cpp',
     ],
-    copts = ['-fPIE', '-I/usr/include/libdrm', '-IBuild/full'],
+    copts = ['-fPIE', '-IBuild/full'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1712,6 +1733,20 @@ cc_binary(
     ],
 )
 
+# === generate_interpreter_layout (executable, 1 TU) ===
+cc_binary(
+    name = 'generate_interpreter_layout',
+    srcs = [
+        'Libraries/LibJS/Interpreter/GenerateLayout.cpp',
+    ],
+    local_defines = ['private=public', 'protected=public'],
+    copts = ['-fPIE'],
+    deps = [
+        '//:AK',
+        '//:all_source_headers',
+    ],
+)
+
 
 # === Qt6 autogen via rules_qt ===
 # qt_cc_moc runs moc over the Q_OBJECT headers; it takes the Qt include dirs
@@ -1733,7 +1768,7 @@ qt_cc_rcc(
     srcs = [":qt_qrc"],
 )
 
-# === ladybird (executable, 23 TU) ===
+# === ladybird (executable, 21 TU) ===
 cc_binary(
     name = 'ladybird',
     srcs = [
@@ -1762,7 +1797,7 @@ cc_binary(
         'UI/Qt/main.cpp',
     ],
     local_defines = ['QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_WIDGETS_LIB'],
-    copts = ['-fPIE', '-IBuild/full/UI/Qt'],
+    copts = ['-fPIE', '-IBuild/full/UI', '-IBuild/full/UI/Qt'],
     linkopts = ['-lGLX', '-lOpenGL', '-lvulkan'],
     deps = [
         '//:AK',

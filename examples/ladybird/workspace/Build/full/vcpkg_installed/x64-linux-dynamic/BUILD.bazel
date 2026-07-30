@@ -36,3 +36,16 @@ cc_import(name = "woff2dec", static_library = "lib/libwoff2dec.a", deps = [":hea
 # lib%s.so name convention above doesn't apply — declare them explicitly.
 cc_import(name = "libEGL_angle", shared_library = "lib/liblibEGL_angle.so", deps = [":headers"])
 cc_import(name = "libGLESv2_angle", shared_library = "lib/liblibGLESv2_angle.so", deps = [":headers"])
+
+# The versioned .so files, as data. cc_import stages a shared_library into
+# _solib_k8 under its FILE name (libfmt.so), but the loader asks for the SONAME
+# (libfmt.so.12), so runfiles alone never satisfy a binary Bazel actually RUNS
+# during the build (a genrule tool). The vcpkg lib dir is also a relative rpath
+# in .bazelrc, and a relative rpath is resolved against the process's cwd --
+# which for an action is the execroot. So staging these files as declared inputs
+# at their real paths is what makes that rpath resolve inside the sandbox.
+# Needed only by tools Bazel executes; it disappears when Bazel builds vcpkg.
+filegroup(
+    name = "runtime_libs",
+    srcs = glob(["lib/*.so*"], allow_empty = True),
+)

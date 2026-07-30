@@ -47,8 +47,15 @@ COVERED = [
     (r'Meta/Generators/',              'python generator (Meta/Generators)'),
     (r'Libraries/LibGfx/TIFFGenerator\.py', 'TIFFGenerator.py (LibGfx)'),
     (r'glslangValidator',              'glslangValidator (SPIR-V shader header)'),
-    (r'bin/generate_interpreter_layout', 'generate_interpreter_layout (self-built)'),
-    (r'bin/flapc',                     'flapc (self-built)'),
+    # Anchored on the tool being INVOKED (start of command, or after `&&`), not
+    # merely named: the cargo command that BUILDS flapc also mentions bin/flapc,
+    # as the destination of a copy_if_different. An unanchored 'bin/flapc' put
+    # that cargo build in this bucket, where it ran (a full cargo rebuild) and
+    # then reported NO_OUTS -- a generator-shaped false positive. Compiling flapc
+    # is a Rust build, which the EXCLUDED list below owns.
+    (r'(?:^|&& )\S*bin/generate_interpreter_layout\b',
+                                       'generate_interpreter_layout (self-built)'),
+    (r'(?:^|&& )\S*bin/flapc\b',       'flapc (self-built)'),
 ]
 
 # ---------------------------------------------------------------------------
@@ -72,6 +79,27 @@ EXCLUDED = [
                               'directory staging, tracked as the runfiles gap'),
     (r'-P .*run_quiet\.cmake.*(?!glslang)',
                               'log wrapper around a command counted separately'),
+    # CMake's own per-directory bookkeeping. Ninja emits these four rules in
+    # EVERY one of the ~80 build directories, which is why they dominate the
+    # count: 4 x directories, none of them producing a build input.
+    (r'cmake --regenerate-during-build',
+                              'CMake re-running itself when CMakeLists change; '
+                              'Bazel loads BUILD files every invocation'),
+    (r'-P cmake_install\.cmake',
+                              'install/strip step (cmake --install), not a build '
+                              'input; Bazel packaging is a separate concern'),
+    (r'cmake -E env \S*LADYBIRD_SOURCE_DIR=\S+ (\S*bin/Ladybird|gdb)\b',
+                              'ninja "run"/"debug" convenience target, not a '
+                              'build step'),
+    (r'cmake -E copy \S+\.py \S+',
+                              'staging a test script into bin/ as an executable; '
+                              'test scaffolding, and tracked as the runfiles gap'),
+    (r'cmake -E cmake_autorcc\b',
+                              'Qt AUTORCC. Bazel runs rcc ITSELF (rules_qt '
+                              'qt_cc_rcc, see //:qt_rcc), so the resource .cpp is '
+                              'Bazel output; it is not byte-compared here because '
+                              'CMake and rules_qt name the generated symbols after '
+                              'their own respective output paths'),
 ]
 
 

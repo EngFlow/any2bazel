@@ -1290,7 +1290,7 @@ cc_library(
     includes = [".."],
     alwayslink = True,
     local_defines = ['LibWeb_EXPORTS', 'SK_CODEC_DECODES_BMP', 'SK_CODEC_DECODES_GIF', 'SK_CODEC_DECODES_WBMP', 'SK_DISABLE_TRACING', 'SK_ENABLE_AVX512_OPTS', 'SK_ENABLE_PRECOMPILE', 'SK_FONTMGR_ANDROID_AVAILABLE', 'SK_FONTMGR_FCI_AVAILABLE', 'SK_FONTMGR_FONTCONFIG_AVAILABLE', 'SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMBEDDED_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMPTY_AVAILABLE', 'SK_GAMMA_APPLY_TO_A8', 'SK_GANESH', 'SK_HAS_WUFFS_LIBRARY', 'SK_R32_SHIFT=16', 'SK_TYPEFACE_FACTORY_FREETYPE', 'SK_USE_PERFETTO', 'SK_VULKAN', 'SK_XML'],
-    copts = ['-fvisibility=hidden', '-I/usr/include/libdrm', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/libxml2', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
+    copts = ['-fvisibility=hidden', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/libxml2', '-isystem', 'Build/full/vcpkg_installed/x64-linux-dynamic/include/skia'],
     deps = [
         '//:AK',
         '//:LibCompress',
