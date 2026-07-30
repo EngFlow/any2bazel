@@ -46,6 +46,15 @@ TRIPLET="${5:-x64-linux-dynamic}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# vcpkg reads $HOME (for its own config/telemetry dirs) and hard-fails "unable to
+# read $HOME" without it. Bazel deliberately does not pass HOME through to
+# actions -- that is the sandbox doing its job, since anything an action reads
+# from a real home directory is an undeclared input. So point HOME at the
+# action's own scratch dir: vcpkg gets a writable HOME, and it is one that cannot
+# leak state between builds.
+export HOME="$WORK/home"
+mkdir -p "$HOME"
+
 # --- the asset-cache script: resolve by hash, never fetch --------------------
 cat > "$WORK/fetch.sh" <<EOF
 #!/bin/bash

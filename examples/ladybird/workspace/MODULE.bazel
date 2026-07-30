@@ -3,6 +3,9 @@ module(name = "ladybird", version = "0.0.0")
 bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "platforms", version = "1.0.0")
 
+# Bazel 9 removed the native sh_binary; //Meta:vcpkg_build is one.
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
 # Qt6 via rules_qt (kklochkov). Its qt.local_repo discovers the host Qt through
 # qmake, so moc/rcc and the Qt cc_library targets all come from one 6.10.2 SDK
 # -- the version Ladybird's CMake asks for -- and the moc rule reads its include
@@ -26,3 +29,100 @@ qt.local_repo(
 qt.active_sdk(name = "qt", repo = "qt6_local")
 use_repo(qt, "qt")
 register_toolchains("@qt//:qt_linux_x86_64_toolchain")
+
+# ---------------------------------------------------------------------------
+# Ring 2: the vcpkg dependency tree. Bazel owns FETCHING (here); vcpkg is still
+# the recipe that builds them (//:vcpkg_installed, see vcpkg.bzl).
+#
+# The 76 distfiles, their URLs and their SHA512s are all GENERATED from a capture
+# of what vcpkg actually downloads (Meta/vcpkg_assets.tsv), by
+# Meta/emit_vcpkg_bazel.py -- including the use_repo list below, because bzlmod
+# needs every extension-created repo named here and 76 hand-kept names would
+# drift. Regenerate all four files with:
+#
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --distfiles > vcpkg_distfiles.bzl
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --index     > vcpkg_index.bzl
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --extension > vcpkg_extension.bzl
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --use-repo   # paste below
+#
+# None of those need vcpkg, CMake or the network: the capture IS the pin.
+vcpkg_deps = use_extension("//:vcpkg_extension.bzl", "vcpkg_deps")
+use_repo(
+    vcpkg_deps,
+    'vcpkg_AOMediaCodec_libavif_v1_4_2_tar_gz_cbf318278840',
+    'vcpkg_DetectSSE2_cmake_219a4c8591ee',
+    'vcpkg_GNOME_libxml2_v2_15_3_tar_gz_f65df793fca5',
+    'vcpkg_GPUOpen_LibrariesAndSDKs_VulkanMemoryAllocator_v3_4_0_tar_gz_563acbcd8912',
+    'vcpkg_KhronosGroup_EGL_Registry_3ae2b7c48690d2ce13cc6db3db02dfc0572be65e_tar_gz_c7b09ded4964',
+    'vcpkg_KhronosGroup_OpenGL_Registry_0b449b97cdf1043eef5e1f0e235cbbab6ec10c86_tar_gz_148e1bfe4cc1',
+    'vcpkg_KhronosGroup_Vulkan_Headers_vulkan_sdk_1_4_350_1_tar_gz_eee702ee5ff4',
+    'vcpkg_WebKitCompilerFlags_cmake_8b281ffcf920',
+    'vcpkg_WebKitMacros_cmake_565175443d5d',
+    'vcpkg_abseil_abseil_cpp_20260107_1_tar_gz_f5012885d6b6',
+    'vcpkg_automake_1_17_tar_gz_11357dfab8cb',
+    'vcpkg_bzip2_1_0_8_tar_gz_083f5e675d73',
+    'vcpkg_cisco_openh264_v2_6_0_tar_gz_26a03acde715',
+    'vcpkg_cmake_4_4_0_linux_x86_64_tar_gz_3df4aaa128a4',
+    'vcpkg_curl_curl_curl_8_21_0_tar_gz_0ab6c99c3d5b',
+    'vcpkg_davea42_libdwarf_code_v2_3_1_tar_gz_e8eb74c622ce',
+    'vcpkg_dbus_dbus_dbus_1_16_2_tar_gz_8ad3ab55bf6e',
+    'vcpkg_facebook_zstd_v1_5_7_tar_gz_26e441267305',
+    'vcpkg_fastfloat_fast_float_v8_2_10_tar_gz_eec563358117',
+    'vcpkg_ffmpeg_ffmpeg_n7_1_1_tar_gz_6b9a5ee501be',
+    'vcpkg_fmt_backport_4813_patch_afda8fdfcdcb',
+    'vcpkg_fmtlib_fmt_12_2_0_tar_gz_5ac2ba0f54a4',
+    'vcpkg_fontconfig_fontconfig_2_17_1_tar_gz_8e05cad63cd0',
+    'vcpkg_freetype_freetype_VER_2_13_3_tar_gz_fccfaa15eb79',
+    'vcpkg_giflib_6_1_3_tar_gz_fb1d63196947',
+    'vcpkg_gn_linux_amd64_zip_d49575bd383b',
+    'vcpkg_gni_to_cmake_py_cf9dab1b59cd',
+    'vcpkg_google_angle_79ac1a8cd767a32cce6401203e20c4bd4ca4d539_tar_gz_a3d5d09460f0',
+    'vcpkg_google_brotli_v1_2_0_tar_gz_f94542afd2ec',
+    'vcpkg_google_highway_1_4_0_tar_gz_819422857d6a',
+    'vcpkg_google_skia_e7c90ecca9444fe09598f1630ab7cee2c0ee027a_tar_gz_f52286fcac1d',
+    'vcpkg_google_woff2_v1_0_2_tar_gz_c788bba1530a',
+    'vcpkg_google_wuffs_mirror_release_c_v0_3_4_tar_gz_d22136a1adf3',
+    'vcpkg_gperf_3_3_tar_gz_246b75b8ce7d',
+    'vcpkg_harfbuzz_harfbuzz_10_2_0_tar_gz_697205a571bb',
+    'vcpkg_icu4c_78_3_sources_tgz_04a49455e148',
+    'vcpkg_include_CMakeLists_txt_a7ddf3c6df75',
+    'vcpkg_jeremy_rifkin_cpptrace_v1_0_2_tar_gz_4ae394fb3c21',
+    'vcpkg_libedit_20240808_3_1_tar_gz_b11d64947f94',
+    'vcpkg_libexpat_libexpat_R_2_8_2_tar_gz_e60e6d6ae9d0',
+    'vcpkg_libidn2_2_3_7_tar_gz_eab5702bc0ba',
+    'vcpkg_libjpeg_turbo_libjpeg_turbo_3_2_0_tar_gz_1ce063e9e126',
+    'vcpkg_libjxl_libjxl_v0_11_2_tar_gz_a7e1f7d060b3',
+    'vcpkg_libpng_1_6_58_apng_patch_gz_95a6f5bb7148',
+    'vcpkg_libproxy_libproxy_0_4_18_tar_gz_1148d688a9f0',
+    'vcpkg_libpsl_public_suffix_list_0ed17e_dat_7969c40b0600',
+    'vcpkg_libsdl_org_SDL_release_3_4_12_tar_gz_fc0a55ca01c3',
+    'vcpkg_libtiff_libtiff_v4_7_2_tar_gz_c4dcde3c79e5',
+    'vcpkg_libtom_libtommath_v1_3_0_tar_gz_3dbd7053a670',
+    'vcpkg_libunistring_1_2_tar_xz_5fbb5a0a864d',
+    'vcpkg_libuuid_1_0_3_tar_gz_77488caccc66',
+    'vcpkg_madler_zlib_v1_3_1_tar_gz_8c9642495baf',
+    'vcpkg_meson_1_9_0_tar_gz_ecd69b6734be',
+    'vcpkg_microsoft_mimalloc_v2_2_7_tar_gz_19f5481c9882',
+    'vcpkg_mm2_Little_CMS_lcms2_19_1_tar_gz_1b2781ed8898',
+    'vcpkg_nghttp2_nghttp2_v1_69_0_tar_gz_1029fb86935a',
+    'vcpkg_ngtcp2_nghttp3_v1_17_0_tar_gz_23d85a2abfa8',
+    'vcpkg_ngtcp2_ngtcp2_v1_24_0_tar_gz_04a5762d6eac',
+    'vcpkg_ngtcp2_sfparse_f2046eaa1acba7c5467399b1e1e1f354d22d1f48_tar_gz_b3cbcce6d96d',
+    'vcpkg_openssl_openssl_openssl_3_6_3_tar_gz_a89c08101fa1',
+    'vcpkg_patchelf_0_19_0_x86_64_tar_gz_2a65c9cbdddc',
+    'vcpkg_pdfjs_5_6_205_dist_zip_66fecdb8a80d',
+    'vcpkg_pkgconf_pkgconf_pkgconf_3_0_3_tar_gz_4e49bb7b10c6',
+    'vcpkg_pnggroup_libpng_v1_6_58_tar_gz_65f54d805e1f',
+    'vcpkg_rockdaboot_libpsl_0_21_5_tar_gz_d8e224b2ce5d',
+    'vcpkg_simdjson_simdjson_v4_6_4_tar_gz_003b96daab30',
+    'vcpkg_simdutf_simdutf_v9_0_0_tar_gz_0c74226247cb',
+    'vcpkg_sqlite_autoconf_3530300_tar_gz_355a8db490ec',
+    'vcpkg_tukaani_project_xz_v5_8_3_tar_gz_8fb5e6a13397',
+    'vcpkg_videolan_dav1d_1_5_3_tar_gz_8d976b931352',
+    'vcpkg_webmproject_libvpx_v1_16_0_tar_gz_07f5e352411d',
+    'vcpkg_webmproject_libwebp_v1_6_0_tar_gz_298e0ad4c093',
+    'vcpkg_xiph_ogg_v1_3_6_tar_gz_c247e1da8b12',
+    'vcpkg_xiph_opus_v1_5_2_tar_gz_4ffefd9c0356',
+    'vcpkg_xiph_theora_v1_2_0_tar_gz_b2aac15528f0',
+    'vcpkg_xiph_vorbis_v1_3_7_tar_gz_bfb6f5dbfd49',
+)

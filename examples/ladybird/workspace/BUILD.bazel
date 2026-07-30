@@ -1,6 +1,8 @@
 load("@rules_qt//qt:defs.bzl", "qt_cc_moc", "qt_cc_rcc", "qt_qrc")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":codegen_root.bzl", "root_codegen")
+load(":vcpkg.bzl", "vcpkg_tree")
+load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -1824,3 +1826,45 @@ cc_binary(
     ],
 )
 
+
+# ---------------------------------------------------------------------------
+# Ring 2: build the vcpkg dependency tree AS A BAZEL ACTION, with zero network.
+#
+# Every download is resolved by SHA512 out of the 76 http_files Bazel fetched
+# (vcpkg_index.bzl, generated from the capture); x-block-origin makes a miss a
+# hard error rather than a silent fetch, which is what makes the hermeticity
+# claim checkable rather than aspirational.
+#
+# NB the cc_import shims in Build/full/vcpkg_installed/... still point at the
+# CMake reference tree. Swapping them onto this output is the next step; this
+# target is what makes that swap possible, and building it proves the boundary.
+vcpkg_tree(
+    name = "vcpkg_installed",
+    distfiles = VCPKG_DISTFILE_INDEX,
+    source_dir = ".",
+    source_root = ":vcpkg_source_inputs",
+    triplet = "x64-linux-dynamic",
+    vcpkg_root = "Build/vcpkg",
+    vcpkg_tree = "//Build/vcpkg:tree",
+)
+
+# The manifest + overlays the build action needs, declared as inputs rather than
+# read out of the ambient checkout (finding 23: the manifest is used VERBATIM,
+# never reconstructed -- a hand-derived dep list loses feature selections on
+# transitive deps, and libpng[apng] alone is 20 exported symbols).
+filegroup(
+    name = "vcpkg_source_inputs",
+    srcs = ["vcpkg.json", "vcpkg-configuration.json"] + glob([
+        "Meta/CMake/vcpkg/overlay-ports/**",
+        "Meta/CMake/vcpkg/release-triplets/**",
+        "Meta/CMake/vcpkg/base-triplets/**",
+        # The 4 git-sourced externals. vcpkg_from_git bypasses asset caching
+        # entirely (it shells out to `git fetch`, which no asset source
+        # intercepts) but DOES honour a pre-placed downloads/<PORT>-<REF>.tar.gz,
+        # so these are staged there by the driver. Discovered by difference
+        # against what a completed run leaves in downloads/, not by parsing --
+        # skia reaches ten externals through its own declare_external_from_git
+        # wrapper and angle's are behind ${URL}/${REF} (finding 30).
+        "Meta/CMake/vcpkg/git-archives/**",
+    ], allow_empty = True),
+)

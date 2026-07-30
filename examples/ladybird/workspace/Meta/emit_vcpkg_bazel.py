@@ -475,10 +475,83 @@ def emit_distfiles(distfiles):
             distfiles.items(), key=lambda kv: (kv[1][1], kv[0])):
         print("    http_file(")
         print("        name = %r," % bazel_name(name, sha))
-        print("        urls = [%r]," % url)
+        print("        urls = %r," % urls_for(url))
         print("        downloaded_file_path = %r," % name)
         print("        integrity = %r,  # %s" % (sri(sha), port))
         print("    )")
+
+
+# Known-equivalent mirrors, keyed by URL prefix. This is the payoff predicted in
+# finding 29: vcpkg's x-script asset hook is handed ONE url per attempt, so the
+# multi-mirror redundancy portfiles encode never reaches it and a single 502 kills
+# the fetch. `http_file` takes a LIST of urls and tries them in order, so moving
+# fetching to Bazel does not just relocate the problem, it fixes it. (Observed,
+# not hypothetical: ftpmirror.gnu.org 502'd during the capture AND again during
+# the first Bazel fetch of all 76.)
+#
+# Safe because every URL is content-addressed by `integrity`: a mirror that serves
+# the wrong bytes fails the hash, so the only thing a bad mirror can cost is time.
+MIRRORS = {
+    "https://ftpmirror.gnu.org/gnu/": [
+        "https://ftp.gnu.org/gnu/",
+        "https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/",
+        "https://mirrors.kernel.org/gnu/",
+    ],
+    "https://ftp.gnu.org/gnu/": [
+        "https://ftpmirror.gnu.org/gnu/",
+        "https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/",
+        "https://mirrors.kernel.org/gnu/",
+    ],
+    "https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/": [
+        "https://ftpmirror.gnu.org/gnu/",
+        "https://ftp.gnu.org/gnu/",
+        "https://mirrors.kernel.org/gnu/",
+    ],
+}
+
+
+def urls_for(url):
+    """One URL -> the list to hand http_file, primary first."""
+    out = [url]
+    for prefix, alts in MIRRORS.items():
+        if url.startswith(prefix):
+            rest = url[len(prefix):]
+            out += [a + rest for a in alts]
+            break
+    return out
+
+
+def emit_extension(distfiles):
+    """The module extension that actually creates the repos.
+
+    `http_file` is a *repository* rule, so under bzlmod it cannot be called from
+    MODULE.bazel directly -- it has to be invoked from a module extension's
+    implementation. That indirection is also what lets one `use_repo` name the 76
+    repos without MODULE.bazel enumerating any URLs or hashes.
+    """
+    sys.stdout.write(HEADER)
+    print('load(":vcpkg_distfiles.bzl", "vcpkg_distfiles")')
+    print()
+    print("def _vcpkg_deps_impl(_ctx):")
+    print("    vcpkg_distfiles()")
+    print()
+    print("vcpkg_deps = module_extension(implementation = _vcpkg_deps_impl)")
+
+
+def emit_use_repo(distfiles):
+    """The `use_repo(vcpkg_deps, ...)` line MODULE.bazel needs.
+
+    Emitted rather than hand-maintained because bzlmod requires every repo an
+    extension creates to be named here to be visible, and a list of 76 names kept
+    in sync by hand is a guaranteed drift (and the failure is a confusing
+    "no such repository", far from its cause)."""
+    names = sorted(bazel_name(name, sha)
+                   for sha, (_u, name, _p, _s) in distfiles.items())
+    print("use_repo(")
+    print("    vcpkg_deps,")
+    for n in names:
+        print("    %r," % n)
+    print(")")
 
 
 def emit_index(distfiles):
@@ -592,6 +665,10 @@ def main():
         emit_distfiles(distfiles)
     elif "--index" in sys.argv:
         emit_index(distfiles)
+    elif "--extension" in sys.argv:
+        emit_extension(distfiles)
+    elif "--use-repo" in sys.argv:
+        emit_use_repo(distfiles)
     else:
         return report(distfiles, externals, unresolved, unexpanded)
     return 0

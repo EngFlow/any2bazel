@@ -187,3 +187,27 @@ def test_emitting_from_the_capture_alone_needs_no_vcpkg():
                          capture_output=True, text=True, env=env)
     assert bad.returncode == 2, bad.stderr
     assert "UNDERCOUNTS" in bad.stderr
+
+
+def test_gnu_urls_get_mirror_alternatives():
+    """Finding 29's predicted payoff, now load-bearing: vcpkg's x-script hook is
+    handed ONE url per attempt, so the mirror redundancy portfiles encode never
+    reaches it and a single 502 kills the fetch (observed twice --
+    ftpmirror.gnu.org during the capture, and again during the first Bazel fetch
+    of all 76). http_file takes a LIST, so moving fetching to Bazel fixes it
+    rather than relocating it. Safe because `integrity` content-addresses every
+    URL: a mirror serving wrong bytes fails the hash, so it can only cost time."""
+    urls = emit.urls_for("https://ftpmirror.gnu.org/gnu/automake/automake-1.17.tar.gz")
+    assert urls[0] == "https://ftpmirror.gnu.org/gnu/automake/automake-1.17.tar.gz"
+    assert len(urls) > 1
+    # The path after the mirror prefix must be carried over verbatim.
+    for u in urls:
+        assert u.endswith("/automake/automake-1.17.tar.gz"), u
+    assert len(set(urls)) == len(urls), "no duplicate urls"
+
+
+def test_non_mirrored_urls_are_left_as_a_single_entry():
+    """Only prefixes with known-equivalent mirrors expand; a GitHub tarball has no
+    mirror and must not acquire a fabricated one."""
+    u = "https://github.com/madler/zlib/archive/v1.3.1.tar.gz"
+    assert emit.urls_for(u) == [u]

@@ -1,3 +1,4 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 package(default_visibility = ["//visibility:public"])
 
 # All Python generator scripts + their shared helper packages (Meta/Utils,
@@ -12,9 +13,9 @@ filegroup(
     ]),
 )
 
-# The vcpkg_tree action's driver (see //:vcpkg.bzl). It resolves every download
-# by SHA512 out of a Bazel-written index and runs vcpkg with x-block-origin, so
-# the dependency build reaches the network zero times.
+# Ring 2: the driver for the vcpkg build action (see //:vcpkg.bzl). It runs
+# `vcpkg install` with x-block-origin, resolving every download by SHA512 from
+# files Bazel fetched, so the build reaches the network zero times.
 sh_binary(
     name = "vcpkg_build",
     srcs = ["vcpkg_build.sh"],
