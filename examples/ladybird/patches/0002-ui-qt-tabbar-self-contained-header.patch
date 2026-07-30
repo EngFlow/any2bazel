@@ -1,0 +1,29 @@
+From: any2bazel Ladybird migration
+Subject: [PATCH] UI/Qt: make TabBar.h self-contained by including Tab.h
+
+TabBar.h calls as<Tab>() inline -- a dynamic_cast, which needs Tab's complete
+type -- while only forward-declaring Tab. It compiles today only by accident of
+CMake's AUTOMOC: the unity mocs_compilation.cpp happens to #include moc_Tab.cpp
+(which includes Tab.h) before moc_TabBar.cpp, so the definition is in scope by
+the time TabBar.h is parsed.
+
+Bazel runs moc per header rather than through a unity file, so nothing supplies
+Tab.h first and the header fails to compile on its own. That makes this a real
+latent bug rather than a Bazel quirk: the header is not self-contained, and any
+build that compiles it in a different order -- a unity build with different
+bucketing, a header-only IWYU check, a different generator -- hits the same
+thing.
+
+One line, and it makes the header stand alone.
+diff --git a/UI/Qt/TabBar.h b/UI/Qt/TabBar.h
+index 00269c5c..93963006 100644
+--- a/UI/Qt/TabBar.h
++++ b/UI/Qt/TabBar.h
+@@ -10,6 +10,7 @@
+ 
+ #include <AK/TypeCasts.h>
+ #include <LibWebView/Settings.h>
++#include <UI/Qt/Tab.h>
+ 
+ #include <QPointer>
+ #include <QPushButton>
