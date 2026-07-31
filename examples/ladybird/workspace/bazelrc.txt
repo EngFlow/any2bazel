@@ -57,10 +57,16 @@ build --linkopt=-Wl,--allow-shlib-undefined
 # The -L / -rpath-link / -rpath into the vcpkg lib dir are GONE: each
 # //Meta/vcpkg:<port> dep contributes them itself, pointing at Bazel's own output
 # tree, and declares that tree as an input of the link so the sandbox has it.
-# The prebuilt Rust crate archives each bundle an identical copy of the rust
-# allocator shim (__rust_realloc/__rust_alloc_zeroed/...). The reference build
-# isolates them by linking each crate into its own .so; our combined-archive
-# shim pulls several into one link, so take the first (identical) definition.
+# Every Rust staticlib bundles its OWN copy of the rust allocator shim
+# (__rust_alloc/__rust_dealloc/__rust_realloc/__rust_alloc_zeroed), so any target
+# linking two crates sees each of those four defined twice. The definitions are
+# identical, and there is no way to deduplicate them from outside cargo: the
+# reference build sidesteps it by linking each crate into its own .so.
+# Still required after finding 34 -- checked by deleting it: //:Compositor then
+# fails with "multiple definition of `__rustc::__rust_alloc'" between
+# liburl_rust and libregex_rust. (The comment here used to blame the combined
+# archive that finding 34 deleted; the flag outlived that explanation, which is
+# why it is worth re-testing a flag rather than inheriting its rationale.)
 build --linkopt=-Wl,--allow-multiple-definition
 # System library search path for find_package deps (Qt6, GLX/OpenGL).
 build --linkopt=-L/usr/lib/x86_64-linux-gnu

@@ -67,7 +67,8 @@ vcpkg tree and the Rust crates itself, with zero network access in either:
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
 # 1. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
-git apply .../examples/ladybird/patches/*.patch   # generator determinism (gap 7)
+git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt header
+                                                 # that is not self-contained (gap 7)
 # 2. Build. This includes the 77 vcpkg ports (~45 min cold) and the 10 Rust
 #    crates + flapc: the libraries depend on them through //Meta/vcpkg:<port> and
 #    //:<crate>_lib, so there is no separate step. Build //:vcpkg_installed alone
@@ -198,8 +199,15 @@ Honest inventory of what stops this from being a clone-and-build.
    byte-identical to the CMake reference — with Rust owning URL parsing, the CSS
    parser, the HTML tokenizer, regex and the text codecs, so a matching layout
    tree is a real signal. All 14 FFI headers are byte-identical to CMake's, and
-   the 10 archives' normalized symbol tables (~34k symbols) diff **0** against
-   the reference cargo build (only rustc's hash suffixes differ).
+   the 10 archives agree with the reference cargo build on the surface that can
+   actually be linked against: **0 differences across all 331 `extern "C"` FFI
+   symbols** (197 of them in `libweb_css_rust` alone). Their *internal* symbols do
+   differ — rustc's `17h<hash>E` suffixes, LLVM `anon.*.llvm.<n>` names and the
+   metadata hash in each object-file name are functions of the build path, so
+   ~2.4k of ~50k names differ after normalizing the obvious ones. That is noise of
+   the same class as the vcpkg `.dynstr` deltas in finding 32, but it is worth
+   stating precisely rather than rounding to "identical": nothing here proves the
+   archives are bit-identical, only that their linkable ABI is.
 
    Wrapping vcpkg is explicitly a stepping stone, not the destination. It keeps
    vcpkg as the *recipe* (it encodes the patches, configure flags and feature sets
@@ -264,11 +272,20 @@ Honest inventory of what stops this from being a clone-and-build.
    patches). The BCR's `rules_qt` module is Vertexwahn's unrelated `rules_qt6`.
    Qt itself *is* host-portable: `qt.local_repo` discovers the host Qt via
    `qmake -query`, so no Qt SDK is vendored.
-7. **Three upstreamable Ladybird fixes.** Two are applied in the checkout, not here:
-   the `sorted()` determinism fix in `Meta/Generators/libweb_bindings/to_idl_value.py`
-   (filed as [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899),
-   fixed upstream) and a one-line `#include <UI/Qt/Tab.h>` in `UI/Qt/TabBar.h`
-   to make the header self-contained (still to file).
+7. **Three upstreamable Ladybird fixes.** The first is the `sorted()` determinism
+   fix in `Meta/Generators/libweb_bindings/to_idl_value.py`, filed as
+   [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899) and
+   fixed upstream.
+
+   The second is a one-line `#include <UI/Qt/Tab.h>` in `UI/Qt/TabBar.h`:
+   [`patches/0002-ui-qt-tabbar-self-contained-header.patch`](patches/0002-ui-qt-tabbar-self-contained-header.patch).
+   `TabBar.h` calls `as<Tab>()` — a `dynamic_cast`, needing Tab's complete type —
+   while only forward-declaring `Tab`, and compiles under CMake purely by ordering
+   luck: AUTOMOC's unity `mocs_compilation.cpp` includes `moc_Tab.cpp` (hence
+   `Tab.h`) before `moc_TabBar.cpp`. Bazel mocs each header separately, so nothing
+   supplies the definition first. A latent upstream bug rather than a Bazel quirk —
+   any build that changes compile order (different unity bucketing, an IWYU pass)
+   hits it. Still to file upstream.
 
    A **third** one is now needed, in the same function as the first: the topological
    sort in `dictionaries_in_dependency_order` iterates a *set* of dependency names,
