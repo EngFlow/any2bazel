@@ -1474,10 +1474,13 @@ different claim from the one this ring closed.
   the browser renders, and finding 24 showed the render comparison is the
   stronger check anyway. Byte-parity was the right *ratchet* while building the
   migration; it is not the definition of done.
-  Remaining after Ring 2: `rules_rust` for the 10 crates (Ladybird's own source,
-  167 crates.io deps in `Cargo.lock` → `crate_universe`). (Qt — moc/rcc and the
-  host include paths — is done, via `rules_qt`, now fetched by
-  `archive_override` from upstream rather than a local path.)
+  Nothing remains after Ring 2: the 10 Rust crates and `flapc` are Bazel-built
+  too (finding 34), from `Cargo.lock`'s own pins — and *not* via `rules_rust` /
+  `crate_universe`, which was the plan here: cargo is the recipe worth keeping
+  (the workspace resolution, the build scripts that run cbindgen), so it gets the
+  vcpkg treatment rather than a reimplementation. (Qt — moc/rcc and the host
+  include paths — is done, via `rules_qt`, now fetched by `archive_override` from
+  upstream rather than a local path.)
   The full gap list is in [`examples/ladybird/README.md`](../examples/ladybird/README.md#known-gaps).
 
 ## Success gate — MET
@@ -1490,10 +1493,17 @@ every process (UI, WebContent, Compositor, RequestServer, ImageDecoder)
 Bazel-built, proven by removing the reference services and watching the CMake
 binary fail while the Bazel one renders.
 
-**Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~2,700 Bazel actions;
+And with findings 33 and 34 it is a **clone-and-build**: Bazel fetches and builds
+the 77 vcpkg ports *and* the 10 Rust crates + `flapc` itself, with zero network
+access in the build actions, verified by removing each reference tree from the
+machine in turn. `Build/full` is now only the *converter's* input — the model the
+emitters read and the baseline the parity harness diffs — not the build's.
+
+**Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~4,400 Bazel actions
+from scratch (2,700 C++ plus the vcpkg and Rust rings);
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 33 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; 34 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 ## Environment notes (this sandbox)
