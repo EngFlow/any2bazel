@@ -66,8 +66,7 @@ cmake --preset default -B Build/full -DENABLE_GUI_TARGETS=ON && ninja -C Build/f
    echo save; echo end; } | ar -M)
 # 2. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
-git apply .../examples/ladybird/patches/*.patch   # generator determinism (gap 7) + a
-                                                 # non-self-contained Qt header (gap 8)
+git apply .../examples/ladybird/patches/*.patch   # generator determinism (gap 7)
 # 2b. The vcpkg dependency tree — Bazel fetches all 76 distfiles and builds all 77
 #     ports with zero network access. Not a separate step any more: the libraries
 #     depend on it through //Meta/vcpkg:<port>, so step 4 builds it. Build it
@@ -228,14 +227,3 @@ Honest inventory of what stops this from being a clone-and-build.
    any single run — the inherited-seed run was clean. The fix is in
    [`patches/0001-libweb-bindings-deterministic-dictionary-order.patch`](patches/0001-libweb-bindings-deterministic-dictionary-order.patch);
    apply it in the checkout before running the harness.
-
-8. **One Ladybird header is not self-contained, and only CMake's unity moc hides it.**
-   `UI/Qt/TabBar.h` calls `as<Tab>()` — a `dynamic_cast`, needing Tab's complete
-   type — while only forward-declaring `Tab`. It compiles under CMake purely by
-   ordering luck: AUTOMOC's unity `mocs_compilation.cpp` includes `moc_Tab.cpp`
-   (hence `Tab.h`) before `moc_TabBar.cpp`. Bazel mocs each header separately, so
-   nothing supplies the definition first and the header fails on its own. That
-   makes it a latent upstream bug rather than a Bazel quirk — any build that
-   changes compile order (different unity bucketing, an IWYU pass) hits it.
-   One line: [`patches/0002-ui-qt-tabbar-self-contained-header.patch`](patches/0002-ui-qt-tabbar-self-contained-header.patch).
-   Both patches are upstream candidates, filed alongside ladybird#10899.
