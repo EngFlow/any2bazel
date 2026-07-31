@@ -1299,6 +1299,135 @@ control (58 PulseAudio symbols = Bazel's SDL3, 0 = CMake's) confirms which tree 
 loaded. The four `.bazelrc` escapes are deleted rather than relocated. vcpkg is no
 longer a reason you need a CMake build first — Rust is the only one left.
 
+## Finding 34: cargo and Bazel disagree about the unit, and every bug was that
+
+Rust was the last host escape: 10 crates consumed as a **260 MB prebuilt
+`librust_combined.a`** copied out of `Build/full/cargo/`, merged by a hand-run
+`ar -M` that the README told you to type, and `flapc` taken from the reference
+build. It is closed now — 154 crates.io crates fetched by Bazel from
+`Cargo.lock`, 10 archives and `flapc` built by sandboxed, network-blocked
+actions, `Build/full/cargo` and `Build/full/bin/flapc` moved off the machine,
+`bazel clean`, all six binaries rebuilt (4,427 actions) and
+`--headless=text`/`--headless=layout-tree` byte-identical to the CMake reference.
+
+The plumbing is finding 33's three layers again (fetch at module level, build as
+an action, consume as `CcInfo`), and the fetch layer is *easier* than vcpkg's:
+`Cargo.lock` already carries a sha256 for every registry crate and crates.io's
+URL is a pure function of (name, version), so there is **nothing to capture** —
+no instrumented run, no network, no CMake, just a parse. The interesting part is
+not the plumbing. It is that every single bug in this ring came from one
+mismatch, and it is not a mismatch about Rust:
+
+> **cargo's unit of work is the workspace; Bazel's is the package.** cargo
+> resolves all 11 crates together, writes their generated headers into one shared
+> directory, and treats "which file came from which crate" as an implementation
+> detail. Bazel demands the opposite: per-target inputs, per-target declared
+> outputs, and deletion of anything undeclared.
+
+Each bug is that seam, and each one presented as an *absence* that Bazel's
+undeclared-output deletion turned into a visible failure:
+
+- **The headers collide.** Six crates each emit a file literally named
+  `RustFFI.h` into the same `$FFI_OUTPUT_DIR`. So "which crate's copy survives"
+  is a real question, and for one build the answer was wrong: `liburl_rust`
+  shipped `libregex_rust`'s header, and LibURL compiled against the wrong ABI.
+  The fix is to stop treating the shared scratch dir as the source of truth and
+  resolve each header from the owning crate's own
+  `build/<crate>-*/root-output` — which is exactly what
+  `Meta/CMake/sync_rust_ffi_header.cmake` does, i.e. upstream hit this too and
+  papered it with a copy step rather than naming it.
+- **CMake's own header declaration is incomplete.** `libweb_rust` declares one
+  FFI header; its build scripts write two, because its dependency
+  `libweb_html_tokenizer` writes `HTMLTokenizerRustFFI.h` into the same shared
+  dir and three LibWeb TUs include it. CMake never notices — nothing declares it
+  and nothing deletes it. Bazel deletes it, and the compile fails. So the
+  declared list has to be the *union*, and the emitter has to say when its two
+  sources disagree rather than silently pick one.
+- **Bazel packages cut across the cargo workspace.** Four crates live under
+  `Libraries/LibWeb/`, which is its own Bazel package, and `glob()` is
+  package-relative — so the root package, which owns the ring, cannot see their
+  sources at all. Hence a `//Libraries/LibWeb:rust_crate_srcs` filegroup on that
+  side of the boundary. The alternative (making the root package own those files)
+  means deleting the LibWeb package.
+- **`rustc` finds its sysroot through `argv[0]`.** Merging the three fetched
+  toolchain components with `cp -al` copies Bazel's *symlinks into its fetch
+  cache*, so `bin/rustc` resolves back into the cache, looks for
+  `lib/rustlib/<triple>` there, and reports "can't find crate for `std` … the
+  target may not be installed" — a message that sends you hunting for a missing
+  component that is in fact right there. `cp -alL` makes it a real file, and the
+  sysroot is the merged tree.
+- **cargo validates every target in a manifest while parsing it**, so `flapc`
+  needs its `benches/` and `tests/` directories declared as inputs even though
+  nothing builds them.
+
+### The bug I introduced by believing a comment
+
+The shim I was replacing said the archives have "circular cross-crate symbol
+references (`liburl_rust` → `libunicode_rust`, and the regex crate is bundled
+into several)", which is why the 260 MB `ar -M` merge existed. I kept the premise
+and only moved it into the graph: all 10 archives in **one linker input** bracketed
+by `-Wl,--start-group/--end-group`, so ld re-scans until nothing new resolves.
+That retires the `ar` step, it links `ladybird` and `WebContent`, and it is wrong.
+
+`ImageDecoder` and `RequestServer` failed with hundreds of undefined
+`rust_sfd_*`, `script_gdi_*`, `eval_gdi_*` — symbols defined in
+`Libraries/LibJS/RustIntegration.cpp`, in a binary that deliberately does not link
+LibJS. Inside a `--start-group`, ld may satisfy `libgfx_rust`'s std symbol from a
+member object of `libjs_rust.a`, which drags that object in, which then wants
+`libjs_rust`'s C++ side. The group did not resolve a cycle; it manufactured
+dependencies between units that had none.
+
+Because the premise was false, and I only found that out by measuring instead of
+reading: take each archive's undefined symbols, subtract the ones **its own
+archive also defines**, and ask which other crate supplies the rest.
+
+| | cross-crate symbol edges | what's actually left over |
+|---|---|---|
+| all 10 crates, both directions | **0** | 176–274 libc/libgcc/pthread symbols each |
+
+Every one of the 200–700 symbols any two archives "share" is defined in *both* of
+them, because each Rust staticlib bundles its own copy of rust-std,
+compiler-builtins and alloc. That is symmetric by construction — which is exactly
+what a dependency is not. Ladybird's Rust crates never call each other; they call
+**C++**, and C++ calls them.
+
+So the right shape is one target per crate carrying that crate's archive and that
+crate's headers, and the dep edge in `BUILD.bazel` is one-for-one with CMake's
+`target_link_libraries`. Which is where the answer was the whole time: CMake links
+`libgfx_rust.a` into LibGfx and nothing else, and I had a byte-parity harness
+pointed at that build. I trusted a prose comment over a build I could query.
+
+The narrowness is now visible in the output, not just the BUILD files:
+`ImageDecoder` defines **28** `rust_*` FFI symbols where `WebContent` defines
+**328**. Under the group, `ImageDecoder` did not link at all.
+
+**The transferable lesson.** A wrapped foreign build system hands you two things:
+a recipe, and an *explanation* of the recipe. Finding 23 said take the recipe
+verbatim and never re-derive it — that was about the manifest. This is the dual:
+the explanation is not part of the recipe, and it is not evidence. "The archives
+are circular" was load-bearing in a hand-written shim, survived into a doc, and
+was still wrong. Bazel is unusually good at punishing that, because a shared
+`--start-group` and ten separate inputs both *link* on the target you happen to be
+testing, and only differ on the target that needs less. Then check the *narrow*
+direction: a superset always links; only the subset proves the edges are real.
+
+### What is left
+
+Both remaining debts are over-declaration, and they are honest:
+
+- Every crate declares the **whole workspace's** sources, because cargo resolves
+  the workspace whichever crate you ask for. Touch one `.rs` and 11 crates
+  rebuild. Under-declaring would silently reuse a stale archive, so the trade is
+  the right way round — but per-crate source sets need the path-dependency graph
+  read out of the manifests, which is real work not done here.
+- Each `vcpkg_lib` still declares the whole vcpkg tree as its header input
+  (finding 33's leftover). Same shape: paths are per-port, the input *set* is not.
+
+`git clone && bazel build //:ladybird` is now true for the browser. `Build/full`
+is still needed to *regenerate* the BUILD files and to run the parity harness —
+that is a converter-development dependency, not a build dependency, and it is a
+different claim from the one this ring closed.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →

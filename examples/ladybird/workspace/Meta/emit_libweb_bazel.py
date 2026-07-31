@@ -20,7 +20,11 @@ MODEL = os.path.join(ROOT, "model.cmake.full.json")
 PKG_PREFIX = "Libraries/LibWeb/"
 GEN_PREFIX = "Build/full/Libraries/LibWeb/"
 VCPKG = "//Meta/vcpkg"
-RUST_PKG = "//Build/full/cargo/build/x86_64-unknown-linux-gnu/release"
+# See emit_build_bazel.py: the crates are Bazel-built now, and each crate is ONE
+# target (//:<crate>_lib) carrying its own archive and its own generated FFI
+# headers -- one for one with CMake's per-library edge, so LibWeb links the four
+# crates it uses and nothing else.
+RUST_LIB_FMT = "//:%s_lib"
 
 GLOBAL_DEFINES = {
     "USE_VULKAN=1", "ENABLE_COMPILETIME_FORMAT_CHECK", "USE_FONTCONFIG=1",
@@ -44,6 +48,41 @@ package(default_visibility = ["//visibility:public"])
 
 libweb_codegen()
 libweb_bindings_codegen()
+
+# The four Rust crates that live INSIDE this package (LibWeb/Rust,
+# LibWeb/CSS/Rust, LibWeb/Layout/Rust, LibWeb/ContentBlocker/Rust, plus
+# HTML/Parser/Rust), exposed so the root package's cargo_ring() can declare them
+# as cargo inputs. They are one cargo WORKSPACE with the crates at the repo root,
+# but Bazel packages cut across it: glob() is package-relative, so the root
+# package cannot see files under Libraries/LibWeb/ at all. Hence a filegroup on
+# this side of the boundary rather than a glob on that side -- the alternative
+# (making the root package own these files) would mean deleting this package.
+filegroup(
+    name = "rust_crate_srcs",
+    srcs = glob([
+        "Rust/**",
+        "CSS/Rust/**",
+        "Layout/Rust/**",
+        "ContentBlocker/Rust/**",
+        "HTML/Parser/Rust/**",
+    ], allow_empty = False) + [
+        # Non-Rust build-script inputs that live here too: libweb_css_rust's
+        # build.rs GENERATES Rust from these CSS data files, and libweb_rust's
+        # reads the HTML name headers + Entities.json. Taken from the reference
+        # build's cargo depfiles, so the list is measured rather than predicted.
+        "CSS/Enums.json",
+        "CSS/Keywords.json",
+        "CSS/LogicalPropertyGroups.json",
+        "CSS/Properties.json",
+        "CSS/PseudoClasses.json",
+        "CSS/PseudoElementPropertyGroups.txt",
+        "CSS/PseudoElements.json",
+        "CSS/Units.json",
+        "HTML/AttributeNames.h",
+        "HTML/Parser/Entities.json",
+        "HTML/TagNames.h",
+    ],
+)
 '''
 
 
@@ -178,8 +217,7 @@ def main():
                 deps.append("//:%s" % tgt)
             continue
         if nm.endswith("_rust"):
-            deps.append(RUST_PKG + ":" + nm)
-            deps.append("//Build/full/Libraries:rust_ffi_headers")
+            deps.append(RUST_LIB_FMT % nm)
         elif nm in so or nm in ar:
             deps.append(VCPKG + ":" + nm)
         elif nm in SYSTEM_LIBS:

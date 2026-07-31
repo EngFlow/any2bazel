@@ -299,17 +299,13 @@ def emit_glslang(shaders):
 #       AK, compiled with -Dprivate=public -Dprotected=public so offsetof() can
 #       see private members). A plain cc_binary; Bazel builds it host-side and
 #       the genrule runs it via tools=[].
-#   flapc -- a RUST crate (Libraries/LibJS/Flap, cargo workspace, 51 .rs files,
-#       depends on the in-tree bytecode_def crate and on smallvec from
-#       crates.io). Building it under Bazel means rules_rust plus a crate
-#       universe for the registry dep -- i.e. the Rust ring this migration has
-#       explicitly deferred (the 10 production Rust crates are still consumed as
-#       a prebuilt archive). So flapc is run FROM the reference build's
-#       Build/full/bin/flapc, declared as a genrule tool so it is at least a
-#       real, hashed, sandboxed input rather than an ambient path -- and the
-#       .S it produces is now Bazel's own output, not a shim over CMake's tree.
-#       The remaining debt is one binary, and it is the same debt as the Rust
-#       crates, not a new one.
+#   flapc -- a RUST crate (Libraries/LibJS/Flap, its own cargo workspace, 51 .rs
+#       files, depends on the in-tree bytecode_def crate and on smallvec from
+#       crates.io). Bazel BUILDS it now (//:flapc, a cargo_binary): its lock has
+#       exactly 3 packages and the one registry crate is the same smallvec 1.15.1
+#       the big workspace already fetches -- same version, same checksum, checked
+#       by the emitter -- so the Rust ring covers it with no extra machinery.
+#       Nothing in this chain comes out of CMake's tree any more.
 # ---------------------------------------------------------------------------
 def emit_flap(layout, flap):
     if not (layout and flap):
@@ -319,8 +315,9 @@ def emit_flap(layout, flap):
     print('    # struct offsets flapc needs; flapc then compiles the Flap DSL to')
     print('    # the interpreter assembly. tools=[] makes each a declared,')
     print('    # hashed input, so the .S is Bazel output rather than a shim over')
-    print('    # CMake\'s build tree. flapc itself is the reference build\'s')
-    print('    # binary: it is a cargo crate, and Rust is a separate ring.')
+    print('    # CMake\'s build tree. flapc is Bazel-built too now (//:flapc,')
+    print('    # a cargo_binary from its own 3-package lock), so neither tool')
+    print('    # nor output in this chain comes from the reference build.')
     print('    native.genrule(')
     print('        name = %r,' % 'gen_interpreter_layout')
     print('        outs = [%r],' % layout['out'])
@@ -348,11 +345,12 @@ def emit_flap(layout, flap):
     return [flap['out']]
 
 
-# flapc as the reference cargo build produced it. CMake copies this binary to
-# Build/full/bin/flapc; we point at the cargo output directly, in the same
-# package as the prebuilt Rust archives, because it is the same debt: a cargo
-# artifact consumed by Bazel until the Rust ring lands.
-FLAPC_TOOL = '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:flapc'
+# flapc, BUILT BY BAZEL (//:flapc -- a cargo_binary, see cargo.bzl and
+# cargo_ring.bzl). It used to be the reference cargo build's binary, the last
+# artifact this migration took from CMake, because Libraries/LibJS/Flap is a Rust
+# crate and Rust was a separate ring. That ring has landed, so both tools in this
+# chain and both of their outputs are now Bazel's own.
+FLAPC_TOOL = '//:flapc'
 
 
 def main():

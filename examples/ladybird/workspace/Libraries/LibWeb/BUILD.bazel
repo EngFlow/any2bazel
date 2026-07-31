@@ -7,6 +7,41 @@ package(default_visibility = ["//visibility:public"])
 libweb_codegen()
 libweb_bindings_codegen()
 
+# The four Rust crates that live INSIDE this package (LibWeb/Rust,
+# LibWeb/CSS/Rust, LibWeb/Layout/Rust, LibWeb/ContentBlocker/Rust, plus
+# HTML/Parser/Rust), exposed so the root package's cargo_ring() can declare them
+# as cargo inputs. They are one cargo WORKSPACE with the crates at the repo root,
+# but Bazel packages cut across it: glob() is package-relative, so the root
+# package cannot see files under Libraries/LibWeb/ at all. Hence a filegroup on
+# this side of the boundary rather than a glob on that side -- the alternative
+# (making the root package own these files) would mean deleting this package.
+filegroup(
+    name = "rust_crate_srcs",
+    srcs = glob([
+        "Rust/**",
+        "CSS/Rust/**",
+        "Layout/Rust/**",
+        "ContentBlocker/Rust/**",
+        "HTML/Parser/Rust/**",
+    ], allow_empty = False) + [
+        # Non-Rust build-script inputs that live here too: libweb_css_rust's
+        # build.rs GENERATES Rust from these CSS data files, and libweb_rust's
+        # reads the HTML name headers + Entities.json. Taken from the reference
+        # build's cargo depfiles, so the list is measured rather than predicted.
+        "CSS/Enums.json",
+        "CSS/Keywords.json",
+        "CSS/LogicalPropertyGroups.json",
+        "CSS/Properties.json",
+        "CSS/PseudoClasses.json",
+        "CSS/PseudoElementPropertyGroups.txt",
+        "CSS/PseudoElements.json",
+        "CSS/Units.json",
+        "HTML/AttributeNames.h",
+        "HTML/Parser/Entities.json",
+        "HTML/TagNames.h",
+    ],
+)
+
 # === LibWeb (shared_library, 1961 TU: 1273 checked-in + 688 generated) ===
 #   SYSTEM libs (linkopts on binary): ['dl', 'pthread', 'vulkan']
 cc_library(
@@ -1314,11 +1349,10 @@ cc_library(
         '//:LibWasm',
         '//:LibXML',
         '//:all_source_headers',
-        '//Build/full/Libraries:rust_ffi_headers',
-        '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libweb_content_blocker_rust',
-        '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libweb_css_rust',
-        '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libweb_layout_rust',
-        '//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:libweb_rust',
+        '//:libweb_content_blocker_rust_lib',
+        '//:libweb_css_rust_lib',
+        '//:libweb_layout_rust_lib',
+        '//:libweb_rust_lib',
         '//Meta/vcpkg:SDL3',
         '//Meta/vcpkg:crypto',
         '//Meta/vcpkg:expat',

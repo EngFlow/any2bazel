@@ -20,3 +20,29 @@ sh_binary(
     name = "vcpkg_build",
     srcs = ["vcpkg_build.sh"],
 )
+
+# Ring 2 part 3: the driver for the cargo build actions (see //:cargo.bzl). It
+# assembles the vendor directory from crates Bazel fetched, points CARGO_HOME at
+# action-local scratch, and runs `cargo rustc --offline --locked` -- so the build
+# reaches the network zero times and a crate missing from the vendor dir is a
+# hard error rather than a download.
+sh_binary(
+    name = "cargo_build",
+    srcs = ["cargo_build.sh"],
+    # cargo_vendor.sh is SOURCED at run time, and it arrives as a declared input
+    # of each cargo action (cargo.bzl's `_vendor` attr) whose path is passed in
+    # $CARGO_VENDOR_LIB -- NOT as data here. An sh_binary's runfiles live under
+    # <name>.runfiles/, not beside the wrapper Bazel execs, so `dirname $0`
+    # finds nothing in the sandbox: a failure that appears only when sandboxed.
+)
+
+# The same driver, for a `--bin` crate (flapc). One script, two entry points:
+# the difference is `cargo rustc --bin <name>` instead of `--lib`, and an
+# executable output instead of an archive + headers.
+sh_binary(
+    name = "cargo_binary_build",
+    srcs = ["cargo_binary_build.sh"],
+)
+
+# Sourced by both drivers; exported so cargo.bzl can name it as an input.
+exports_files(["cargo_vendor.sh"])

@@ -130,8 +130,9 @@ def root_codegen():
     # struct offsets flapc needs; flapc then compiles the Flap DSL to
     # the interpreter assembly. tools=[] makes each a declared,
     # hashed input, so the .S is Bazel output rather than a shim over
-    # CMake's build tree. flapc itself is the reference build's
-    # binary: it is a cargo crate, and Rust is a separate ring.
+    # CMake's build tree. flapc is Bazel-built too now (//:flapc,
+    # a cargo_binary from its own 3-package lock), so neither tool
+    # nor output in this chain comes from the reference build.
     native.genrule(
         name = 'gen_interpreter_layout',
         outs = ['Libraries/LibJS/Interpreter/layout.conf'],
@@ -143,8 +144,8 @@ def root_codegen():
         name = 'gen_interpreter_asm',
         srcs = ['Libraries/LibJS/Interpreter/interpreter.flap', 'Libraries/LibJS/Bytecode/Bytecode.def', ':Libraries/LibJS/Interpreter/layout.conf'],
         outs = ['Libraries/LibJS/Interpreter/interpreter_x86_64.S'],
-        tools = ['//Build/full/cargo/build/x86_64-unknown-linux-gnu/release:flapc'],
-        cmd = "$(location //Build/full/cargo/build/x86_64-unknown-linux-gnu/release:flapc) --arch x86_64 --object-format elf --constants $(location :Libraries/LibJS/Interpreter/layout.conf) --bytecode-def $(location Libraries/LibJS/Bytecode/Bytecode.def) --input $(location Libraries/LibJS/Interpreter/interpreter.flap) --output $@",
+        tools = ['//:flapc'],
+        cmd = "$(location //:flapc) --arch x86_64 --object-format elf --constants $(location :Libraries/LibJS/Interpreter/layout.conf) --bytecode-def $(location Libraries/LibJS/Bytecode/Bytecode.def) --input $(location Libraries/LibJS/Interpreter/interpreter.flap) --output $@",
     )
     cc_library(
         name = 'generated_libraries_headers',

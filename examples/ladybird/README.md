@@ -2,7 +2,7 @@
 
 The Bazel workspace overlay produced by the any2bazel parity loop for
 [Ladybird](https://ladybird.org) (CMake + vcpkg, C++23). The narrative — why
-each of these files looks the way it does, and the 33 findings the migration
+each of these files looks the way it does, and the 34 findings the migration
 produced — is in [`docs/CASE-ladybird-migration.md`](../../docs/CASE-ladybird-migration.md).
 This directory is the *artifact*: what you would drop into a Ladybird checkout.
 
@@ -13,13 +13,19 @@ generators run under Bazel with output **byte-identical to CMake's**
 every one of the build's 586 ninja `CUSTOM_COMMAND`s — 51 covered, 535 excluded
 with a stated reason, **0 unhandled**), the result renders pages
 (`--headless=text` and `--headless=layout-tree` match the CMake reference byte
-for byte), and **the 77 vcpkg dependencies are fetched and built by Bazel with
-zero network access**, then *consumed* from Bazel's own output tree: with the
-CMake vcpkg tree deleted from the machine, a clean build of all six binaries
-still renders `--headless=layout-tree` byte-identically to the reference
-(findings 30–33).
+for byte), **the 77 vcpkg dependencies are fetched and built by Bazel with
+zero network access** (findings 30–33), and **so are the 10 Rust crates and
+`flapc`** — 154 crates.io crates fetched from `Cargo.lock`, built by
+network-blocked cargo actions (finding 34).
 
-**It is not yet a clean-machine build.** See [Known gaps](#known-gaps).
+**`git clone && bazel build //:ladybird` now builds the browser.** Verified by
+removal, twice: with `Build/full/vcpkg_installed` gone, and then with
+`Build/full/cargo` **and** `Build/full/bin/flapc` gone, a `bazel clean` build of
+all six binaries renders `--headless=text` and `--headless=layout-tree`
+byte-identically to the CMake reference. `Build/full` is still needed to
+*regenerate* the BUILD files and to run the parity harness — a
+converter-development dependency, not a build dependency. See
+[Known gaps](#known-gaps) for what is still owed.
 
 ## Layout
 
@@ -41,7 +47,10 @@ still renders `--headless=layout-tree` byte-identically to the reference
 | `Meta/bazel_parity_harness.py` | Buckets every ninja `CUSTOM_COMMAND` as covered / excluded-with-reason / unhandled, re-runs the covered ones and byte-compares against CMake's tree. Non-zero unhandled is a failure |
 | `Meta/BUILD.bazel` | `//Meta:generators` filegroup (the generator scripts, as genrule inputs) |
 | `Meta/vcpkg/BUILD.bazel` | The 41 `vcpkg_lib` targets Ladybird's libraries depend on, backed by `//:vcpkg_installed`. Hand-written and stable (one target per port); this is the whole interface between Ladybird and its dependencies |
-| `Build/full/**/BUILD.bazel` | Shims over the *reference CMake build tree*: the prebuilt Rust archives and the `flapc` binary (a cargo crate). **This is the remaining Ring 2 debt** — the vcpkg shims are gone, and no generated *source* is shimmed either |
+| `cargo_crates.bzl`, `cargo_index.bzl`, `cargo_extension.bzl` | One `http_archive` per crates.io crate (154), the name/version/sha256 index the vendor staging resolves through, and the module extension that creates the repos + the 3 pinned Rust toolchain components. **Generated** by `Meta/emit_cargo_bazel.py` **from `Cargo.lock` alone** — no cargo, no network, no CMake |
+| `cargo.bzl`, `Meta/cargo_build.sh`, `Meta/cargo_binary_build.sh`, `Meta/cargo_vendor.sh` | `rust_sysroot` (the pinned 1.96.1 toolchain merged into one tree), `cargo_crate` / `cargo_binary` (offline, network-blocked build actions), and `cargo_lib` (one consumable `CcInfo` per crate: its archive + its FFI headers) |
+| `cargo_ring.bzl` | The 10 `cargo_crate` + 10 `cargo_lib` targets and `flapc`, as a macro for the root package (the crate sources are at the repo root and `glob()` is package-relative). **Generated** by `Meta/emit_cargo_bazel.py` |
+| `Build/full/**/BUILD.bazel` | Shims over the *reference CMake build tree*: **only generated headers now.** The Rust archive and `flapc` shims are gone (finding 34), as are the vcpkg ones (finding 33) |
 
 The four generated files are reproducible: re-running each emitter against the
 same `Build/full` reproduces them byte for byte — **on the same machine**. They
@@ -51,28 +60,31 @@ adds `-I/usr/include/libdrm`), which is gap 3 below, not an emitter bug.
 
 ## Reproducing
 
+To **build the browser**, no CMake build is needed — Bazel fetches and builds the
+vcpkg tree and the Rust crates itself, with zero network access in either:
+
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
-# 1. Reference CMake build. Still needed for the RUST artifacts (gap 1) and for
-#    the 696 generated files the parity harness diffs against. NOT for vcpkg any
-#    more: Bazel fetches and builds the whole dep tree itself, and the build has
-#    been verified with Build/full/vcpkg_installed deleted.
-cmake --preset default -B Build/full -DENABLE_GUI_TARGETS=ON && ninja -C Build/full
-# 1b. Merge the per-crate cargo archives into the one combined archive the Rust
-#     shim cc_imports (see gap 1). They have circular cross-crate references, so
-#     a flat link cannot resolve them by ordering.
-(cd Build/full/cargo/build/x86_64-unknown-linux-gnu/release && \
- { echo "create librust_combined.a"; for a in liblib*_rust.a; do echo "addlib $a"; done; \
-   echo save; echo end; } | ar -M)
-# 2. Drop in the overlay.
+# 1. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism (gap 7)
-# 2b. The vcpkg dependency tree — Bazel fetches all 76 distfiles and builds all 77
-#     ports with zero network access. Not a separate step any more: the libraries
-#     depend on it through //Meta/vcpkg:<port>, so step 4 builds it. Build it
-#     alone if you want to time it (~45 min cold).
-bazel build //:vcpkg_installed
-# 3. Regenerate the BUILD files from the reference build (optional — they are checked in).
+# 2. Build. This includes the 77 vcpkg ports (~45 min cold) and the 10 Rust
+#    crates + flapc: the libraries depend on them through //Meta/vcpkg:<port> and
+#    //:<crate>_lib, so there is no separate step. Build //:vcpkg_installed alone
+#    if you want to time it.
+bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder //:Compositor //:WebWorker
+```
+
+To **regenerate or verify the BUILD files** you additionally need the reference
+CMake build — that is a converter-development dependency, not a build dependency:
+
+```sh
+# 3. Reference CMake build: the model the emitters read, and the 1,408 generated
+#    files the parity harness byte-compares against. NOT needed for vcpkg (finding
+#    33) or Rust (finding 34) any more; verified with Build/full/vcpkg_installed,
+#    Build/full/cargo and Build/full/bin/flapc all deleted.
+cmake --preset Release -B Build/full -DENABLE_GUI_TARGETS=ON && ninja -C Build/full
+# 4. Regenerate the BUILD files from it (optional — they are checked in).
 python3 Meta/emit_build_bazel.py > BUILD.bazel
 python3 Meta/emit_codegen_bazel.py Libraries/LibWeb > Libraries/LibWeb/codegen.bzl
 python3 Meta/emit_root_codegen_bazel.py > codegen_root.bzl
@@ -81,8 +93,13 @@ python3 Meta/emit_libweb_bazel.py > Libraries/LibWeb/BUILD.bazel
 python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --distfiles > vcpkg_distfiles.bzl
 python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --index     > vcpkg_index.bzl
 python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --extension > vcpkg_extension.bzl
-# 4. Build, and check every generator against CMake.
-bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder //:Compositor
+# The cargo rules regenerate from Cargo.lock alone — no cargo, no network, no CMake.
+python3 Meta/emit_cargo_bazel.py --crates > cargo_crates.bzl
+python3 Meta/emit_cargo_bazel.py --index  > cargo_index.bzl
+python3 Meta/emit_cargo_bazel.py --ring   > cargo_ring.bzl
+python3 Meta/emit_cargo_bazel.py --extension > cargo_extension.bzl
+python3 Meta/emit_cargo_bazel.py --check .    # all four reproduce byte-for-byte
+# 5. Check every generator against CMake.
 python3 Meta/bazel_parity_harness.py     # expects 1408/1408 identical, 0 UNHANDLED
 # Sweep hash seeds: a generator that iterates a set matches under some seeds only.
 for s in 0 1 7 42; do python3 Meta/bazel_parity_harness.py --seed $s; done
@@ -106,8 +123,8 @@ ln -sfn "$PWD/Build/full/share/Lagom" "$ER/bazel-out/k8-fastbuild/share"
 
 Honest inventory of what stops this from being a clone-and-build.
 
-1. **External deps: Bazel now fetches AND builds them; the shims still read the
-   CMake tree.** `bazel build //:vcpkg_installed` fetches all 76 distfiles as
+1. **External deps: Bazel fetches AND builds all of them — vcpkg and Rust.**
+   `bazel build //:vcpkg_installed` fetches all 76 distfiles as
    `http_file`s (hashes from a committed capture of what vcpkg actually
    downloads) and builds all 77 ports with `x-block-origin` — **zero network
    access**. Verified against CMake's reference tree, not merely built: identical
@@ -149,11 +166,40 @@ Honest inventory of what stops this from being a clone-and-build.
    `include/skia`, `include/harfbuzz` and `include/libxml2` now ride on the port
    that owns them, so a TU including `<skia/...>` must depend on `//Meta/vcpkg:skia`.
 
-   What remains is Rust: the crates are still a 260 MB prebuilt
-   `librust_combined.a` (10 cargo archives pre-merged with `ar`, because they have
-   circular cross-crate references a flat link cannot order), and `flapc` is still
-   the reference build's binary. Consequence: **you must still run the CMake build
-   first — but for Rust, no longer for vcpkg.**
+   **Rust is closed too (finding 34), so the CMake build is no longer needed to
+   build the browser at all.** The 260 MB prebuilt `librust_combined.a`, the
+   hand-run `ar -M` that produced it and the reference build's `flapc` are gone.
+   `Cargo.lock` already pins a sha256 for all 154 crates.io crates and the URL is
+   a pure function of (name, version), so — unlike vcpkg — **nothing had to be
+   captured**: `Meta/emit_cargo_bazel.py` emits the fetch rules from
+   `Cargo.lock` alone, with no cargo, no network and no CMake, and the three
+   pinned 1.96.1 toolchain components are `http_archive`s merged into one sysroot
+   (no rustup, which fetches at run time). Each crate is then one sandboxed
+   `block-network` action running `cargo --offline --locked` against a vendor dir
+   assembled from Bazel's own fetched crates — checkable rather than merely
+   claimed: deleting one crate from the vendor dir fails the action with "no
+   matching package named `yuv` found" instead of downloading it.
+
+   Consumed one target per crate (`//:<crate>_lib` → its archive + its generated
+   FFI headers), one-for-one with CMake's `target_link_libraries` — **not** a
+   shared `--start-group` over all ten archives, which is what I built first and
+   which broke `ImageDecoder` and `RequestServer`. The shim's "the archives are
+   circular" was false: measured, the cross-crate symbol edge count is **0** for
+   all 10 crates in both directions, and the ~200-700 symbols any two share are
+   each crate's own bundled copy of rust-std. Grouping them let ld satisfy one
+   crate's std symbol from another crate's object and drag that crate's C++ FFI
+   into a binary that never linked it. `ImageDecoder` now defines 28 `rust_*` FFI
+   symbols where `WebContent` defines 328 — the narrowness is in the output, not
+   just the BUILD file. Finding 34 has the whole autopsy.
+
+   Verified by **removal** again: `Build/full/cargo` *and* `Build/full/bin/flapc`
+   moved off the machine, `bazel clean`, all six binaries rebuilt from scratch
+   (4,427 actions), and both `--headless=text` and `--headless=layout-tree` are
+   byte-identical to the CMake reference — with Rust owning URL parsing, the CSS
+   parser, the HTML tokenizer, regex and the text codecs, so a matching layout
+   tree is a real signal. All 14 FFI headers are byte-identical to CMake's, and
+   the 10 archives' normalized symbol tables (~34k symbols) diff **0** against
+   the reference cargo build (only rustc's hash suffixes differ).
 
    Wrapping vcpkg is explicitly a stepping stone, not the destination. It keeps
    vcpkg as the *recipe* (it encodes the patches, configure flags and feature sets
@@ -167,11 +213,16 @@ Honest inventory of what stops this from being a clone-and-build.
    and the real fix is building the deps with Bazel's own toolchain and declared
    sysroot.
 
-   Remaining shim debt: each `vcpkg_lib` still declares the *whole tree* as its
-   header input, so any change in the dep tree re-hashes every C++ compile. The
-   include *paths* are now per-port; the input *set* is not. Making it per-port
-   needs the tree split into per-port outputs, which vcpkg's `.list` manifests
-   would give us (finding 24) — worth doing for a remote cache, invisible locally.
+   Remaining shim debt, and it is the same shape on both sides — over-declared
+   input *sets* with correct *paths*: each `vcpkg_lib` declares the whole vcpkg
+   tree as its header input, so any change in the dep tree re-hashes every C++
+   compile (making it per-port needs the tree split into per-port outputs, which
+   vcpkg's `.list` manifests would give us — finding 24), and every
+   `cargo_crate` declares the whole cargo **workspace's** sources, because cargo
+   resolves the workspace whichever crate you ask for, so touching one `.rs`
+   rebuilds all 11 crates. Both trade a rebuild for correctness, which is the
+   right way round — under-declaring silently reuses a stale artifact. Per-crate
+   source sets need the path-dependency graph read out of the manifests.
 2. **The exec configuration's flags are a duplicated list.** Now that Bazel
    *runs* a tool it built (`//:generate_interpreter_layout`), that tool and the AK
    it links are built in the exec configuration, a separate flag namespace that
@@ -190,17 +241,19 @@ Honest inventory of what stops this from being a clone-and-build.
    cross-compile, at which point the skew is silent. Bazel makes the two
    namespaces explicit and thereby makes the duplication visible; the right fix
    is a shared `.bzl` flag list or a custom toolchain, not more `--host_*` lines.
-3. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm`,
-   `-L/usr/lib/x86_64-linux-gnu`, and `-L`/`-rpath` into
-   `Build/full/vcpkg_installed/`. All three are consequences of (1) plus libdrm
-   being host-provided.
-4. **`flapc` is a prebuilt binary, not a Bazel-built one.** Bazel *runs* it as a
-   declared genrule tool, so the interpreter assembly it emits is genuinely Bazel
-   output — but the compiler binary itself comes from the reference cargo build,
-   because `Libraries/LibJS/Flap` is a Rust crate (51 `.rs` files, a crates.io
-   dep) and building it needs the same rules_rust ring as the prebuilt archives
-   in (1). The other half of that pair, `generate_interpreter_layout`, *is* a real
-   `cc_binary` Bazel builds and runs.
+3. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm`
+   and `-L/usr/lib/x86_64-linux-gnu`, both because libdrm and Vulkan are
+   host-provided. (The `-L`/`-rpath` into `Build/full/vcpkg_installed/` are gone —
+   finding 33.)
+4. **The generated-header shims over `Build/full` are what is left of the CMake
+   dependency.** `Build/full/**/BUILD.bazel` no longer shims any *binary* — the
+   vcpkg `.so`s (finding 33) and the Rust archives + `flapc` (finding 34) are all
+   Bazel-built, and `flapc` is now a real `cargo_binary` Bazel builds *and* runs
+   as a genrule tool, so `interpreter_x86_64.S` depends on no cargo artifact. What
+   remains is a handful of generated *headers* the emitters have not yet taught
+   Bazel to generate, plus `Build/full` itself as the model the emitters read and
+   the baseline the parity harness diffs against. That last one is a
+   converter-development dependency, not a build dependency.
 5. **Running the UI needs manual staging** (the commands above). Ladybird's UI
    spawns its service binaries by looking next to itself, and `share/Lagom` for
    resources. A real Bazel setup would express this with `data` + runfiles;

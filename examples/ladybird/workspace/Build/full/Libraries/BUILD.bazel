@@ -1,14 +1,15 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
-# Generated Rust FFI headers (cargo cxx byproducts materialized here by the
-# reference build). Exposed so <LibUnicode/RustFFI.h> etc. resolve in the Bazel
-# sandbox. includes=["."] makes this dir a header root => <Lib/RustFFI.h> works.
-cc_library(
-    name = "rust_ffi_headers",
-    hdrs = glob(["*/RustFFI.h", "*/*/RustFFI.h"], allow_empty = True),
-    includes = ["."],
-)
+# NOTE: no rust_ffi_headers here any more. The 14 Rust FFI headers used to be
+# globbed out of CMake's build tree (cargo writes them into
+# Build/full/Libraries/<Lib>/ via FFI_OUTPUT_DIR), so every Rust-consuming TU
+# read a CMake artifact. Bazel now BUILDS the crates and declares those headers
+# as the cargo_crate action's own outputs, consumed one target per crate
+# (//:libweb_css_rust_lib etc., cargo_ring.bzl) -- so the include path arrives on
+# the dep edge instead of a glob over a foreign tree. Verified by removal: with
+# this gone AND Build/full/cargo + Build/full/bin/flapc moved off the machine, all
+# six binaries still build and render identically.
 
 # All CMake-generated per-library headers materialized under Build/full/Libraries
 # (generate_export_header -> <Lib>/Export.h, plus other generated .h). Exposed as
