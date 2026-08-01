@@ -47,7 +47,12 @@ AK is the foundation library (38 sources, external deps fmt/simdutf/mimalloc/
 cpptrace, two configure-generated headers). Standing it up end-to-end proved the
 whole loop works on real Ladybird and surfaced the reusable scaffolding:
 
-- **`MODULE.bazel`**: bzlmod, `rules_cc` 0.2.17, `platforms` 1.0.0.
+- **`MODULE.bazel`**: bzlmod, `rules_cc` 0.2.19, `platforms` 1.0.0. (Declared
+  0.2.17 for most of this migration, which was inert: MVS resolved 0.2.19 via
+  `bazel_tools` on Bazel 9.2.0. Caught only on adding
+  `common --check_direct_dependencies=error`, which is now in the `.bazelrc` so
+  the declared and resolved versions cannot drift apart again — see
+  [BAZEL-RULES](BAZEL-RULES.md).)
 - **vcpkg shim**: a `BUILD.bazel` dropped into
   `Build/full/vcpkg_installed/x64-linux-dynamic/` — one `cc_library(:headers)`
   over the whole `include/` tree + `cc_import` per prebuilt `.so`. Consumes

@@ -1,5 +1,12 @@
 common --enable_bzlmod
 
+# A declared version that MVS does not actually resolve to is inert: the floor
+# is usually bazel_tools' (built into Bazel), so .bazelversion is part of the
+# dependency specification. Make the drift fail the build instead of warning --
+# it caught rules_cc 0.2.17 being declared while 0.2.19 resolved on Bazel 9.2.0.
+# See docs/BAZEL-RULES.md, "Versions are resolved, not remembered".
+common --check_direct_dependencies=error
+
 # C++23 everywhere (Ladybird global).
 build --cxxopt=-std=c++23 --host_cxxopt=-std=c++23
 
