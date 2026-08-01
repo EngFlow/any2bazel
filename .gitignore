@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# Local symlink to a target repo used for a migration dry-run (Dolphin)
+dolphin_migration
+
 # Migration artifacts produced by the tool (live beside the target repo)
 model.*.json
 aquery.json
