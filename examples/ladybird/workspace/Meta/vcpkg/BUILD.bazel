@@ -1,0 +1,74 @@
+load("//:vcpkg.bzl", "vcpkg_lib")
+
+package(default_visibility = ["//visibility:public"])
+
+# The 34 external deps, backed by the tree BAZEL builds (//:vcpkg_installed).
+#
+# This replaces the cc_import shims that used to live INSIDE
+# Build/full/vcpkg_installed/x64-linux-dynamic/ -- a package inside the very
+# directory being replaced, so swapping the tree deleted the BUILD file that
+# described it. Nothing under this package names Build/full any more: the labels
+# below are the whole interface between Ladybird and its dependencies.
+#
+# One target per library rather than one big target, so a dep bump invalidates
+# only the TUs that actually depend on it, and so a missing dep edge is a link
+# error instead of silently working (finding 24).
+
+# Shared libs: linked as -l<name> against the tree's lib/ dir.
+SHARED = [
+    "SDL3", "avcodec", "avformat", "avif", "avutil", "brotlicommon", "curl",
+    "brotlidec", "brotlienc", "cpptrace", "crypto", "expat", "fmt",
+    "fontconfig", "freetype", "icudata", "icui18n", "icuuc",
+    "jpeg", "jxl", "mimalloc", "png16", "psl", "simdjson", "simdutf",
+    "sqlite3", "ssl", "swresample", "tommath", "webp",
+    "webpdecoder", "webpdemux", "webpmux", "z",
+]
+
+[
+    vcpkg_lib(name = n, shared = [n], tree = "//:vcpkg_installed")
+    for n in SHARED
+]
+
+# Ports whose headers are NOT at include/ root. CMake passed these as extra
+# -isystem dirs per target; here they ride along with the library that needs
+# them, so the include path arrives with the dep edge instead of as a global
+# flag that every TU gets whether it asked or not.
+vcpkg_lib(
+    name = "harfbuzz",
+    include_dirs = ["include", "include/harfbuzz"],
+    shared = ["harfbuzz"],
+    tree = "//:vcpkg_installed",
+)
+
+vcpkg_lib(
+    name = "skia",
+    include_dirs = ["include", "include/skia"],
+    shared = ["skia"],
+    tree = "//:vcpkg_installed",
+)
+
+vcpkg_lib(
+    name = "xml2",
+    include_dirs = ["include", "include/libxml2"],
+    shared = ["xml2"],
+    tree = "//:vcpkg_installed",
+)
+
+# ANGLE ships its .so with a doubled "lib" prefix (liblibEGL_angle.so), so
+# -llibEGL_angle is the right flag -- the name really does start with "lib".
+vcpkg_lib(name = "libEGL_angle", shared = ["libEGL_angle"], tree = "//:vcpkg_installed")
+
+vcpkg_lib(name = "libGLESv2_angle", shared = ["libGLESv2_angle"], tree = "//:vcpkg_installed")
+
+# Static libs. woff2dec references woff2common symbols, so both archives go on
+# the link line together (woff2common is not itself a Ladybird dep).
+vcpkg_lib(name = "woff2common", static = ["woff2common"], tree = "//:vcpkg_installed")
+
+vcpkg_lib(
+    name = "woff2dec",
+    static = [
+        "woff2dec",
+        "woff2common",
+    ],
+    tree = "//:vcpkg_installed",
+)

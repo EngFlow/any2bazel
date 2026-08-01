@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+
+# The vcpkg checkout itself: ports/, versions/, scripts/ and the vcpkg binary.
+# Still a host escape (gap: it is a checkout, not a fetched archive) -- but
+# declared as an input, so the build action does not read it ambiently.
+filegroup(
+    name = "tree",
+    srcs = glob(["**"], exclude = [
+        "BUILD.bazel",
+        "downloads/**",
+        "installed/**",
+        "packages/**",
+        "buildtrees/**",
+        ".git/**",
+    ], allow_empty = True),
+)

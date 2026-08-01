@@ -1,0 +1,122 @@
+common --enable_bzlmod
+
+# C++23 everywhere (Ladybird global).
+build --cxxopt=-std=c++23 --host_cxxopt=-std=c++23
+
+# Global warning/feature flags from Meta/CMake/compile_options.cmake, applied
+# by CMake to every target. Mirror them as global copts.
+build --cxxopt=-Wcast-qual --cxxopt=-Wformat=2 --cxxopt=-Wimplicit-fallthrough
+build --cxxopt=-Wlogical-op --cxxopt=-Wmissing-declarations
+build --cxxopt=-Wmissing-field-initializers --cxxopt=-Wsuggest-override
+build --cxxopt=-Wno-expansion-to-defined --cxxopt=-Wno-invalid-offsetof
+build --cxxopt=-Wno-maybe-uninitialized --cxxopt=-Wno-shorten-64-to-32
+build --cxxopt=-Wno-unknown-warning-option --cxxopt=-Wno-unused-command-line-argument
+build --cxxopt=-Wno-user-defined-literals --cxxopt=-Werror --cxxopt=-Wall --cxxopt=-Wextra
+build --cxxopt=-fno-exceptions --cxxopt=-ffp-contract=off --cxxopt=-fstrict-flex-arrays=2
+build --cxxopt=-fstack-protector-strong --cxxopt=-fsigned-char
+build --cxxopt=-ftrivial-auto-var-init=zero --cxxopt=-fno-semantic-interposition
+build --cxxopt=-fvisibility-inlines-hidden --cxxopt=-Wno-literal-suffix
+build --cxxopt=-Wno-unqualified-std-cast-call --cxxopt=-Wvla --cxxopt=-Wno-array-bounds
+build --cxxopt=-Wno-stringop-overflow --cxxopt=-Wno-dangling-reference
+build --cxxopt=-fstack-clash-protection
+
+# Global include roots (repo-root-relative includes like <AK/Foo.h>).
+
+build --cxxopt=-I. --cxxopt=-ILibraries --cxxopt=-IServices
+# NOTE: deliberately NO global -IBuild/full* include roots. They were here to
+# mirror CMake's build-dir include, but they let any TU include any
+# CMake-generated header without declaring it -- the same undeclared-input hole
+# Bazel is supposed to catch (see finding 1). Generated headers now come only
+# from declared deps (the per-package genrule outputs + the header-root
+# cc_librarys under Build/full/*/BUILD.bazel, which ARE declared).
+# Verified: //:ladybird + all 5 services build, and --headless=text and
+# --headless=layout-tree are byte-identical to the CMake reference without them.
+# NOTE: deliberately NO global -isystem for the vcpkg include root. It used to be
+# here (mirroring CMake's single -isystem) and it meant every TU could include any
+# third-party header without declaring the dep. The vcpkg include dirs now ride on
+# the //Meta/vcpkg:<port> dep edges as system_includes, so a TU that includes
+# <skia/...> has to depend on skia -- and third-party headers are still -isystem,
+# so -Werror stays suppressed inside them.
+
+# NDEBUG (CMake RelWithDebInfo).
+# Reference build is CMake RelWithDebInfo (-O2 -g). Match its optimization so
+# optimization-sensitive diagnostics (e.g. -Werror=maybe-musttail-local-addr in
+# LibWasm) and codegen agree.
+build --cxxopt=-O2 --cxxopt=-g
+build --cxxopt=-DNDEBUG
+# Global defines from Meta/CMake/compile_options.cmake (every TU).
+build --cxxopt=-DUSE_VULKAN=1 --cxxopt=-DUSE_FONTCONFIG=1
+build --cxxopt=-DUSE_VULKAN_DMABUF_IMAGES=1 --cxxopt=-DENABLE_COMPILETIME_FORMAT_CHECK
+build --cxxopt=-D_FILE_OFFSET_BITS=64 --cxxopt=-D_FORTIFY_SOURCE=3
+build --cxxopt=-fstack-protector-strong --cxxopt=-march=native --cxxopt=-fdiagnostics-color=always
+build --copt=-fPIC
+
+# Let ld resolve the transitive DT_NEEDED of the vcpkg .so files
+# (avif->libyuv, cpptrace->libdwarf, ...) which are not themselves link inputs.
+build --linkopt=-Wl,--allow-shlib-undefined
+# The -L / -rpath-link / -rpath into the vcpkg lib dir are GONE: each
+# //Meta/vcpkg:<port> dep contributes them itself, pointing at Bazel's own output
+# tree, and declares that tree as an input of the link so the sandbox has it.
+# Every Rust staticlib bundles its OWN copy of the rust allocator shim
+# (__rust_alloc/__rust_dealloc/__rust_realloc/__rust_alloc_zeroed), so any target
+# linking two crates sees each of those four defined twice. The definitions are
+# identical, and there is no way to deduplicate them from outside cargo: the
+# reference build sidesteps it by linking each crate into its own .so.
+# Still required after finding 34 -- checked by deleting it: //:Compositor then
+# fails with "multiple definition of `__rustc::__rust_alloc'" between
+# liburl_rust and libregex_rust. (The comment here used to blame the combined
+# archive that finding 34 deleted; the flag outlived that explanation, which is
+# why it is worth re-testing a flag rather than inheriting its rationale.)
+build --linkopt=-Wl,--allow-multiple-definition
+# System library search path for find_package deps (Qt6, GLX/OpenGL).
+build --linkopt=-L/usr/lib/x86_64-linux-gnu
+# System includes for find_package deps that are still host-provided (libdrm).
+# Qt6 no longer appears here: it comes from rules_qt as a real Bazel dep.
+build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm
+
+# --- exec (host) configuration ---------------------------------------------
+# Every flag above is a --cxxopt/--copt/--linkopt, which Bazel applies only to
+# the TARGET configuration. //:generate_interpreter_layout is run as a genrule
+# tool, so Bazel builds it (and the AK it links) in the EXEC configuration,
+# a separate flag namespace that would otherwise get none of the above -- not
+# even -I. , so <AK/kmalloc.h> would not resolve.
+#
+# Mirroring is a CORRECTNESS requirement here, not a convenience: that tool
+# prints struct offsets/sizes that flapc bakes into the interpreter assembly,
+# so it must see the same headers with the same defines (NDEBUG, _FORTIFY_SOURCE,
+# USE_VULKAN, ...) and the same ABI flags as the code that will use those
+# offsets. A host/target flag skew here is silent memory corruption at run time,
+# which is exactly what CMake's single flat flag namespace hides: there, "host
+# tool" and "target library" are compiled by the same variables by default.
+# The exec config defaults to --host_compilation_mode=opt, whose opt feature
+# adds -D_FORTIFY_SOURCE=1; our -D_FORTIFY_SOURCE=3 then collides (redefined,
+# and -Werror). Put the exec config in the same compilation mode as the target
+# build so the two flag namespaces really do agree.
+build --host_compilation_mode=fastbuild
+
+build --host_cxxopt=-Wcast-qual --host_cxxopt=-Wformat=2 --host_cxxopt=-Wimplicit-fallthrough
+build --host_cxxopt=-Wlogical-op --host_cxxopt=-Wmissing-declarations
+build --host_cxxopt=-Wmissing-field-initializers --host_cxxopt=-Wsuggest-override
+build --host_cxxopt=-Wno-expansion-to-defined --host_cxxopt=-Wno-invalid-offsetof
+build --host_cxxopt=-Wno-maybe-uninitialized --host_cxxopt=-Wno-shorten-64-to-32
+build --host_cxxopt=-Wno-unknown-warning-option --host_cxxopt=-Wno-unused-command-line-argument
+build --host_cxxopt=-Wno-user-defined-literals --host_cxxopt=-Werror --host_cxxopt=-Wall --host_cxxopt=-Wextra
+build --host_cxxopt=-fno-exceptions --host_cxxopt=-ffp-contract=off --host_cxxopt=-fstrict-flex-arrays=2
+build --host_cxxopt=-fstack-protector-strong --host_cxxopt=-fsigned-char
+build --host_cxxopt=-ftrivial-auto-var-init=zero --host_cxxopt=-fno-semantic-interposition
+build --host_cxxopt=-fvisibility-inlines-hidden --host_cxxopt=-Wno-literal-suffix
+build --host_cxxopt=-Wno-unqualified-std-cast-call --host_cxxopt=-Wvla --host_cxxopt=-Wno-array-bounds
+build --host_cxxopt=-Wno-stringop-overflow --host_cxxopt=-Wno-dangling-reference
+build --host_cxxopt=-fstack-clash-protection
+build --host_cxxopt=-I. --host_cxxopt=-ILibraries --host_cxxopt=-IServices
+build --host_cxxopt=-O2 --host_cxxopt=-g
+build --host_cxxopt=-DNDEBUG
+build --host_cxxopt=-DUSE_VULKAN=1 --host_cxxopt=-DUSE_FONTCONFIG=1
+build --host_cxxopt=-DUSE_VULKAN_DMABUF_IMAGES=1 --host_cxxopt=-DENABLE_COMPILETIME_FORMAT_CHECK
+build --host_cxxopt=-D_FILE_OFFSET_BITS=64 --host_cxxopt=-D_FORTIFY_SOURCE=3
+build --host_cxxopt=-fstack-protector-strong --host_cxxopt=-march=native --host_cxxopt=-fdiagnostics-color=always
+build --host_copt=-fPIC
+build --host_linkopt=-Wl,--allow-shlib-undefined
+build --host_linkopt=-Wl,--allow-multiple-definition
+build --host_linkopt=-L/usr/lib/x86_64-linux-gnu
+build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm

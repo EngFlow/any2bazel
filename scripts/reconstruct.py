@@ -135,9 +135,31 @@ def _java_compile_group(args, repo_root: str) -> "CompileGroup":
                         sources=tuple(sorted(sources)), flags=tuple(flags))
 
 
+_LINK_INPUT_LIB_EXTS = (".a", ".lo", ".lib", ".so", ".dylib")
+
+
+def _lib_identity(arg) -> Optional[str]:
+    """Abstract dep name for an archive/shared-lib FILE link input:
+    'libcatch2_main.a' -> 'catch2_main', 'libfmt.so.12' -> 'fmt'. None if `arg`
+    is a flag/object/output, not a library file. Handles versioned solibs
+    (libfmt.so.12.2.0) by taking the stem before the first dot."""
+    if arg.startswith("-"):
+        return None
+    base = os.path.basename(arg)
+    is_lib = base.endswith(_LINK_INPUT_LIB_EXTS) or ".so." in base
+    if not is_lib:
+        return None
+    stem = base.split(".")[0]
+    if stem.startswith("lib"):
+        stem = stem[3:]
+    return stem or None
+
+
 def _archive_identity(arg) -> Optional[str]:
     """Abstract dep name for an archive FILE link input: 'libcatch2_main.a' ->
-    'catch2_main'. None if `arg` is a flag/object/output, not an archive."""
+    'catch2_main'. None if `arg` is a flag/object/output, not an archive.
+    (Kept for the argv path, which historically only saw archives; shared-lib
+    inputs come through _lib_identity on the link action's declared inputs.)"""
     if arg.startswith("-") or not arg.endswith(_ARCHIVE_EXTS):
         return None
     stem = os.path.basename(arg).split(".")[0]
@@ -153,9 +175,18 @@ def _is_external_path(arg) -> bool:
 
 
 def _infer_deps_from_link(actions, existing) -> List[Dependency]:
-    """Infer link deps from link-action argv (Bazel only has argv). -l<name> ->
-    external system lib; archive file inputs -> external if under external/, else
-    internal. Dedup against names already present."""
+    """Infer link deps from a link action's argv AND its declared library inputs
+    (Bazel only annotates argv + inputs, no resolved dep list like CMake).
+
+      * argv `-l<name>`            -> external system lib
+      * argv archive file token    -> external if under external/, else internal
+      * declared INPUT lib file    -> archive/solib fed to the linker by path
+                                       rather than -l (the common Bazel case);
+                                       external if under external/, else internal
+
+    Reading the declared inputs is what makes statically-linked archives and
+    external solibs visible even when they never appear as a -l argv token.
+    Dedup against names already present."""
     deps: List[Dependency] = list(existing)
     have = {d.name for d in deps}
     for act in actions:
@@ -170,6 +201,11 @@ def _infer_deps_from_link(actions, existing) -> List[Dependency]:
             ident = _archive_identity(a)
             if ident and ident not in have:
                 deps.append(Dependency(ident, external=_is_external_path(a)))
+                have.add(ident)
+        for path in act.inputs:
+            ident = _lib_identity(path)
+            if ident and ident not in have:
+                deps.append(Dependency(ident, external=_is_external_path(path)))
                 have.add(ident)
     return deps
 

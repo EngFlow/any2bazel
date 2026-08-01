@@ -1,0 +1,20 @@
+diff --git a/Meta/Generators/libweb_bindings/to_idl_value.py b/Meta/Generators/libweb_bindings/to_idl_value.py
+index ef890dbb1b..9e9bb92767 100644
+--- a/Meta/Generators/libweb_bindings/to_idl_value.py
++++ b/Meta/Generators/libweb_bindings/to_idl_value.py
+@@ -189,7 +189,14 @@ def dictionaries_in_dependency_order(dictionaries: List[Dictionary], context: Ge
+             raise RuntimeError(f"Dictionary '{dictionary.name}' depends on itself")
+ 
+         visiting.add(dictionary.name)
+-        for dependency_name in dependency_names_for(dictionary):
++        # sorted(): dependency_names_for returns a SET, so iterating it visits
++        # sibling dependencies in hash order, and the emission order of two
++        # dictionaries that do not depend on each other (AudioConfiguration and
++        # VideoConfiguration, both reached from MediaConfiguration) then varies
++        # with PYTHONHASHSEED. A topological sort only constrains dependency
++        # before dependent; the order among independent siblings has to be pinned
++        # separately, or the generator is not reproducible.
++        for dependency_name in sorted(dependency_names_for(dictionary)):
+             dependency = local_dictionaries.get(dependency_name)
+             if dependency is not None:
+                 visit(dependency)

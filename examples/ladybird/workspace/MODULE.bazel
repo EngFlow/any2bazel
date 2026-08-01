@@ -1,0 +1,309 @@
+module(name = "ladybird", version = "0.0.0")
+
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# Bazel 9 removed the native sh_binary; //Meta:vcpkg_build is one.
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
+# Qt6 via rules_qt (kklochkov). Its qt.local_repo discovers the host Qt through
+# qmake, so moc/rcc and the Qt cc_library targets all come from one 6.10.2 SDK
+# -- the version Ladybird's CMake asks for -- and the moc rule reads its include
+# dirs from the Qt CcInfo compilation context instead of hand-passed -I flags.
+# rules_qt 2.0.1 is NOT on the BCR (the BCR's "rules_qt" is Vertexwahn's
+# unrelated rules_qt6), so point the dep at the upstream release tarball. This is
+# stock upstream v2.0.1 -- no local patches -- so any checkout can fetch it.
+bazel_dep(name = "rules_qt", version = "2.0.1")
+archive_override(
+    module_name = "rules_qt",
+    urls = ["https://github.com/kklochkov/rules_qt/archive/refs/tags/v2.0.1.tar.gz"],
+    strip_prefix = "rules_qt-2.0.1",
+    integrity = "sha256-RLp8ZJu4VVgNqssn5q5WnsE1BH4yn6CvIHAAOWqnvpM=",
+)
+
+qt = use_extension("@rules_qt//qt:extensions.bzl", "qt")
+qt.local_repo(
+    name = "qt6_local",
+    paths = {"linux-x86_64": "/usr/lib/qt6"},
+)
+qt.active_sdk(name = "qt", repo = "qt6_local")
+use_repo(qt, "qt")
+register_toolchains("@qt//:qt_linux_x86_64_toolchain")
+
+# ---------------------------------------------------------------------------
+# Ring 2: the vcpkg dependency tree. Bazel owns FETCHING (here); vcpkg is still
+# the recipe that builds them (//:vcpkg_installed, see vcpkg.bzl).
+#
+# The 76 distfiles, their URLs and their SHA512s are all GENERATED from a capture
+# of what vcpkg actually downloads (Meta/vcpkg_assets.tsv), by
+# Meta/emit_vcpkg_bazel.py -- including the use_repo list below, because bzlmod
+# needs every extension-created repo named here and 76 hand-kept names would
+# drift. Regenerate all four files with:
+#
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --distfiles > vcpkg_distfiles.bzl
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --index     > vcpkg_index.bzl
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --extension > vcpkg_extension.bzl
+#   python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --use-repo   # paste below
+#
+# None of those need vcpkg, CMake or the network: the capture IS the pin.
+vcpkg_deps = use_extension("//:vcpkg_extension.bzl", "vcpkg_deps")
+use_repo(
+    vcpkg_deps,
+    'vcpkg_AOMediaCodec_libavif_v1_4_2_tar_gz_cbf318278840',
+    'vcpkg_DetectSSE2_cmake_219a4c8591ee',
+    'vcpkg_GNOME_libxml2_v2_15_3_tar_gz_f65df793fca5',
+    'vcpkg_GPUOpen_LibrariesAndSDKs_VulkanMemoryAllocator_v3_4_0_tar_gz_563acbcd8912',
+    'vcpkg_KhronosGroup_EGL_Registry_3ae2b7c48690d2ce13cc6db3db02dfc0572be65e_tar_gz_c7b09ded4964',
+    'vcpkg_KhronosGroup_OpenGL_Registry_0b449b97cdf1043eef5e1f0e235cbbab6ec10c86_tar_gz_148e1bfe4cc1',
+    'vcpkg_KhronosGroup_Vulkan_Headers_vulkan_sdk_1_4_350_1_tar_gz_eee702ee5ff4',
+    'vcpkg_WebKitCompilerFlags_cmake_8b281ffcf920',
+    'vcpkg_WebKitMacros_cmake_565175443d5d',
+    'vcpkg_abseil_abseil_cpp_20260107_1_tar_gz_f5012885d6b6',
+    'vcpkg_automake_1_17_tar_gz_11357dfab8cb',
+    'vcpkg_bzip2_1_0_8_tar_gz_083f5e675d73',
+    'vcpkg_cisco_openh264_v2_6_0_tar_gz_26a03acde715',
+    'vcpkg_cmake_4_4_0_linux_x86_64_tar_gz_3df4aaa128a4',
+    'vcpkg_curl_curl_curl_8_21_0_tar_gz_0ab6c99c3d5b',
+    'vcpkg_davea42_libdwarf_code_v2_3_1_tar_gz_e8eb74c622ce',
+    'vcpkg_dbus_dbus_dbus_1_16_2_tar_gz_8ad3ab55bf6e',
+    'vcpkg_facebook_zstd_v1_5_7_tar_gz_26e441267305',
+    'vcpkg_fastfloat_fast_float_v8_2_10_tar_gz_eec563358117',
+    'vcpkg_ffmpeg_ffmpeg_n7_1_1_tar_gz_6b9a5ee501be',
+    'vcpkg_fmt_backport_4813_patch_afda8fdfcdcb',
+    'vcpkg_fmtlib_fmt_12_2_0_tar_gz_5ac2ba0f54a4',
+    'vcpkg_fontconfig_fontconfig_2_17_1_tar_gz_8e05cad63cd0',
+    'vcpkg_freetype_freetype_VER_2_13_3_tar_gz_fccfaa15eb79',
+    'vcpkg_giflib_6_1_3_tar_gz_fb1d63196947',
+    'vcpkg_gn_linux_amd64_zip_d49575bd383b',
+    'vcpkg_gni_to_cmake_py_cf9dab1b59cd',
+    'vcpkg_google_angle_79ac1a8cd767a32cce6401203e20c4bd4ca4d539_tar_gz_a3d5d09460f0',
+    'vcpkg_google_brotli_v1_2_0_tar_gz_f94542afd2ec',
+    'vcpkg_google_highway_1_4_0_tar_gz_819422857d6a',
+    'vcpkg_google_skia_e7c90ecca9444fe09598f1630ab7cee2c0ee027a_tar_gz_f52286fcac1d',
+    'vcpkg_google_woff2_v1_0_2_tar_gz_c788bba1530a',
+    'vcpkg_google_wuffs_mirror_release_c_v0_3_4_tar_gz_d22136a1adf3',
+    'vcpkg_gperf_3_3_tar_gz_246b75b8ce7d',
+    'vcpkg_harfbuzz_harfbuzz_10_2_0_tar_gz_697205a571bb',
+    'vcpkg_icu4c_78_3_sources_tgz_04a49455e148',
+    'vcpkg_include_CMakeLists_txt_a7ddf3c6df75',
+    'vcpkg_jeremy_rifkin_cpptrace_v1_0_2_tar_gz_4ae394fb3c21',
+    'vcpkg_libedit_20240808_3_1_tar_gz_b11d64947f94',
+    'vcpkg_libexpat_libexpat_R_2_8_2_tar_gz_e60e6d6ae9d0',
+    'vcpkg_libidn2_2_3_7_tar_gz_eab5702bc0ba',
+    'vcpkg_libjpeg_turbo_libjpeg_turbo_3_2_0_tar_gz_1ce063e9e126',
+    'vcpkg_libjxl_libjxl_v0_11_2_tar_gz_a7e1f7d060b3',
+    'vcpkg_libpng_1_6_58_apng_patch_gz_95a6f5bb7148',
+    'vcpkg_libproxy_libproxy_0_4_18_tar_gz_1148d688a9f0',
+    'vcpkg_libpsl_public_suffix_list_0ed17e_dat_7969c40b0600',
+    'vcpkg_libsdl_org_SDL_release_3_4_12_tar_gz_fc0a55ca01c3',
+    'vcpkg_libtiff_libtiff_v4_7_2_tar_gz_c4dcde3c79e5',
+    'vcpkg_libtom_libtommath_v1_3_0_tar_gz_3dbd7053a670',
+    'vcpkg_libunistring_1_2_tar_xz_5fbb5a0a864d',
+    'vcpkg_libuuid_1_0_3_tar_gz_77488caccc66',
+    'vcpkg_madler_zlib_v1_3_1_tar_gz_8c9642495baf',
+    'vcpkg_meson_1_9_0_tar_gz_ecd69b6734be',
+    'vcpkg_microsoft_mimalloc_v2_2_7_tar_gz_19f5481c9882',
+    'vcpkg_mm2_Little_CMS_lcms2_19_1_tar_gz_1b2781ed8898',
+    'vcpkg_nghttp2_nghttp2_v1_69_0_tar_gz_1029fb86935a',
+    'vcpkg_ngtcp2_nghttp3_v1_17_0_tar_gz_23d85a2abfa8',
+    'vcpkg_ngtcp2_ngtcp2_v1_24_0_tar_gz_04a5762d6eac',
+    'vcpkg_ngtcp2_sfparse_f2046eaa1acba7c5467399b1e1e1f354d22d1f48_tar_gz_b3cbcce6d96d',
+    'vcpkg_openssl_openssl_openssl_3_6_3_tar_gz_a89c08101fa1',
+    'vcpkg_patchelf_0_19_0_x86_64_tar_gz_2a65c9cbdddc',
+    'vcpkg_pdfjs_5_6_205_dist_zip_66fecdb8a80d',
+    'vcpkg_pkgconf_pkgconf_pkgconf_3_0_3_tar_gz_4e49bb7b10c6',
+    'vcpkg_pnggroup_libpng_v1_6_58_tar_gz_65f54d805e1f',
+    'vcpkg_rockdaboot_libpsl_0_21_5_tar_gz_d8e224b2ce5d',
+    'vcpkg_simdjson_simdjson_v4_6_4_tar_gz_003b96daab30',
+    'vcpkg_simdutf_simdutf_v9_0_0_tar_gz_0c74226247cb',
+    'vcpkg_sqlite_autoconf_3530300_tar_gz_355a8db490ec',
+    'vcpkg_tukaani_project_xz_v5_8_3_tar_gz_8fb5e6a13397',
+    'vcpkg_videolan_dav1d_1_5_3_tar_gz_8d976b931352',
+    'vcpkg_webmproject_libvpx_v1_16_0_tar_gz_07f5e352411d',
+    'vcpkg_webmproject_libwebp_v1_6_0_tar_gz_298e0ad4c093',
+    'vcpkg_xiph_ogg_v1_3_6_tar_gz_c247e1da8b12',
+    'vcpkg_xiph_opus_v1_5_2_tar_gz_4ffefd9c0356',
+    'vcpkg_xiph_theora_v1_2_0_tar_gz_b2aac15528f0',
+    'vcpkg_xiph_vorbis_v1_3_7_tar_gz_bfb6f5dbfd49',
+)
+
+# ---------------------------------------------------------------------------
+# Ring 2, part 3: the Rust crates. Bazel owns FETCHING (here) and BUILDING
+# (//:rust and friends, see cargo.bzl); cargo is still the recipe.
+#
+# The 154 crates.io crates, their URLs and their SHA256s are all GENERATED by
+# Meta/emit_cargo_bazel.py from the two Cargo.lock files -- plus the three
+# rust-toolchain.toml components, and the use_repo list below, which bzlmod
+# requires to name every extension-created repo and which 157 hand-kept names
+# would silently drift from. Regenerate with:
+#
+#   python3 Meta/emit_cargo_bazel.py --crates    > cargo_crates.bzl
+#   python3 Meta/emit_cargo_bazel.py --index     > cargo_index.bzl
+#   python3 Meta/emit_cargo_bazel.py --extension > cargo_extension.bzl
+#   python3 Meta/emit_cargo_bazel.py --ring      > cargo_ring.bzl
+#   python3 Meta/emit_cargo_bazel.py --use-repo   # paste below
+#
+# Unlike the vcpkg equivalent this needed no capture at all: Cargo.lock already
+# carries a sha256 for every registry crate and crates.io's URL is a pure
+# function of (name, version), so the pin was already in the repo.
+cargo_deps = use_extension("//:cargo_extension.bzl", "cargo_deps")
+use_repo(
+    cargo_deps,
+    'crate_adblock_0_12_5',
+    'crate_addr_0_15_6',
+    'crate_aho_corasick_1_1_4',
+    'crate_allocator_api2_0_2_21',
+    'crate_anstream_1_0_0',
+    'crate_anstyle_1_0_14',
+    'crate_anstyle_parse_1_0_0',
+    'crate_anstyle_query_1_1_5',
+    'crate_anstyle_wincon_3_0_11',
+    'crate_anyhow_1_0_102',
+    'crate_arbitrary_1_4_2',
+    'crate_arrayvec_0_7_6',
+    'crate_autocfg_1_5_0',
+    'crate_base64_0_22_1',
+    'crate_bitflags_2_11_0',
+    'crate_bumpalo_3_20_2',
+    'crate_calendrical_calculations_0_2_4',
+    'crate_cbindgen_0_29_2',
+    'crate_cfg_if_1_0_4',
+    'crate_chardetng_1_0_0',
+    'crate_clap_4_6_0',
+    'crate_clap_builder_4_6_0',
+    'crate_clap_lex_1_1_0',
+    'crate_colorchoice_1_0_5',
+    'crate_core_maths_0_1_1',
+    'crate_cranelift_bforest_0_116_1',
+    'crate_cranelift_bitset_0_116_1',
+    'crate_cranelift_codegen_0_116_1',
+    'crate_cranelift_codegen_meta_0_116_1',
+    'crate_cranelift_codegen_shared_0_116_1',
+    'crate_cranelift_control_0_116_1',
+    'crate_cranelift_entity_0_116_1',
+    'crate_cranelift_frontend_0_116_1',
+    'crate_cranelift_isle_0_116_1',
+    'crate_cranelift_module_0_116_1',
+    'crate_cranelift_native_0_116_1',
+    'crate_displaydoc_0_2_5',
+    'crate_either_1_16_0',
+    'crate_encoding_rs_0_8_35',
+    'crate_equivalent_1_0_2',
+    'crate_errno_0_3_14',
+    'crate_fARM64_0_0_2',
+    'crate_fallible_iterator_0_3_0',
+    'crate_fastrand_2_4_0',
+    'crate_flatbuffers_25_12_19',
+    'crate_foldhash_0_1_5',
+    'crate_form_urlencoded_1_2_2',
+    'crate_getrandom_0_4_2',
+    'crate_gimli_0_31_1',
+    'crate_hashbrown_0_14_5',
+    'crate_hashbrown_0_15_5',
+    'crate_hashbrown_0_16_1',
+    'crate_heck_0_5_0',
+    'crate_iced_x86_1_21_0',
+    'crate_icu_calendar_2_2_1',
+    'crate_icu_calendar_data_2_2_0',
+    'crate_icu_collections_2_2_0',
+    'crate_icu_locale_2_2_0',
+    'crate_icu_locale_core_2_2_0',
+    'crate_icu_locale_data_2_2_0',
+    'crate_icu_normalizer_2_2_0',
+    'crate_icu_normalizer_data_2_2_0',
+    'crate_icu_properties_2_2_0',
+    'crate_icu_properties_data_2_2_0',
+    'crate_icu_provider_2_2_0',
+    'crate_id_arena_2_3_0',
+    'crate_idna_1_1_0',
+    'crate_idna_adapter_1_2_2',
+    'crate_indexmap_2_13_1',
+    'crate_is_terminal_polyfill_1_70_2',
+    'crate_itertools_0_13_0',
+    'crate_itoa_1_0_18',
+    'crate_ixdtf_0_6_5',
+    'crate_lazy_static_1_5_0',
+    'crate_leb128fmt_0_1_0',
+    'crate_libc_0_2_184',
+    'crate_libm_0_2_16',
+    'crate_linux_raw_sys_0_12_1',
+    'crate_litemap_0_8_2',
+    'crate_log_0_4_29',
+    'crate_memchr_2_8_0',
+    'crate_num_bigint_0_4_6',
+    'crate_num_integer_0_1_46',
+    'crate_num_traits_0_2_19',
+    'crate_once_cell_1_21_4',
+    'crate_once_cell_polyfill_1_70_2',
+    'crate_percent_encoding_2_3_2',
+    'crate_potential_utf_0_1_5',
+    'crate_precomputed_hash_0_1_1',
+    'crate_prettyplease_0_2_37',
+    'crate_proc_macro2_1_0_106',
+    'crate_psl_2_1_210',
+    'crate_psl_types_2_0_11',
+    'crate_quote_1_0_45',
+    'crate_r_efi_6_0_0',
+    'crate_regalloc2_0_11_2',
+    'crate_regex_1_12_3',
+    'crate_regex_automata_0_4_14',
+    'crate_regex_syntax_0_8_10',
+    'crate_rustc_hash_1_1_0',
+    'crate_rustc_hash_2_1_2',
+    'crate_rustc_version_0_4_1',
+    'crate_rustix_1_1_4',
+    'crate_seahash_4_1_0',
+    'crate_semver_1_0_28',
+    'crate_serde_1_0_228',
+    'crate_serde_core_1_0_228',
+    'crate_serde_derive_1_0_228',
+    'crate_serde_json_1_0_149',
+    'crate_serde_spanned_1_1_1',
+    'crate_smallvec_1_15_1',
+    'crate_stable_deref_trait_1_2_1',
+    'crate_strsim_0_11_1',
+    'crate_syn_2_0_117',
+    'crate_synstructure_0_13_2',
+    'crate_target_lexicon_0_13_5',
+    'crate_tempfile_3_27_0',
+    'crate_thiserror_1_0_69',
+    'crate_thiserror_impl_1_0_69',
+    'crate_tinystr_0_8_3',
+    'crate_toml_0_9_12_spec_1_1_0',
+    'crate_toml_datetime_0_7_5_spec_1_1_0',
+    'crate_toml_parser_1_1_2_spec_1_1_0',
+    'crate_toml_writer_1_1_1_spec_1_1_0',
+    'crate_unicode_ident_1_0_24',
+    'crate_unicode_xid_0_2_6',
+    'crate_url_2_5_8',
+    'crate_utf8_iter_1_0_4',
+    'crate_utf8parse_0_2_2',
+    'crate_wasip2_1_0_2_wasi_0_2_9',
+    'crate_wasip3_0_4_0_wasi_0_3_0_rc_2026_01_06',
+    'crate_wasm_encoder_0_244_0',
+    'crate_wasm_metadata_0_244_0',
+    'crate_wasmparser_0_244_0',
+    'crate_windows_link_0_2_1',
+    'crate_windows_sys_0_61_2',
+    'crate_winnow_0_7_15',
+    'crate_winnow_1_0_1',
+    'crate_wit_bindgen_0_51_0',
+    'crate_wit_bindgen_core_0_51_0',
+    'crate_wit_bindgen_rust_0_51_0',
+    'crate_wit_bindgen_rust_macro_0_51_0',
+    'crate_wit_component_0_244_0',
+    'crate_wit_parser_0_244_0',
+    'crate_writeable_0_6_3',
+    'crate_yoke_0_8_2',
+    'crate_yoke_derive_0_8_2',
+    'crate_yuv_0_8_13',
+    'crate_zerofrom_0_1_7',
+    'crate_zerofrom_derive_0_1_7',
+    'crate_zerotrie_0_2_4',
+    'crate_zerovec_0_11_6',
+    'crate_zerovec_derive_0_11_3',
+    'crate_zmij_1_0_21',
+    'rust_cargo_1_96_1',
+    'rust_rust_std_1_96_1',
+    'rust_rustc_1_96_1',
+)

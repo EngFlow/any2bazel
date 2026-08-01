@@ -266,6 +266,21 @@ def extract(aquery_path: str, repo_root: str) -> CanonicalModel:
         elif mnem in _LINK:
             primary = outs[0] if outs else ""
             t = target_for(name, _kind_from_link(mnem, primary))
+            # Record link INPUTS (archive/solib artifacts from the input depset),
+            # not just argv. Bazel feeds many link deps to the linker as depset
+            # inputs by PATH rather than as -l/-L argv tokens (e.g. statically
+            # linked .a archives, and external solibs), so dep inference from
+            # argv alone misses them. Capturing the input libs makes the
+            # external-dep closure observable per-target, not only when a dep
+            # happens to appear as a -l flag. (Object inputs are filtered by the
+            # differ; only archive/shared-lib inputs become deps.)
+            link_inputs = depsets.resolve(action.get("inputDepSetIds", []))
+            lib_inputs = tuple(
+                p for p in (artifacts.get(i, "") for i in link_inputs)
+                if p.endswith((".a", ".lo", ".lib", ".so", ".dylib")) or ".so." in p)
+            t.actions.append(Action(mnemonic=mnem, arguments=args,
+                                    inputs=lib_inputs, outputs=outs))
+            continue
         elif mnem in _JAVAC:
             # a java_library produces a jar (an archive of classes) -> STATIC.
             # Record under the neutral 'JavaCompile' mnemonic the differ groups on.
