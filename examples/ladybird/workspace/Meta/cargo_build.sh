@@ -32,7 +32,8 @@
 #      and fails an action that does not write a declared one. (That check is how
 #      HTMLTokenizerRustFFI.h -- written by a dependency's build script, declared
 #      by nobody -- turned up.) Which crate's copy of a colliding header name
-#      wins is note 4, and it is the subtlest thing in this file.
+#      wins is sync_ffi_headers in cargo_vendor.sh, and it is the subtlest thing
+#      in this ring.
 #   3. **The cargo invocation mirrors CMake's exactly**: same subcommand
 #      (`cargo rustc --lib`), same --target/--release, same trailing rustc flags
 #      (-Cdefault-linker-libraries=yes -D warnings). Not for tidiness -- those
@@ -60,11 +61,7 @@ source "${CARGO_VENDOR_LIB:?path to cargo_vendor.sh}"
 FEATURE_FLAGS=()
 [ -n "$FEATURES" ] && FEATURE_FLAGS=("--features=$FEATURES")
 
-# FFI_OUTPUT_DIR is a SCRATCH dir, not the declared output dir -- see note 4
-# below for why that distinction is load-bearing.
-FFI_SCRATCH="$WORK/ffi"
-mkdir -p "$FFI_SCRATCH" "$FFI_OUT"
-export FFI_OUTPUT_DIR="$FFI_SCRATCH"
+mkdir -p "$FFI_OUT"
 
 cd "$SRC"
 "$SYSROOT/bin/cargo" rustc \
@@ -82,49 +79,7 @@ cd "$SRC"
 
 cp "$TARGET_DIR/$TRIPLE/release/lib$CRATE.a" "$OUT_LIB"
 
-# --- note 4: resolve each header from the OWNING crate's OUT_DIR -------------
-#
-# $FFI_OUTPUT_DIR is shared by every build script in the crate's dependency
-# graph, and the header names COLLIDE: six crates each emit a file called
-# `RustFFI.h`. liburl_rust path-depends on libregex_rust, so building liburl_rust
-# runs BOTH build scripts against the same FFI_OUTPUT_DIR and the surviving
-# RustFFI.h is whichever ran last -- we shipped libregex_rust's URL header for
-# one build and it was only caught by byte-comparing against CMake's tree.
-#
-# CMake hits this too, and has a whole script for it
-# (Meta/CMake/sync_rust_ffi_header.cmake): after cargo runs it copies the header
-# out of the OWNING crate's own OUT_DIR, found via
-# `build/<crate>-*/root-output`, and that copy is what the compiler sees. Mirror
-# that: prefer the crate's own OUT_DIR, and fall back to the shared scratch dir
-# for a header written by a DEPENDENCY's build script (libweb_rust's
-# HTMLTokenizerRustFFI.h comes from libweb_html_tokenizer and collides with
-# nothing, which is exactly why CMake never noticed it was undeclared).
-BUILD_DIR="$TARGET_DIR/$TRIPLE/release/build"
-missing=()
-for h in "${FFI_HEADERS[@]+"${FFI_HEADERS[@]}"}"; do
-    mkdir -p "$FFI_OUT/$(dirname "$h")"
-    src=""
-    # The crate's own OUT_DIR, newest first: a rebuild can leave several.
-    for ro in $(ls -t "$BUILD_DIR/$CRATE"-*/root-output 2>/dev/null); do
-        cand="$(cat "$ro")/$h"
-        [ -f "$cand" ] && { src="$cand"; break; }
-    done
-    # Else a dependency's build script wrote it to the shared dir.
-    [ -z "$src" ] && [ -f "$FFI_SCRATCH/$h" ] && src="$FFI_SCRATCH/$h"
-    if [ -z "$src" ]; then
-        missing+=("$h")
-        continue
-    fi
-    cp "$src" "$FFI_OUT/$h"
-done
-if [ ${#missing[@]} -gt 0 ]; then
-    echo "cargo_build: $CRATE declared FFI headers cargo never wrote: ${missing[*]}" >&2
-    echo "cargo_build: what it DID write under $FFI_SCRATCH:" >&2
-    (cd "$FFI_SCRATCH" && find . -type f | sed 's|^\./|  |') >&2
-    echo "cargo_build: and in its own OUT_DIRs:" >&2
-    for ro in "$BUILD_DIR/$CRATE"-*/root-output; do
-        [ -f "$ro" ] || continue
-        (cd "$(cat "$ro")" && find . -type f -name "*.h" | sed 's|^\./|  |') >&2
-    done
-    exit 1
-fi
+# The declared headers, resolved out of the OWNING crate's OUT_DIR -- see
+# sync_ffi_headers in cargo_vendor.sh for why $FFI_OUTPUT_DIR alone is not enough
+# (eight crates emit a file called RustFFI.h into one shared directory).
+sync_ffi_headers "$FFI_OUT" "${FFI_HEADERS[@]+"${FFI_HEADERS[@]}"}"

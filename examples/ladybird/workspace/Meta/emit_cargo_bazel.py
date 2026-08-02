@@ -109,6 +109,20 @@ def toolchain_channel():
     return _toml(os.path.join(ROOT, "rust-toolchain.toml"))["toolchain"]["channel"]
 
 
+def root_workspace_members():
+    """The root cargo workspace's member directories, read from Cargo.toml.
+
+    Which workspace a crate belongs to decides its SOURCE SET, and it is the one
+    thing here that must not be guessed. `Libraries/LibWasm/Rust` is member #7 of
+    the root workspace, so cargo resolves the whole workspace when asked for it
+    and its input set is the shared `crate_srcs`; `Libraries/LibJS/Flap` is in
+    `exclude` and has its own lock, so its input set is its own subtree. Reading
+    the member list means adding a crate to either workspace needs no edit here.
+    """
+    ws = _toml(os.path.join(ROOT, "Cargo.toml"))["workspace"]
+    return {os.path.normpath(m) for m in ws.get("members", [])}
+
+
 # ---------------------------------------------------------------------------
 # The lock files.
 # ---------------------------------------------------------------------------
@@ -206,6 +220,8 @@ FFI_HEADERS_OBSERVED = {
     "libweb_css_rust": ["ComputedValuesRustFFI.h", "RustFFI.h",
                         "SelectorRustFFI.h", "StyleValueRustFFI.h"],
     "libweb_content_blocker_rust": ["ContentBlockerRustFFI.h"],
+    # A BINARY crate that also emits a header -- see BINARY_CMAKELISTS below.
+    "libwasm_cranelift": ["CraneliftFFI.h"],
 }
 
 # Where each crate's headers are included FROM. CMake sets FFI_OUTPUT_DIR to the
@@ -224,6 +240,7 @@ FFI_PREFIX = {
     "libweb_layout_rust": "LibWeb",
     "libweb_css_rust": "LibWeb",
     "libweb_content_blocker_rust": "LibWeb",
+    "libwasm_cranelift": "LibWasm",
 }
 
 # The non-Rust files each crate's build script reads, taken from the DEPFILES the
@@ -236,6 +253,12 @@ FFI_PREFIX = {
 # through a `manifest_dir.parent()` join.
 CRATE_EXTRA_INPUTS = {
     "libjs_rust": ["Libraries/LibJS/Bytecode/Bytecode.def"],
+    # libwasm_cranelift's build.rs reads `manifest_dir.join("../Opcode.h")` and
+    # generates a Rust constant per `M(name, value, ...)` line, so the WASM
+    # opcode table is a compile input to the cranelift compiler binary. Exactly
+    # the `manifest_dir.parent()` join the depfile finds and reading build.rs
+    # nearly misses.
+    "libwasm_cranelift": ["Libraries/LibWasm/Opcode.h"],
     # The LibWeb ones (8 CSS data files for libweb_css_rust, TagNames.h +
     # AttributeNames.h + Entities.json for libweb_rust) are NOT here: they are
     # inside the Libraries/LibWeb package, so they ride in that package's
@@ -321,10 +344,15 @@ CMAKELISTS = [
     "Libraries/LibURL/CMakeLists.txt",
     "Libraries/LibUnicode/CMakeLists.txt",
     "Libraries/LibWeb/CMakeLists.txt",
+    # LibWasm calls build_rust_binary(), not import_rust_crate() -- see
+    # parse_cmake_binaries() for why that distinction is load-bearing and why it
+    # nevertheless has to be in the SAME list.
+    "Libraries/LibWasm/CMakeLists.txt",
 ]
 
 _KEYS = ["MANIFEST_PATH", "CRATE_NAME", "FFI_OUTPUT_DIR", "FFI_HEADER",
-         "FFI_HEADERS", "FEATURES"]
+         "FFI_HEADERS", "FEATURES", "BINARY_NAME", "OUTPUT_NAME",
+         "OUTPUT_PATH_VAR"]
 
 
 def parse_cmake_crates():
@@ -384,6 +412,162 @@ def parse_cmake_crates():
     return sorted(out, key=lambda c: c["crate"])
 
 
+def parse_cmake_binaries():
+    """[{crate, bin, manifest, ffi_headers}] from build_rust_binary() calls.
+
+    The SECOND kind of Rust target CMake has, and the one this migration missed
+    for a long time, with a consequence worth recording: because
+    `Libraries/LibWasm/CMakeLists.txt` was absent from CMAKELISTS and
+    `build_rust_binary` was not parsed, the Cranelift crate was **entirely absent
+    from the Bazel graph** -- and every browser binary failed with
+    `CraneliftFFI.h: No such file or directory`, 1,600 actions into a build that
+    could not have worked. The reference build hid it twice over: the header was
+    sitting in `Build/full/Libraries/LibWasm`, which a global `-I` reached, and
+    the compiler binary was reached by an ABSOLUTE PATH baked into a
+    `-DWASM_CRANELIFT_COMPILER_PATH=` -- i.e. two host escapes covering for one
+    missing target.
+
+    Two things make a build_rust_binary crate different from an
+    import_rust_crate one, and both matter here:
+
+      * There is NO archive to link. `cargo rustc --bin` is the whole build, and
+        what the C++ side consumes is the *executable*, spawned at run time.
+      * It can STILL emit an FFI header. libwasm_cranelift's build.rs runs
+        cbindgen exactly like the staticlib crates do, and
+        `Libraries/LibWasm/CraneliftBridge.cpp` includes the result -- bare
+        (`#include <CraneliftFFI.h>`), because CMake's FFI_OUTPUT_DIR is
+        LibWasm's own binary dir.
+
+    So a binary crate needs both halves: a cargo_binary for the executable, and
+    the same declared-header treatment the staticlib crates get. The two are
+    reported separately for the same reason import_rust_crate's list is parsed
+    rather than hard-coded: which kind a crate is, and whether it emits a header,
+    is a property of the CMake call site.
+    """
+    out = []
+    for rel in CMAKELISTS:
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            text = f.read()
+        pkgdir = os.path.dirname(rel)
+        for block in RE_BINARY.findall(text):
+            crate = _arg(block, "CRATE_NAME")
+            manifest = _arg(block, "MANIFEST_PATH")
+            binary = _arg(block, "BINARY_NAME")
+            if not (crate and manifest and binary):
+                continue
+            # FFI_OUTPUT_DIR present at the call site means the build script is
+            # expected to write a header. Which header it writes is the
+            # observation (FFI_HEADERS_OBSERVED), exactly as for the staticlibs:
+            # build_rust_binary has no FFI_HEADERS argument at all, so CMake
+            # declares nothing and there is nothing to compare against.
+            emits_ffi = _arg(block, "FFI_OUTPUT_DIR") is not None
+            out.append({
+                "crate": crate,
+                "bin": binary,
+                "manifest": os.path.normpath(os.path.join(pkgdir, manifest)),
+                "output_name": _arg(block, "OUTPUT_NAME") or binary,
+                "emits_ffi": emits_ffi,
+            })
+    return sorted(out, key=lambda c: c["crate"])
+
+
+def binary_specs():
+    """The per-binary-crate recipe, with the FFI headers each one emits.
+
+    `ffi_bare_include` is derived the same way the staticlib crates' is (by
+    scanning the tree for a directory-less `#include`), not asserted: LibWasm
+    spells it `#include <CraneliftFFI.h>`, and it must be that scan that says so.
+    """
+    specs = []
+    for b in parse_cmake_binaries():
+        headers = sorted(FFI_HEADERS_OBSERVED.get(b["crate"], [])) \
+            if b["emits_ffi"] else []
+        specs.append(dict(b, ffi_headers=headers,
+                          ffi_prefix=FFI_PREFIX.get(b["crate"], "")))
+    bare = crates_included_bare(_bare_scan_specs())
+    for sp in specs:
+        sp["ffi_bare_include"] = bool(bare.get(sp["crate"]))
+    return specs
+
+
+def _bare_scan_specs():
+    """Every Rust crate that emits a header, staticlib and binary alike.
+
+    ONE list, because the bare-include scan is a question about the whole tree:
+    it looks for a directory-less `#include <X>` where X is any crate's header
+    basename, and a scan that only knew about the staticlibs would answer "no"
+    for CraneliftFFI.h no matter how many TUs include it that way.
+    """
+    return [{"crate": c["crate"], "manifest": c["manifest"],
+             "ffi_headers": sorted(set(c["cmake_ffi_headers"]) |
+                                   set(FFI_HEADERS_OBSERVED.get(c["crate"], [])))}
+            for c in parse_cmake_crates()] + \
+           [{"crate": b["crate"], "manifest": b["manifest"],
+             "ffi_headers": sorted(FFI_HEADERS_OBSERVED.get(b["crate"], []))
+             if b["emits_ffi"] else []}
+            for b in parse_cmake_binaries()]
+
+
+def crates_included_bare(specs):
+    """Crates whose FFI header is #included with NO directory prefix.
+
+    Derived by scanning the source tree for `#include <X>` where X is exactly a
+    crate's FFI header basename, rather than hard-coding a list: which TUs spell
+    the include bare is a property of Ladybird's source and changes when someone
+    edits an include line.
+
+    Why it matters: 8 of the 10 crates emit a header named `RustFFI.h`. CMake
+    gives each library only its OWN crate's binary dir, so a bare
+    `#include <RustFFI.h>` is unambiguous there. Bazel propagates every dep's
+    include dirs onto one command line, so exposing an unprefixed dir for all
+    crates lets one crate's RustFFI.h satisfy another's include -- silently, since
+    both exist and only ORDER decides. So the unprefixed dir is opt-in per crate,
+    and only for crates that actually need it.
+    """
+    bare = {}
+    pat = re.compile(r'^\s*#\s*include\s*<([^/>]+)>\s*$', re.M)
+    wanted = {}
+    owner_dir = {}
+    for sp in specs:
+        # The crate's manifest lives at <Library>/[sub/]Rust/Cargo.toml, so the
+        # owning library directory is the manifest's path with the trailing
+        # Rust/Cargo.toml removed -- that is the tree whose TUs may include this
+        # crate's header bare.
+        d = os.path.dirname(sp["manifest"])
+        while d and os.path.basename(d) in ("Rust", "rust"):
+            d = os.path.dirname(d)
+        owner_dir[sp["crate"]] = d
+        for h in sp["ffi_headers"]:
+            wanted.setdefault(os.path.basename(h), set()).add(sp["crate"])
+    for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, "Libraries")):
+        dirnames[:] = [d for d in dirnames if d not in ("Rust", "target")]
+        for fn_ in filenames:
+            if not fn_.endswith((".cpp", ".h")):
+                continue
+            fpath = os.path.join(dirpath, fn_)
+            try:
+                with open(fpath, errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for m in pat.finditer(text):
+                inc = m.group(1)
+                if inc not in wanted:
+                    continue
+                # Attribute the bare include to the crate owned by the library
+                # this file lives in, so we never enable the unprefixed dir for
+                # an unrelated crate that happens to emit the same basename.
+                rel = os.path.relpath(fpath, ROOT)
+                for crate in wanted[inc]:
+                    owner = owner_dir.get(crate)
+                    if owner and rel.startswith(owner + os.sep):
+                        bare[crate] = True
+    return bare
+
+
 def crate_specs():
     """The per-crate build recipe the Bazel rule consumes.
 
@@ -403,6 +587,13 @@ def crate_specs():
             "ffi_headers": headers,
             "ffi_prefix": FFI_PREFIX.get(c["crate"], ""),
         })
+    # Derived from the source tree, not hard-coded: which crates' headers are
+    # included without a directory prefix. Scanned over EVERY crate that emits a
+    # header (binaries included), so the answer does not depend on which emitter
+    # asked.
+    bare = crates_included_bare(_bare_scan_specs())
+    for sp in specs:
+        sp["ffi_bare_include"] = bool(bare.get(sp["crate"]))
     return specs
 
 
@@ -486,6 +677,7 @@ def emit_index(crates, specs):
         print("        \"features\": %r," % s["features"])
         print("        \"ffi_headers\": %r," % s["ffi_headers"])
         print("        \"ffi_prefix\": %r," % s["ffi_prefix"])
+        print("        \"ffi_bare_include\": %r," % s["ffi_bare_include"])
         print("    },")
     print("}")
     print()
@@ -495,7 +687,7 @@ def emit_index(crates, specs):
     print("RUST_TRIPLE = %r" % TRIPLE)
 
 
-def emit_ring(crates, specs):
+def emit_ring(crates, specs, binaries):
     """cargo_ring.bzl: the whole Rust ring as a macro for the ROOT package.
 
     A macro instantiated in the root package rather than its own `Meta/cargo`
@@ -511,20 +703,20 @@ def emit_ring(crates, specs):
     and a hand-kept copy of them would be the bug (finding 23).
     """
     sys.stdout.write(HEADER)
-    print('load(":cargo.bzl", "cargo_binary", "cargo_crate", "cargo_lib", "rust_sysroot")')
+    print('load(":cargo.bzl", "cargo_binary", "cargo_crate", "cargo_lib", "cargo_bare_include", "rust_sysroot")')
     print('load(":cargo_index.bzl", "CARGO_CRATE_FILES", "CARGO_CRATE_SPECS")')
     print()
-    print("# Ladybird's %d production Rust crates and flapc, BUILT BY BAZEL from the"
-          % len(specs))
-    print("# %d crates.io crates Bazel fetched -- replacing the prebuilt 260 MB" % len(crates))
-    print("# librust_combined.a that was copied out of Build/full/cargo/, the `ar -M`")
-    print("# merge that produced it (README step 1b), and the reference build's flapc")
-    print("# binary. Nothing here names Build/full.")
+    print("# Ladybird's %d production Rust crates and %d binary crates, BUILT BY BAZEL"
+          % (len(specs), len(binaries)))
+    print("# from the %d crates.io crates Bazel fetched -- replacing the prebuilt" % len(crates))
+    print("# 260 MB librust_combined.a that was copied out of Build/full/cargo/, the")
+    print("# `ar -M` merge that produced it (README step 1b), and the reference build's")
+    print("# flapc and cranelift-compiler binaries. Nothing here names Build/full.")
     print("#")
     print("# Every attribute comes from CARGO_CRATE_SPECS, which")
-    print("# Meta/emit_cargo_bazel.py parses out of import_rust_crate() in CMake, so a")
-    print("# feature or header list cannot drift from the reference build without the")
-    print("# emitter's --report saying so.")
+    print("# Meta/emit_cargo_bazel.py parses out of import_rust_crate() and")
+    print("# build_rust_binary() in CMake, so a feature or header list cannot drift from")
+    print("# the reference build without the emitter's --report saying so.")
     print()
     print("def cargo_ring():")
     print("    # The pinned toolchain (rust-toolchain.toml says %s), assembled from"
@@ -562,6 +754,8 @@ def emit_ring(crates, specs):
         print("        crate_features = CARGO_CRATE_SPECS[%r][\"features\"]," % s["crate"])
         print("        ffi_headers = CARGO_CRATE_SPECS[%r][\"ffi_headers\"]," % s["crate"])
         print("        ffi_prefix = CARGO_CRATE_SPECS[%r][\"ffi_prefix\"]," % s["crate"])
+        print("        ffi_bare_include = CARGO_CRATE_SPECS[%r][\"ffi_bare_include\"],"
+              % s["crate"])
         print("        manifest = CARGO_CRATE_SPECS[%r][\"manifest\"]," % s["crate"])
         if extra:
             print("        # Build-script inputs, taken from the reference build's DEPFILES")
@@ -584,21 +778,80 @@ def emit_ring(crates, specs):
         print("        name = %r," % (s["crate"] + "_lib"))
         print("        crate = %r," % (":" + s["crate"]))
         print("    )")
+        if s["ffi_bare_include"]:
+            # The owning library's TUs spell this crate's header with no
+            # directory. That dir must NOT ride on cargo_lib (it propagates
+            # transitively and 8 crates ship a RustFFI.h), so it is its own
+            # target, depended on by exactly one library.
+            print("    cargo_bare_include(")
+            print("        name = %r," % (s["crate"] + "_bare_include"))
+            print("        crate = %r," % (":" + s["crate"]))
+            print("    )")
     print()
-    print("    # flapc, the Flap-DSL -> interpreter-assembly compiler. Its workspace is")
-    print("    # `exclude`d from the root one and has its own lock with exactly 3")
-    print("    # packages (flapc, in-tree bytecode_def, and smallvec from crates.io")
-    print("    # pinned =1.15.1 -- the same version AND checksum the big workspace pins,")
-    print("    # so it is the same fetch rule, not a second one).")
-    print("    cargo_binary(")
-    print("        name = \"flapc\",")
-    print("        bin = \"flapc\",")
-    print("        crate = \"flapc\",")
-    print("        crates = CARGO_CRATE_FILES,")
-    print("        manifest = \"Libraries/LibJS/Flap/Cargo.toml\",")
-    print("        srcs = native.glob(%r, allow_empty = False)," % FLAPC_SRC_GLOBS)
-    print("        sysroot = \":rust_sysroot\",")
-    print("    )")
+    print("    # The BINARY crates: cargo `--bin` targets, declared in CMake with")
+    print("    # build_rust_binary() rather than import_rust_crate(). Two of them, and")
+    print("    # they are two different shapes:")
+    print("    #")
+    print("    #   flapc              a pure build TOOL -- Bazel runs it in a genrule to")
+    print("    #                      produce the interpreter assembly. Its workspace is")
+    print("    #                      `exclude`d from the root one and has its own lock")
+    print("    #                      with exactly 3 packages (flapc, in-tree")
+    print("    #                      bytecode_def, and smallvec from crates.io pinned")
+    print("    #                      =1.15.1 -- the same version AND checksum the big")
+    print("    #                      workspace pins, so it is the same fetch rule, not a")
+    print("    #                      second one).")
+    print("    #   cranelift-compiler a RUNTIME tool -- LibWasm spawns it to AOT-compile")
+    print("    #                      WebAssembly, and its build script ALSO emits the")
+    print("    #                      CraneliftFFI.h that LibWasm's CraneliftBridge.cpp")
+    print("    #                      includes. It is a root-workspace member, so its")
+    print("    #                      source set is the shared crate_srcs.")
+    for b in binaries:
+        member = os.path.dirname(b["manifest"])
+        in_root_ws = member in root_workspace_members()
+        extra = CRATE_EXTRA_INPUTS.get(b["crate"], [])
+        print("    cargo_binary(")
+        print("        name = %r," % b["bin"])
+        print("        bin = %r," % b["bin"])
+        print("        crate = %r," % b["crate"])
+        print("        crates = CARGO_CRATE_FILES,")
+        print("        manifest = %r," % b["manifest"])
+        if b["ffi_headers"]:
+            print("        # This binary crate's build script runs cbindgen too, so the")
+            print("        # header is a DECLARED output -- Bazel deletes what nothing")
+            print("        # declares, and LibWasm includes this one bare.")
+            print("        ffi_headers = %r," % b["ffi_headers"])
+            print("        ffi_prefix = %r," % b["ffi_prefix"])
+            print("        ffi_bare_include = %r," % b["ffi_bare_include"])
+        if in_root_ws:
+            print("        # A member of the ROOT cargo workspace (Cargo.toml lists it), so")
+            print("        # cargo resolves the whole workspace whichever crate you ask for")
+            print("        # and the source set is the shared one -- same over-declaration,")
+            print("        # same reason, as the staticlib crates.")
+            srcs = "crate_srcs"
+            if extra:
+                srcs += " + %r" % extra
+            print("        srcs = %s," % srcs)
+        else:
+            print("        # Its OWN workspace (`exclude`d from the root one), so its source")
+            print("        # set is its own subtree.")
+            print("        srcs = native.glob(%r, allow_empty = False)," % FLAPC_SRC_GLOBS)
+        print("        sysroot = \":rust_sysroot\",")
+        print("    )")
+        if b["ffi_headers"]:
+            print()
+            print("    # The consumable target, IDENTICAL in shape to a staticlib crate's:")
+            print("    # this crate's generated header to include. There is no archive to")
+            print("    # link -- what C++ consumes from a binary crate is the EXECUTABLE,")
+            print("    # spawned at run time -- so cargo_lib yields a headers-only CcInfo.")
+            print("    cargo_lib(")
+            print("        name = %r," % (b["crate"] + "_lib"))
+            print("        crate = %r," % (":" + b["bin"]))
+            print("    )")
+            if b["ffi_bare_include"]:
+                print("    cargo_bare_include(")
+                print("        name = %r," % (b["crate"] + "_bare_include"))
+                print("        crate = %r," % (":" + b["bin"]))
+                print("    )")
 
 
 def emit_extension(crates):
@@ -674,10 +927,27 @@ def report(crates):
         if missing:
             print("    declared by CMake but never written: %s" % ", ".join(missing))
             rc = 1
-    for crate in sorted(set(FFI_HEADERS_OBSERVED) -
-                        {c["crate"] for c in parse_cmake_crates()}):
-        print("%-30s observed but no import_rust_crate found -- did a crate get "
-              "renamed or moved?" % crate)
+    print()
+    # The binary crates are reported separately, because the two kinds fail
+    # differently: a missing staticlib crate is a link error, a missing binary
+    # crate is a header that never appears (CraneliftFFI.h) plus a tool that has
+    # to be found at run time.
+    for b in binary_specs():
+        print("%-30s bin=%-20s manifest=%s"
+              % (b["crate"], b["bin"], b["manifest"]))
+        if b["emits_ffi"] and not b["ffi_headers"]:
+            print("    FFI_OUTPUT_DIR is set at the call site but no header is "
+                  "listed in FFI_HEADERS_OBSERVED -- run the reference cargo "
+                  "build with FFI_OUTPUT_DIR set and add what it wrote")
+            rc = 1
+        for h in b["ffi_headers"]:
+            print("    emits %s (bare-included: %s)"
+                  % (h, "yes" if b["ffi_bare_include"] else "no"))
+    known = ({c["crate"] for c in parse_cmake_crates()} |
+             {b["crate"] for b in parse_cmake_binaries()})
+    for crate in sorted(set(FFI_HEADERS_OBSERVED) - known):
+        print("%-30s observed but no import_rust_crate/build_rust_binary found "
+              "-- did a crate get renamed or moved?" % crate)
         rc = 1
     return rc
 
@@ -707,7 +977,7 @@ def check(dirpath):
             {"--crates": lambda: emit_crates(crates),
              "--index": lambda: emit_index(crates, specs),
              "--extension": lambda: emit_extension(crates),
-             "--ring": lambda: emit_ring(crates, specs)}[flag]()
+             "--ring": lambda: emit_ring(crates, specs, binary_specs())}[flag]()
         finally:
             sys.stdout = real
         path = os.path.join(dirpath, fn)
@@ -737,7 +1007,7 @@ def main():
     elif "--extension" in argv:
         emit_extension(crates)
     elif "--ring" in argv:
-        emit_ring(crates, crate_specs())
+        emit_ring(crates, crate_specs(), binary_specs())
     elif "--use-repo" in argv:
         emit_use_repo(crates)
     else:

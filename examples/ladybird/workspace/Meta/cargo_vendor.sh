@@ -87,3 +87,67 @@ export AR_${TRIPLE_US}="${AR:-ar}"
 export CARGO_TARGET_${TRIPLE_UP}_LINKER="${CC:-cc}"
 
 TARGET_DIR="$WORK/target"
+
+# --- FFI_OUTPUT_DIR is a SCRATCH dir, not the declared output dir ------------
+# Shared by both drivers because the reason is the same for both: cbindgen runs
+# from a build script, every build script in the crate's dependency graph writes
+# into the SAME $FFI_OUTPUT_DIR, and the header names COLLIDE (eight crates emit
+# a file called `RustFFI.h`). So the declared outputs are resolved out of the
+# OWNING crate's own OUT_DIR afterwards -- see sync_ffi_headers.
+FFI_SCRATCH="$WORK/ffi"
+mkdir -p "$FFI_SCRATCH"
+export FFI_OUTPUT_DIR="$FFI_SCRATCH"
+
+# sync_ffi_headers <out-dir> [header...]
+#
+# Copy each declared FFI header into the declared output dir, resolved from the
+# crate that OWNS it. Mirrors Meta/CMake/sync_rust_ffi_header.cmake, which exists
+# for exactly this reason: liburl_rust path-depends on libregex_rust, so building
+# liburl_rust runs BOTH build scripts against one FFI_OUTPUT_DIR and the
+# surviving RustFFI.h is whichever ran last -- we shipped libregex_rust's URL
+# header for one build and only caught it by byte-comparing against CMake's tree.
+#
+# CMake finds the owning crate's OUT_DIR via `build/<crate>-*/root-output`; so
+# does this, preferring it and falling back to the shared scratch dir for a
+# header written by a DEPENDENCY's build script (libweb_rust's
+# HTMLTokenizerRustFFI.h comes from libweb_html_tokenizer and collides with
+# nothing, which is exactly why CMake never noticed it was undeclared).
+#
+# Failing loudly is the point: Bazel deletes an undeclared output and fails an
+# action that does not write a declared one, so a missing header is reported here
+# with what cargo DID write rather than surfacing as a file-not-found in a C++
+# compile a thousand actions later.
+sync_ffi_headers() {
+    local ffi_out="$1"; shift
+    [ $# -gt 0 ] || return 0
+    local build_dir="$TARGET_DIR/$TRIPLE/release/build"
+    local missing=() h ro cand src
+    mkdir -p "$ffi_out"
+    for h in "$@"; do
+        mkdir -p "$ffi_out/$(dirname "$h")"
+        src=""
+        # The crate's own OUT_DIR, newest first: a rebuild can leave several.
+        for ro in $(ls -t "$build_dir/$CRATE"-*/root-output 2>/dev/null); do
+            cand="$(cat "$ro")/$h"
+            [ -f "$cand" ] && { src="$cand"; break; }
+        done
+        # Else a dependency's build script wrote it to the shared dir.
+        [ -z "$src" ] && [ -f "$FFI_SCRATCH/$h" ] && src="$FFI_SCRATCH/$h"
+        if [ -z "$src" ]; then
+            missing+=("$h")
+            continue
+        fi
+        cp "$src" "$ffi_out/$h"
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "cargo: $CRATE declared FFI headers cargo never wrote: ${missing[*]}" >&2
+        echo "cargo: what it DID write under $FFI_SCRATCH:" >&2
+        (cd "$FFI_SCRATCH" && find . -type f | sed 's|^\./|  |') >&2
+        echo "cargo: and in its own OUT_DIRs:" >&2
+        for ro in "$build_dir/$CRATE"-*/root-output; do
+            [ -f "$ro" ] || continue
+            (cd "$(cat "$ro")" && find . -type f -name "*.h" | sed 's|^\./|  |') >&2
+        done
+        return 1
+    fi
+}
