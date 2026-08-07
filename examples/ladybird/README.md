@@ -320,6 +320,19 @@ Honest inventory of what stops this from being a clone-and-build.
    and `-L/usr/lib/x86_64-linux-gnu`, both because libdrm and Vulkan are
    host-provided. (The `-L`/`-rpath` into `Build/full/vcpkg_installed/` are gone —
    finding 33.)
+
+   **No absolute host path remains in the generated BUILD files.** Two did until
+   recently, and both were the same mistake in different clothing: a value that is
+   correct on the machine that generated it and meaningless anywhere else, sitting
+   in a checked-in file where nothing would ever contradict it.
+   `-DWASM_CRANELIFT_COMPILER_PATH="/home/ubuntu/.../bin/cranelift-compiler"` was
+   load-bearing (finding 35) and now resolves through Ladybird's own
+   sibling-of-self lookup; `vcpkg_tree`'s `cache_dir` was merely a resumability
+   affordance and is now empty, which is also the honest default (an empty cache
+   *is* the genuine from-source build). Grepping the emitted output for `/home/`
+   is a one-line check worth keeping in any migration — a hardcoded path that
+   happens to work is the failure mode that survives every test run on the
+   author's machine.
 4. **The `Build/full` shims are gone; what remains is a *converter* dependency,
    not a build dependency.** `Build/full/**/BUILD.bazel` no longer exists. The
    vcpkg `.so`s (finding 33), the Rust archives + `flapc` (finding 34), the

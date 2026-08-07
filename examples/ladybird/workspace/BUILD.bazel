@@ -1864,10 +1864,16 @@ vcpkg_tree(
     source_dir = ".",
     source_root = ":vcpkg_source_inputs",
     triplet = "x64-linux-dynamic",
-    # Resume cache: makes a killed 45-minute build cheap to restart. Absolute by
-    # necessity (the action's cwd is the execroot) and therefore a host escape --
-    # it is a build-speed affordance, not part of the dependency graph.
-    cache_dir = "/home/ubuntu/.cache/vcpkg-bazel",
+    # Resume cache: OPT-IN, and empty here on purpose. Setting it makes a killed
+    # 45-minute vcpkg build cheap to restart, but the path must be absolute (the
+    # action's cwd is the execroot), so any value here is one developer's home
+    # directory in a file everyone checks out -- it was
+    # /home/ubuntu/.cache/vcpkg-bazel, the last absolute host path left in the
+    # emitted build. Empty is also the honest default: it is the genuine
+    # from-source build. Set this one attribute locally if you want resumability.
+    # It is a build-speed affordance and no part of the dependency graph, which is
+    # precisely why it must not be a checked-in constant.
+    cache_dir = "",
     vcpkg_root = "Build/vcpkg",
     vcpkg_tree = "//Build/vcpkg:tree",
 )
