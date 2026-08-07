@@ -196,7 +196,17 @@ def target_defines(t, name):
 
 def target_private_includes(t):
     """Per-target -isystem/-I under Build/full (the target's own gendir) not in
-    the 6 global roots."""
+    the 6 global roots.
+
+    Paths are NORMALIZED before the comparison, which is not cosmetic. CMake emits
+    a target's own binary dir relative to itself, so the five service targets get
+    `-IBuild/full/Services/WebContent/../..` -- the same directory as the global
+    `-IBuild/full`, spelled differently. Compared as strings it is not in
+    globalroots, so it came out as a per-target `-IBuild/full` copt on five
+    targets plus WebContent: six copts pointing into CMake's build tree that
+    supplied nothing any global root did not already supply, and which made the
+    emitted build look like it needed Build/full when it did not.
+    """
     globalroots = {ROOT, ROOT+"/Libraries", ROOT+"/Services",
                    ROOT+"/Build/full", ROOT+"/Build/full/Libraries",
                    ROOT+"/Build/full/Services",
@@ -207,7 +217,7 @@ def target_private_includes(t):
         args = a["arguments"]; i = 0
         while i < len(args):
             if args[i] in ("-I", "-isystem"):
-                p = args[i+1]
+                p = os.path.normpath(args[i+1])
                 if p in globalroots:
                     pass
                 elif p.startswith(ROOT):
@@ -508,21 +518,29 @@ cc_library(
         "UI/**/*.h",
     ], allow_empty = True),
     deps = [
-        # Bazel-generated headers (the genrules above) come FIRST so they win
-        # over the CMake copies; the Build/full roots below now only supply what
-        # Bazel does not yet generate (Rust FFI headers, CMake's
-        # generate_export_header Export.h).
+        # EVERY generated header is Bazel's own now. The two
+        # //Build/full/{Libraries,Services} header roots that used to be listed
+        # here are gone, and with them the last thing the BUILD read out of
+        # CMake's build tree.
+        #
+        # They were not supplying anything by the end, and that is the part worth
+        # recording, because it is why they survived so long: a `glob(["**/*.h"])`
+        # over a foreign tree cannot fail. The 709 headers under those roots were
+        # 21 that Bazel generates and 688 LibWeb bindings headers that Bazel ALSO
+        # generates -- so the roots were SHADOWING Bazel's own outputs, silently
+        # winning or losing on include order, and the only reason a fresh clone
+        # did not fail here was that it got no error either: allow_empty=True
+        # turns "the tree is not there" into an empty glob and the build dies
+        # ~1,600 actions later on a missing Export.h. Verified by removal:
+        # Build/full/{Libraries,Services,UI} moved off the machine, all six
+        # binaries rebuilt from scratch, --headless=text and
+        # --headless=layout-tree byte-identical to the CMake reference.
         ":generated_libraries_headers",
         ":generated_services_headers",
         ":generated_shader_headers",
         ":generated_export_headers",
         ":generated_ak_headers",
         "//Libraries/LibWeb:generated_export_header",
-        # Build/full roots: now ONLY the Rust FFI headers and the IPC/codegen
-        # headers Bazel does not yet generate. Export.h and AK's two
-        # configure_file headers are Bazel-generated above.
-        "//Build/full/Libraries:generated_lib_headers",
-        "//Build/full/Services:generated_service_headers",
     ],
 )
 
@@ -709,6 +727,16 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
                 # path arrives WITH the dep edge -- a target that includes
                 # <skia/...> without depending on skia now fails to compile,
                 # which is the whole point of declaring inputs.
+                pass
+            elif i in ("Build/full/UI", "Build/full/UI/Qt"):
+                # CMake's UI gendir, whose only non-autogen contents are the two
+                # SPIR-V shader headers (WebContentViewLinux{Frag,Vert}Shader.h).
+                # Bazel generates both itself and carries them on
+                # :generated_shader_headers with includes=["UI/Qt"], so the
+                # include path arrives through the dep graph. Dropped, not
+                # relocated -- and checked by removal: with Build/full/UI moved
+                # off the machine, //:ladybird still builds and renders
+                # byte-identically.
                 pass
             else:
                 copt_toks.append("-I" + i)

@@ -42,21 +42,29 @@ cc_library(
         "UI/**/*.h",
     ], allow_empty = True),
     deps = [
-        # Bazel-generated headers (the genrules above) come FIRST so they win
-        # over the CMake copies; the Build/full roots below now only supply what
-        # Bazel does not yet generate (Rust FFI headers, CMake's
-        # generate_export_header Export.h).
+        # EVERY generated header is Bazel's own now. The two
+        # //Build/full/{Libraries,Services} header roots that used to be listed
+        # here are gone, and with them the last thing the BUILD read out of
+        # CMake's build tree.
+        #
+        # They were not supplying anything by the end, and that is the part worth
+        # recording, because it is why they survived so long: a `glob(["**/*.h"])`
+        # over a foreign tree cannot fail. The 709 headers under those roots were
+        # 21 that Bazel generates and 688 LibWeb bindings headers that Bazel ALSO
+        # generates -- so the roots were SHADOWING Bazel's own outputs, silently
+        # winning or losing on include order, and the only reason a fresh clone
+        # did not fail here was that it got no error either: allow_empty=True
+        # turns "the tree is not there" into an empty glob and the build dies
+        # ~1,600 actions later on a missing Export.h. Verified by removal:
+        # Build/full/{Libraries,Services,UI} moved off the machine, all six
+        # binaries rebuilt from scratch, --headless=text and
+        # --headless=layout-tree byte-identical to the CMake reference.
         ":generated_libraries_headers",
         ":generated_services_headers",
         ":generated_shader_headers",
         ":generated_export_headers",
         ":generated_ak_headers",
         "//Libraries/LibWeb:generated_export_header",
-        # Build/full roots: now ONLY the Rust FFI headers and the IPC/codegen
-        # headers Bazel does not yet generate. Export.h and AK's two
-        # configure_file headers are Bazel-generated above.
-        "//Build/full/Libraries:generated_lib_headers",
-        "//Build/full/Services:generated_service_headers",
     ],
 )
 
@@ -1439,7 +1447,6 @@ cc_library(
         'Services/WebContent/WebUIConnection.cpp',
     ],
     hdrs = glob(["Services/WebContent/**/*.h"], allow_empty = True),
-    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1480,7 +1487,6 @@ cc_library(
         'Services/RequestServer/WebSocketImplCurl.cpp',
     ],
     hdrs = glob(["Services/RequestServer/**/*.h"], allow_empty = True),
-    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1508,7 +1514,6 @@ cc_library(
         'Services/ImageDecoder/ConnectionFromClient.cpp',
     ],
     hdrs = glob(["Services/ImageDecoder/**/*.h"], allow_empty = True),
-    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1543,7 +1548,6 @@ cc_library(
     ],
     hdrs = glob(["Services/Compositor/**/*.h"], allow_empty = True),
     local_defines = ['SK_CODEC_DECODES_BMP', 'SK_CODEC_DECODES_GIF', 'SK_CODEC_DECODES_WBMP', 'SK_DISABLE_TRACING', 'SK_ENABLE_AVX512_OPTS', 'SK_ENABLE_PRECOMPILE', 'SK_FONTMGR_ANDROID_AVAILABLE', 'SK_FONTMGR_FCI_AVAILABLE', 'SK_FONTMGR_FONTCONFIG_AVAILABLE', 'SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMBEDDED_AVAILABLE', 'SK_FONTMGR_FREETYPE_EMPTY_AVAILABLE', 'SK_GAMMA_APPLY_TO_A8', 'SK_GANESH', 'SK_HAS_WUFFS_LIBRARY', 'SK_R32_SHIFT=16', 'SK_TYPEFACE_FACTORY_FREETYPE', 'SK_USE_PERFETTO', 'SK_VULKAN', 'SK_XML'],
-    copts = ['-IBuild/full'],
     deps = [
         '//:LibCore',
         '//:LibGfx',
@@ -1565,7 +1569,6 @@ cc_library(
         'Services/WebWorker/WorkerHost.cpp',
     ],
     hdrs = glob(["Services/WebWorker/**/*.h"], allow_empty = True),
-    copts = ['-IBuild/full'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1718,7 +1721,7 @@ cc_binary(
         'Services/RendererSandboxLinux.cpp',
         'Services/WebContent/main.cpp',
     ],
-    copts = ['-fPIE', '-IBuild/full'],
+    copts = ['-fPIE'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1816,7 +1819,7 @@ cc_binary(
         'UI/Qt/main.cpp',
     ],
     local_defines = ['QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_WIDGETS_LIB'],
-    copts = ['-fPIE', '-IBuild/full/UI', '-IBuild/full/UI/Qt'],
+    copts = ['-fPIE'],
     linkopts = ['-lGLX', '-lOpenGL', '-lvulkan'],
     deps = [
         '//:AK',
