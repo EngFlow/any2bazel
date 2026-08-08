@@ -1651,9 +1651,23 @@ FFI-header lookup had moved into `cargo_vendor.sh` so both drivers use one copy,
 and one test read `Build/full/Libraries/BUILD.bazel` — a file whose *deletion* was
 the fix. That last one is the pleasing part: the test failed because the thing it
 asserted about no longer exists, so it became the stronger assertion that the path
-**must not** exist. The suite is now 128 tests over 10 files, all passing, and the
-README documents running the glob rather than a hand-kept list of filenames,
-because a list of files to run is one more thing that can silently omit an entry.
+**must not** exist.
+
+The repair is not "add a runner to each file", though that is what was missing: a
+per-file runner is precisely the thing nobody notices the absence of, so doing only
+that leaves the next silent file undetected. What was missing was **one entry point
+that knows how many test files exist and how many tests each contributed**, so a
+file going quiet is a failure and not just a smaller number nobody was counting.
+`tests/run_all.py` discovers `tests/test_*.py`, and fails the run if any file
+defines no tests or will not import — the `allow_empty = False` of test discovery.
+Its guards are tested by triggering them, because a guard never seen to fire is
+back where this started. The suite is 135 tests over 11 files, 0.3s, one exit code.
+
+The general lesson, which outlives this repo's test layout: **the unit that has to
+be accounted for is the CONTAINER, not the item.** Counting passing tests cannot
+detect a missing file; counting matched files cannot detect an empty glob;
+counting green actions cannot detect a header supplied by a shim. Each time, the
+fix was to make the enclosing thing declare how many children it should have.
 
 ## Plan for the rest
 

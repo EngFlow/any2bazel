@@ -392,10 +392,15 @@ python3 scripts/diff_ts.py model.npm.json model.bazel.json    # standalone check
 ## Tests
 
 ```bash
-python3 tests/test_engine.py && python3 tests/test_extractors.py \
-    && python3 tests/test_maven.py && python3 tests/test_extract_npm.py \
-    && python3 tests/test_triage.py && python3 tests/test_configure.py
+python3 tests/run_all.py    # discovers every tests/test_*.py, one exit code
 ```
+
+Do not hand-list the files. This block used to name six of the eleven and chain
+them with `&&`, so it stopped at the first failure and never reached the rest —
+and three of the files it omitted had no `if __name__ == "__main__"` block, so
+running them defined 46 tests, called none, and exited 0. `run_all.py` discovers
+the files and **fails if any file contributed no tests**, which is the
+`allow_empty = False` of test discovery (case study finding 35).
 
 Extractor tests run against fixtures that mirror the documented File API,
 aquery, Maven argfile, and npm-NDJSON schemas. When a real project surfaces a

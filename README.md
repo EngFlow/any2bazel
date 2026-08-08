@@ -318,6 +318,8 @@ scripts/
   triage.py            groups diff.json into a systematic-cause worklist
   serialize.py         model ↔ JSON (the contract between stages)
 tests/
+  run_all.py           discovers and runs every test_*.py; fails on a silent file
+  test_run_all.py      the runner's own guards, triggered rather than asserted
   test_engine.py       diff/canonicalize/roles/config/TU-set behavior
   test_extractors.py   full pipeline on synthetic File-API + aquery fixtures
   test_maven.py        Maven frontend + Java branch of reconstruct
@@ -394,16 +396,30 @@ Run as a skill, Claude drives the generation and triage/fix loop automatically.
 ## Tests
 
 ```bash
-for f in tests/test_*.py; do python3 "$f" || echo "FAILED $f"; done
+python3 tests/run_all.py          # the whole suite, one exit code (~0.3s)
+python3 tests/run_all.py -v cargo # verbose, filtered by file or test name
 ```
 
-Run the glob, not a hand-kept list of files: three of these test files once had
-no `if __name__ == "__main__"` runner at all, so running them **exited 0 having
-executed nothing** — a test suite that cannot fail, which is the same bug as a
-`glob(..., allow_empty = True)` over a directory that is not there (case study
-finding 35). Each file prints `PASS`/`FAIL` per test and an `N/N passed` line, so
-compare the totals against the number of `def test_` in the file rather than
-trusting the exit code.
+`run_all.py` **discovers** `tests/test_*.py` rather than reading a list, and it
+fails the run if a test *file* contributed nothing — no tests defined, or a module
+that would not import. Both of those are the reason it exists: this README used to
+list six commands for ten files, and three of those files had no
+`if __name__ == "__main__"` block at all, so running them imported the module,
+defined 46 test functions, called none of them, and exited 0. There is no pytest
+here, so nothing else called them either.
+
+That is the same bug as `glob(..., allow_empty = True)` over a directory that is
+not there (case study finding 35): **a check that cannot fail is indistinguishable
+from one that is not needed.** A per-file runner is what was missing, but a
+per-file runner is also exactly what nobody notices the absence of — so the fix is
+one entry point that knows how many files there are and how many tests each
+contributed. Its three guards are themselves tested, by triggering them
+(`test_run_all.py`).
+
+Each file also still runs standalone (`python3 tests/test_engine.py`) for a quick
+single-file loop. As the suite grows the next step is a `py_test` per file under
+`bazel test //...`, so the caching and parallelism come for free and a commit gate
+runs it without anyone remembering to — this repo has no `MODULE.bazel` yet.
 
 The extractor tests run against fixtures under `tests/` that mirror the
 documented File API, aquery, Maven argfile, and npm-NDJSON schemas. Real projects
