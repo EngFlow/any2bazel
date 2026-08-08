@@ -400,7 +400,8 @@ them with `&&`, so it stopped at the first failure and never reached the rest â€
 and three of the files it omitted had no `if __name__ == "__main__"` block, so
 running them defined 46 tests, called none, and exited 0. `run_all.py` discovers
 the files and **fails if any file contributed no tests**, which is the
-`allow_empty = False` of test discovery (case study finding 35).
+`allow_empty = False` of test discovery (case study finding 35). Run one file with
+a substring filter: `python3 tests/run_all.py test_triage`.
 
 Extractor tests run against fixtures that mirror the documented File API,
 aquery, Maven argfile, and npm-NDJSON schemas. When a real project surfaces a

@@ -125,6 +125,14 @@ use_repo(
     'vcpkg_xiph_opus_v1_5_2_tar_gz_4ffefd9c0356',
     'vcpkg_xiph_theora_v1_2_0_tar_gz_b2aac15528f0',
     'vcpkg_xiph_vorbis_v1_3_7_tar_gz_bfb6f5dbfd49',
+    # NOT from the capture: the wheel for a Python package a portfile
+    # pip-installs. pip does not go through the vcpkg asset cache, so
+    # `--x-asset-sources=x-script+x-block-origin` never sees it -- which is how
+    # `pip install ply` in the angle port went on reaching PyPI through an
+    # inherited HTTP_PROXY (finding 36). Hand-maintained in
+    # vcpkg_python_packages.bzl for exactly that reason: no instrument can
+    # produce it, so nothing would regenerate it.
+    'vcpkg_pywheel_ply',
 )
 
 # ---------------------------------------------------------------------------

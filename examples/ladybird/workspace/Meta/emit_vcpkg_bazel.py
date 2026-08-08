@@ -531,9 +531,15 @@ def emit_extension(distfiles):
     """
     sys.stdout.write(HEADER)
     print('load(":vcpkg_distfiles.bzl", "vcpkg_distfiles")')
+    # The pip-installed Python packages a PORTFILE asks for. Hand-written, not
+    # captured -- pip does not go through vcpkg's asset cache, so the instrument
+    # that produced the 76 distfiles cannot see them (finding 36). Loaded here so
+    # they are created by the same extension and named by the same use_repo.
+    print('load(":vcpkg_python_packages.bzl", "vcpkg_python_wheels")')
     print()
     print("def _vcpkg_deps_impl(_ctx):")
     print("    vcpkg_distfiles()")
+    print("    vcpkg_python_wheels()")
     print()
     print("vcpkg_deps = module_extension(implementation = _vcpkg_deps_impl)")
 
@@ -547,11 +553,36 @@ def emit_use_repo(distfiles):
     "no such repository", far from its cause)."""
     names = sorted(bazel_name(name, sha)
                    for sha, (_u, name, _p, _s) in distfiles.items())
+    # The pip wheels are created by the SAME extension, so they must be in the
+    # same use_repo -- and they are NOT in the capture, because pip does not go
+    # through vcpkg's asset cache (finding 36). Read them out of the hand-written
+    # vcpkg_python_packages.bzl rather than restating them, so pasting this output
+    # into MODULE.bazel cannot silently drop the wheel and leave a "no such
+    # repository" a long way from its cause.
+    names += ["vcpkg_pywheel_" + n for n in sorted(python_wheel_names())]
     print("use_repo(")
     print("    vcpkg_deps,")
     for n in names:
         print("    %r," % n)
     print(")")
+
+
+def python_wheel_names():
+    """The keys of VCPKG_PYTHON_WHEELS, parsed out of the .bzl that declares them.
+
+    Parsed rather than duplicated: that file is the pin, and a second copy of the
+    list here would be one more thing to drift (finding 23's rule, applied to the
+    one vcpkg input no instrument can capture).
+    """
+    path = os.path.join(ROOT, "vcpkg_python_packages.bzl")
+    if not os.path.exists(path):
+        sys.stderr.write("WARNING: %s is missing; no pip wheels will be named, so "
+                         "any port that pip-installs will fail\n" % path)
+        return []
+    with open(path) as f:
+        body = f.read()
+    block = body.split("VCPKG_PYTHON_WHEELS = {", 1)[1].split("\n}", 1)[0]
+    return re.findall(r'^\s*"([A-Za-z0-9_.\-]+)":', block, re.M)
 
 
 def emit_index(distfiles):

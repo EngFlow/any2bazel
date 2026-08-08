@@ -1861,6 +1861,11 @@ cc_binary(
 vcpkg_tree(
     name = "vcpkg_installed",
     distfiles = VCPKG_DISTFILE_INDEX,
+    # The wheels for the Python packages a portfile pip-installs (angle asks for
+    # `ply`). Pinned separately from the 76 distfiles because pip bypasses vcpkg's
+    # asset cache entirely, so the capture cannot see them and x-block-origin
+    # cannot block them -- see vcpkg_python_packages.bzl and finding 36.
+    python_wheels = ['@vcpkg_pywheel_ply//file'],
     source_dir = ".",
     source_root = ":vcpkg_source_inputs",
     triplet = "x64-linux-dynamic",

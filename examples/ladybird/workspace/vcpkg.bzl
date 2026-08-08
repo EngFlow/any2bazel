@@ -42,7 +42,7 @@ def _vcpkg_tree_impl(ctx):
     ctx.actions.run(
         outputs = [out],
         inputs = depset(
-            [index] + distfile_inputs +
+            [index] + distfile_inputs + ctx.files.python_wheels +
             ctx.files.vcpkg_tree + ctx.files.source_root,
         ),
         executable = ctx.executable._build,
@@ -52,6 +52,10 @@ def _vcpkg_tree_impl(ctx):
             ctx.attr.vcpkg_root,
             ctx.attr.source_dir,
             ctx.attr.triplet,
+            # The find-links dir for pip: a comma-joined list of the wheel paths,
+            # empty when there are none (which is then a hard failure for any port
+            # that pip-installs, rather than a silent fetch).
+            ",".join([f.path for f in ctx.files.python_wheels]),
         ],
         mnemonic = "VcpkgInstall",
         progress_message = "Building %d vcpkg ports (no network)" % len(ctx.attr.distfiles),
@@ -93,6 +97,18 @@ vcpkg_tree = rule(
         "source_root": attr.label(
             allow_files = True,
             doc = "Ladybird's manifest, overlay-ports and overlay-triplets.",
+        ),
+        "python_wheels": attr.label_list(
+            allow_files = True,
+            doc = """Wheels for the Python packages a PORTFILE pip-installs.
+
+            Staged into a find-links dir and paired with PIP_NO_INDEX, so pip
+            resolves offline from these files alone. Needed because pip does NOT go
+            through vcpkg's asset cache, so `x-block-origin` never sees it and the
+            distfile pin cannot cover it -- the angle port's `pip install ply` was
+            reaching PyPI through an inherited HTTP_PROXY for months (finding 36).
+            An empty list means pip has no index and no wheels, i.e. any port that
+            asks for a package fails loudly instead of downloading one.""",
         ),
         "vcpkg_root": attr.string(doc = "Path of the vcpkg checkout."),
         "source_dir": attr.string(doc = "Path of the Ladybird source root."),

@@ -2,7 +2,7 @@
 
 The Bazel workspace overlay produced by the any2bazel parity loop for
 [Ladybird](https://ladybird.org) (CMake + vcpkg, C++23). The narrative — why
-each of these files looks the way it does, and the 34 findings the migration
+each of these files looks the way it does, and the 36 findings the migration
 produced — is in [`docs/CASE-ladybird-migration.md`](../../docs/CASE-ladybird-migration.md).
 This directory is the *artifact*: what you would drop into a Ladybird checkout.
 
@@ -18,14 +18,48 @@ zero network access** (findings 30–33), and **so are the 10 Rust crates, `flap
 and `cranelift-compiler`** — 154 crates.io crates fetched from `Cargo.lock`,
 built by network-blocked cargo actions (findings 34–35).
 
-**`git clone && bazel build //:ladybird` builds the browser, and nothing in the
-emitted build reads CMake's build tree.** Verified by removal: with
-`Build/full/{Libraries,Services,UI,bin,cargo}` moved off the machine — every
-Ladybird-generated header and every binary CMake produced — all six binaries
-build from scratch and render `--headless=text` **and** `--headless=layout-tree`
-byte-identically to the CMake reference. `Build/full` is still needed to
-*regenerate* the BUILD files and to run the parity harness — a
-converter-development dependency, not a build dependency.
+**Nothing in the emitted build reads CMake's build tree (`Build/full`).** Verified
+by removal: with `Build/full/{Libraries,Services,UI,bin,cargo}` moved off the
+machine — every Ladybird-generated header and every binary CMake produced — all six
+binaries build from scratch and render `--headless=text` **and**
+`--headless=layout-tree` byte-identically to the CMake reference, and `cquery` over
+the closure of all six returns **0** targets under `Build/full` (down from 741).
+`Build/full` is still needed to *regenerate* the BUILD files and to run the parity
+harness — a converter-development dependency, not a build dependency.
+
+**But `git clone && bazel build //:ladybird` on a fresh clone still does NOT work,
+and this section said it did.** Tested properly for the first time — `git clone`
+into a new directory, overlay dropped in, nothing else — it fails, and it fails
+**six separate times**. `Build/full` was the dependency I removed; it was not the
+only one, and five of the six have nothing to do with it. Two are fixed here
+(#4, #5) and one now fails loudly instead of silently (#6); the rest are inputs the
+recipe must produce or document:
+
+| # | What is missing on a fresh clone | Why the dev machine hid it |
+|---|---|---|
+| 1 | **`Build/vcpkg`** — a git clone of microsoft/vcpkg at `vcpkg.json`'s `builtin-baseline`, which `//Build/vcpkg:tree` globs with `allow_empty = True`. Matches *one* file (its own `BUILD.bazel`) and the build fails with `/tmp/.../root/vcpkg: No such file or directory`. Ladybird's own `Meta/ladybird.py vcpkg` creates it; the recipe above never says so | `Meta/ladybird.py vcpkg` had been run months earlier |
+| 2 | **`.git` inside that checkout** — vcpkg resolves versioned ports with `git read-tree`, so it is load-bearing (120 MB), and the filegroup *excludes* it. The action is `no-sandbox`, so it reads the real path and got it anyway: an **undeclared input the build needs** | `no-sandbox` + a real checkout on disk |
+| 3 | **`Build/caches/HSTSPreload/transport_security_state_static.json`** (10 MB) — an *unversioned, unpinned* network download CMake does at configure time (`Meta/CMake/hsts_preload.cmake` fetches Chromium's `main`). `codegen_root.bzl` names it as a genrule `srcs`, so Bazel fails cleanly with `missing input file` — but there is no rule that produces it | the CMake configure had already downloaded it |
+| 4 | **Two path bugs in `Meta/vcpkg_build.sh`** — the distfile index and its entries were passed **execroot-relative**, and vcpkg invokes the asset-cache script from its own cwd, so `awk`/`cp` looked in the wrong directory. Every asset lookup failed, reported as `no asset cache hits`, and `x-block-origin` then correctly refused the network. Fixed here (absolutize both) | the vcpkg checkout already had `downloads/tools/cmake-4.4.0-linux` from an earlier run, so vcpkg never *asked* the script for a tool |
+| 5 | **The `angle` port runs `pip install ply`** (`x_vcpkg_get_python_packages`), which is **not** an asset-cache download and therefore not covered by the pin. A real hole in the "zero network access" claim: `vcpkg_tree` set `requires-network: "0"`, but that is a *scheduling hint*, and with `no-sandbox: "1"` **nothing enforced it** — with `use_default_shell_env = True` the action inherited `HTTP_PROXY`/`HTTPS_PROXY` and pip reached PyPI. **Fixed here:** the wheel is pinned by URL+sha256 (`vcpkg_python_packages.bzl`), staged into a find-links dir, and pip runs with `PIP_NO_INDEX` and the proxy variables unset | this sandbox exports a proxy, so pip silently succeeded through it |
+| 6 | **The four `vcpkg_from_git` archives were pre-placed from a directory I had made by hand.** `vcpkg_git_archives.bzl` is generated, committed, listed in the table below — and **loaded by nothing**. The staging was `if [ -d ... ]; then cp ... 2>/dev/null \|\| true; fi`: three ways to succeed while copying nothing. Without them skia fails ~20 min in with `git fetch https://android.googlesource.com/.../piex.git … Error code: 128`, naming neither the directory nor the tarball. **Now a hard error in 4 seconds** naming both; producing them from Bazel still needs a repo rule (they are `git archive` output, so there is no URL to `http_file`) | I created the directory by hand while building the pin, months before |
+
+Rows 1–3 are inputs the recipe must produce or document (step 1a). Rows 4–6 were
+bugs, and 5 is the substantive one: **"zero network access" was measured with
+`x-block-origin`, which only governs vcpkg's own downloader.** A portfile that
+shells out to pip, git or curl bypasses it entirely, and nothing was enforcing the
+absence of a network — `requires-network: "0"` is a hint, and `no-sandbox: "1"`
+means there is no namespace to enforce. `ply` is now pinned like any other
+dependency (URL + sha256 → `http_file` → find-links dir → `PIP_NO_INDEX`), which
+makes an unpinned package a hard error rather than a download. The four
+`vcpkg_from_git` archives are still staged from a directory rather than fetched by
+Bazel — they are `git archive` output with no URL, so they need a repo rule that
+clones at the pinned ref.
+
+The lesson is the same one as finding 35, one layer out: **`Build/full` was the
+dependency I went looking for, so it is the one I found.** The check that would
+have caught all five is not a better `cquery` — it is doing the clone. See
+[Known gaps](#known-gaps).
 
 **This claim was false until recently, and the way it was false is the most
 useful thing in this directory.** The README said it worked; it did not. Every
@@ -64,7 +98,8 @@ an FFI header collision and an entire missing Rust target. See
 | `cargo.bzl`, `Meta/cargo_build.sh`, `Meta/cargo_binary_build.sh`, `Meta/cargo_vendor.sh` | `rust_sysroot` (the pinned 1.96.1 toolchain merged into one tree), `cargo_crate` / `cargo_binary` (offline, network-blocked build actions), and `cargo_lib` (one consumable `CcInfo` per crate: its archive + its FFI headers) |
 | `cargo_ring.bzl` | The 10 `cargo_crate` + 10 `cargo_lib` targets and `flapc`, as a macro for the root package (the crate sources are at the repo root and `glob()` is package-relative). **Generated** by `Meta/emit_cargo_bazel.py` |
 | `export_headers.bzl`, `Libraries/LibWeb/export_header.bzl` | The 15 `generate_export_header` `Export.h` files + AK's two `configure_file` headers, generated by Bazel from the same inputs CMake uses. **Generated** by `Meta/emit_export_headers_bazel.py`; `--check Build/full` byte-compares every one against CMake's |
-| ~~`Build/full/**/BUILD.bazel`~~ | **Gone.** These shimmed the reference CMake build tree, and by the end they supplied *nothing*: the 709 headers they globbed were 21 Bazel generates and 688 LibWeb bindings headers Bazel also generates. Deleting them is what turned "the README claims a clone-and-build" into one |
+| ~~`Build/full/**/BUILD.bazel`~~ | **Gone.** These shimmed the reference CMake build tree, and by the end they supplied *nothing*: the 709 headers they globbed were 21 Bazel generates and 688 LibWeb bindings headers Bazel also generates. Deleting them removed the *`Build/full`* dependency — not every clone-and-build blocker, as the table at the top now records |
+| `Build/vcpkg/BUILD.bazel` | A filegroup over the microsoft/vcpkg checkout. **Still the same `allow_empty = True` glob over a foreign tree that finding 35 is about** — it just globs a *different* tree, so a fresh clone gets no diagnostic. Gap 7 |
 
 The four generated files are reproducible: re-running each emitter against the
 same `Build/full` reproduces them byte for byte — **on the same machine**. They
@@ -75,14 +110,37 @@ adds `-I/usr/include/libdrm`), which is gap 3 below, not an emitter bug.
 ## Reproducing
 
 To **build the browser**, no CMake build is needed — Bazel fetches and builds the
-vcpkg tree and the Rust crates itself, with zero network access in either:
+vcpkg *ports* and the Rust crates itself, and vcpkg's own downloader reaches the
+network zero times. Three inputs still have to be present first (step 1a; gaps 7–8),
+and one port bypasses the pin via `pip`, so "no network at all" is not yet true:
 
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
 # 1. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt header
-                                                 # that is not self-contained (gap 7)
+                                                 # that is not self-contained (gap 9)
+# 1a. THE THREE INPUTS THE OVERLAY DOES NOT CARRY. Without these the build fails;
+#     see the table above for how each one stayed invisible on the dev machine.
+#     (a) the vcpkg checkout at vcpkg.json's builtin-baseline, WITH its .git --
+#         vcpkg resolves versioned ports via `git read-tree`. Ladybird's own
+#         helper does exactly this:
+python3 Meta/ladybird.py vcpkg
+#     (b) the HSTS preload table: an unversioned download from Chromium's main
+#         branch that CMake does at configure time. No Bazel rule produces it.
+mkdir -p Build/caches/HSTSPreload && curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
+    https://raw.githubusercontent.com/chromium/chromium/main/net/http/transport_security_state_static.json
+#     (c) the four vcpkg_from_git archives. These are `git archive` output, so
+#         there is no URL to http_file and Bazel cannot fetch them yet; the
+#         hashes ARE pinned (vcpkg_git_archives.bzl) so they can be verified.
+#         Absent, the build now fails in 4s naming them (gap 7).
+#     NB `ply` no longer needs anything: the wheel is pinned and pip runs with
+#         PIP_NO_INDEX (gap 8).
+#
+# 1b. vcpkg's buildtrees peak around 3 GB, and a default /tmp tmpfs is often too
+#     small -- which surfaces as `No space left on device` from the ASSET SCRIPT,
+#     i.e. a message that blames the pin for a full disk.
+#     --action_env=TMPDIR=... if /tmp is small.
 # 2. Build. This includes the 77 vcpkg ports (~45 min cold) and the 10 Rust
 #    crates + flapc + cranelift-compiler: the libraries depend on them through
 #    //Meta/vcpkg:<port> and //:<crate>_lib, so there is no separate step. Build
@@ -362,7 +420,47 @@ Honest inventory of what stops this from being a clone-and-build.
    patches). The BCR's `rules_qt` module is Vertexwahn's unrelated `rules_qt6`.
    Qt itself *is* host-portable: `qt.local_repo` discovers the host Qt via
    `qmake -query`, so no Qt SDK is vendored.
-7. **Three upstreamable Ladybird fixes.** The first is the `sorted()` determinism
+7. **The fresh clone needs three inputs the overlay does not carry** (step 1a
+   above), and each stayed invisible for the same reason: it was already on the
+   machine. `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s
+   `builtin-baseline`, created by Ladybird's own `Meta/ladybird.py vcpkg` — is
+   globbed by `//Build/vcpkg:tree` with `allow_empty = True`, so on a clone it
+   matches one file and the failure names a missing `/tmp/.../root/vcpkg`. Its
+   `.git` is *load-bearing* (vcpkg resolves versioned ports with `git read-tree`)
+   yet the filegroup **excludes** it — an undeclared input the build reads anyway,
+   because the action is `no-sandbox`. And
+   `Build/caches/HSTSPreload/transport_security_state_static.json` is an
+   *unversioned* download from Chromium's `main` branch that CMake does at
+   configure time; `codegen_root.bzl` names it as a genrule input, so Bazel fails
+   cleanly, but nothing produces it.
+
+   The honest fix for all three is the same shape as findings 30–33: pin them and
+   let Bazel fetch them. The vcpkg checkout is a `git_repository` at the
+   `builtin-baseline` commit (which `vcpkg.json` already names, so the pin exists
+   — it just is not wired to Bazel); the HSTS table is an `http_file`, and needs a
+   hash Ladybird does not currently pin at all, because the URL tracks `main`.
+
+8. **"Zero network access" is true of vcpkg's downloader, not of the vcpkg
+   action.** The pin + `x-block-origin` is verified — a distfile missing from the
+   index is a hard error, not a fetch. But `x-block-origin` only governs vcpkg's
+   *own* downloads, and the `angle` overlay-port calls
+   `x_vcpkg_get_python_packages`, which runs **`pip install ply`**. That is not an
+   asset-cache download, so nothing pins it and `x-block-origin` never sees it.
+   Nor is anything stopping it: `vcpkg_tree` sets `requires-network: "0"`, which is
+   a *scheduling hint* Bazel does not enforce, and `no-sandbox: "1"` means there is
+   no network namespace to enforce it in — so with `use_default_shell_env = True`
+   the action inherits `HTTP_PROXY`/`HTTPS_PROXY` and pip reaches PyPI.
+
+   It went unnoticed because this sandbox exports a proxy, so pip silently
+   succeeded; a fresh clone in a network-free environment fails with
+   `No matching distribution found for ply`. Two things to fix, and the second
+   matters more than the first: pin `ply` as an `http_file` wheel staged into the
+   port's venv, **and stop taking `requires-network: "0"` as a claim** — the
+   verification has to be an environment with no route to the network, not a flag
+   that says there is none. Same shape as the shim that could not fail: a control
+   that is not enforced is indistinguishable from one that is not there.
+
+9. **Three upstreamable Ladybird fixes.** The first is the `sorted()` determinism
    fix in `Meta/Generators/libweb_bindings/to_idl_value.py`, filed as
    [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899) and
    fixed upstream.

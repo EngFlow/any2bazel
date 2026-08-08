@@ -51,9 +51,41 @@ INDEX="${2:?distfile index}"
 VCPKG_TREE="${3:?vcpkg checkout}"
 SRC="${4:?ladybird source root}"
 TRIPLET="${5:-x64-linux-dynamic}"
+WHEELS="${6-}"
 
+# vcpkg's buildtrees peak around 3 GB, and $TMPDIR is often a tmpfs sized well
+# under that (7.9 GB here, shared with everything else) -- which surfaces as
+# `cp: error writing ...: No space left on device` from the ASSET SCRIPT, i.e. a
+# message that blames the pin for a full disk. Honour $TMPDIR when it is set, so a
+# caller can point this at real disk, and say where the scratch went.
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+echo "vcpkg_build: scratch dir $WORK ($(df -h "$WORK" | awk 'NR==2{print $4}') free)" >&2
+# Cleaned up on the way out INCLUDING on failure -- an interrupted run used to
+# leave a multi-GB tree behind, and several of them is how the disk filled.
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+# The index arrives as an EXECROOT-RELATIVE path (bazel-out/.../x.index), and the
+# asset-cache script below is run by vcpkg from vcpkg's own working directory, not
+# ours -- so a relative path there resolves against the wrong dir and awk reports
+# "cannot open". Absolutize it here, once, while we are still in the execroot.
+#
+# Why this survived so long: on the machine this was developed on, the vcpkg
+# checkout already had downloads/tools/cmake-4.4.0-linux populated by an earlier
+# `Meta/ladybird.py vcpkg` run, so vcpkg found its tools locally and never invoked
+# the asset script for one. Only a clone with a pristine checkout makes vcpkg ask
+# for cmake -- and then the script fails, is reported as "no asset cache hits",
+# and x-block-origin correctly refuses to reach the network.
+#
+# The index's VALUES are execroot-relative for the same reason, so rewrite them
+# to absolute here too: awk finding the row is only half the job, and `cp` from a
+# relative path fails identically once vcpkg has chdir'd. Both halves have to be
+# absolutized in the same place, or the failure just moves one line down.
+EXECROOT="$PWD"
+INDEX_ABS="$WORK/index"
+awk -v root="$EXECROOT" \
+    '{ if ($2 ~ /^\//) print $1, $2; else print $1, root "/" $2 }' \
+    "$INDEX" > "$INDEX_ABS"
+INDEX="$INDEX_ABS"
 
 # vcpkg reads $HOME (for its own config/telemetry dirs) and hard-fails "unable to
 # read $HOME" without it. Bazel deliberately does not pass HOME through to
@@ -63,6 +95,40 @@ trap 'rm -rf "$WORK"' EXIT
 # leak state between builds.
 export HOME="$WORK/home"
 mkdir -p "$HOME"
+
+# --- pip: offline, from Bazel-fetched wheels only ----------------------------
+#
+# vcpkg's asset cache does NOT cover pip. The angle overlay-port calls
+# x_vcpkg_get_python_packages, which runs `pip install ply` inside a venv, and
+# neither x-script nor x-block-origin ever sees the request -- so the 76-distfile
+# pin says nothing about it and, with this action running `no-sandbox` and
+# inheriting the shell env, pip happily used the caller's HTTP_PROXY for months
+# (finding 36). `requires-network: "0"` did not stop it: that is a scheduling hint,
+# not a namespace.
+#
+# pip's own offline switches are the fix, so no portfile patch is needed:
+# PIP_NO_INDEX forbids talking to an index at all, PIP_FIND_LINKS points at a
+# directory of wheels Bazel fetched by URL+hash. A package that is not pinned then
+# fails with "No matching distribution found", which is the pip-side equivalent of
+# x-block-origin -- an error instead of a download.
+#
+# Unset the proxy variables too. Leaving them would make the *failure* mode depend
+# on the caller's environment: --no-index means pip should not reach an index, and
+# an inherited proxy is exactly how this went unnoticed. Belt and braces, because
+# the lesson of finding 36 is that one unenforced control is not a control.
+FINDLINKS="$WORK/wheels"
+mkdir -p "$FINDLINKS"
+if [ -n "$WHEELS" ]; then
+    IFS=',' read -r -a _wheels <<< "$WHEELS"
+    for w in "${_wheels[@]}"; do
+        [ -n "$w" ] && cp "$w" "$FINDLINKS/"
+    done
+fi
+export PIP_NO_INDEX=1
+export PIP_FIND_LINKS="$FINDLINKS"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+echo "vcpkg_build: pip is offline; $(ls "$FINDLINKS" | wc -l) pinned wheel(s)" >&2
 
 # --- the asset-cache script: resolve by hash, never fetch --------------------
 cat > "$WORK/fetch.sh" <<EOF
@@ -85,9 +151,33 @@ rm -rf "$ROOT/installed" "$ROOT/packages" "$ROOT/buildtrees"
 mkdir -p "$ROOT/downloads"
 
 # Pre-place the git-sourced externals (see note 5).
-if [ -d "$SRC/Meta/CMake/vcpkg/git-archives" ]; then
-    cp "$SRC/Meta/CMake/vcpkg/git-archives/"*.tar.gz "$ROOT/downloads/" 2>/dev/null || true
+#
+# This used to be `if [ -d ... ]; then cp ... 2>/dev/null || true; fi` -- three
+# separate ways to succeed while copying nothing, in four lines. On the machine
+# that developed this, the directory existed because I had created it by hand; on a
+# fresh clone it does not, so all four archives were silently absent and the build
+# failed ~20 minutes later inside skia's portfile with
+# `git fetch https://android.googlesource.com/.../piex.git ... Error code: 128`,
+# naming neither this directory nor the tarball. Exactly the finding-35 shape: a
+# copy that cannot fail is indistinguishable from a copy that is not needed.
+#
+# So: fail here, naming what is missing and where it comes from. VCPKG_GIT_ARCHIVES
+# in vcpkg_git_archives.bzl lists the four expected names -- that file is GENERATED
+# and checked in, and (finding 36) is currently loaded by nothing at all, which is
+# the deeper bug this only reports. These are `git archive` output, so unlike the 76
+# distfiles they have no URL to http_file; making Bazel produce them needs a repo
+# rule that clones at the pinned ref (gap 7).
+GIT_ARCHIVES="$SRC/Meta/CMake/vcpkg/git-archives"
+if ! compgen -G "$GIT_ARCHIVES/*.tar.gz" > /dev/null; then
+    echo "vcpkg_build: no git-sourced externals at $GIT_ARCHIVES" >&2
+    echo "vcpkg_build: 4 are required (see VCPKG_GIT_ARCHIVES in" >&2
+    echo "vcpkg_build: vcpkg_git_archives.bzl). vcpkg_from_git bypasses the asset" >&2
+    echo "vcpkg_build: cache entirely, so without them skia and angle will try to" >&2
+    echo "vcpkg_build: 'git fetch' and fail ~20 minutes into the build with an" >&2
+    echo "vcpkg_build: error naming a googlesource URL rather than this directory." >&2
+    exit 1
 fi
+cp "$GIT_ARCHIVES"/*.tar.gz "$ROOT/downloads/"
 
 # --- manifest, verbatim (note 2) --------------------------------------------
 MANIFEST="$WORK/manifest"

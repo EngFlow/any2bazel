@@ -416,8 +416,11 @@ one entry point that knows how many files there are and how many tests each
 contributed. Its three guards are themselves tested, by triggering them
 (`test_run_all.py`).
 
-Each file also still runs standalone (`python3 tests/test_engine.py`) for a quick
-single-file loop. As the suite grows the next step is a `py_test` per file under
+Run one file or one test with a substring filter (`run_all.py test_triage`,
+`run_all.py -v cargo`). The per-file `if __name__` runners are gone: in one file
+that block had ended up **mid-file**, so four tests appended after it were defined,
+never called, and the file still reported `6/6 passed`. A test's position in the
+file should not decide whether it runs. As the suite grows the next step is a `py_test` per file under
 `bazel test //...`, so the caching and parallelism come for free and a commit gate
 runs it without anyone remembering to — this repo has no `MODULE.bazel` yet.
 

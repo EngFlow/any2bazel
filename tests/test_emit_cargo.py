@@ -748,22 +748,10 @@ def test_every_extension_created_repo_is_named_in_module_bazel():
     assert {"rust_rustc_1_96_1", "rust_cargo_1_96_1",
             "rust_rust_std_1_96_1"} <= named
 
-
-if __name__ == "__main__":
-    # A runner, because without one this file EXITED 0 WITHOUT RUNNING ANYTHING --
-    # a test suite that cannot fail, which is the same bug as a glob that cannot
-    # fail (finding 35). Found by checking that the suite's output accounted for
-    # every test file, rather than trusting the exit code.
-    import sys as _sys, traceback
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"PASS {fn.__name__}")
-        except Exception:
-            failed += 1
-            print(f"FAIL {fn.__name__}")
-            traceback.print_exc()
-    print(f"\n{len(fns) - failed}/{len(fns)} passed")
-    _sys.exit(1 if failed else 0)
+# No `if __name__ == "__main__"` runner here on purpose. There used to be one in
+# every test file, and in this file it sat MID-FILE -- so four tests appended after
+# it were defined, never called, and the file still printed "6/6 passed". The third
+# instance of this session's recurring bug: a report that cannot count what it does
+# not reach. `python3 tests/run_all.py` enumerates the module instead, so a test's
+# POSITION in the file cannot decide whether it runs; it also fails if a file
+# defines no tests at all. Run a single file with `run_all.py <name-substring>`.

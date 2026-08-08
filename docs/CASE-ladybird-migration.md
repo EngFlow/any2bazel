@@ -8,12 +8,20 @@ generated BUILD files — is in [`examples/ladybird/`](../examples/ladybird/),
 along with an honest inventory of what still stops it from being a
 clone-and-build.
 
-`git clone && bazel build //:ladybird` now builds the browser with **nothing**
-read out of CMake's build tree. That was claimed prematurely and was false for
-most of this migration; [finding 35](#finding-35-the-claim-was-false-and-a-glob-is-why-nobody-noticed)
-is the autopsy, and it is the finding to read first if you are migrating a project
-of your own — the bug was in the *shape of the verification*, not in the Bazel
-rules.
+Bazel now builds the browser with **nothing** read out of CMake's build tree
+(`Build/full`) — 0 targets in the closure of all six binaries, down from 741. That
+was claimed prematurely and was false for most of this migration;
+[finding 35](#finding-35-the-claim-was-false-and-a-glob-is-why-nobody-noticed) is
+the autopsy, and it is the finding to read first if you are migrating a project of
+your own — the bug was in the *shape of the verification*, not in the Bazel rules.
+
+**`git clone && bazel build` on a fresh clone still fails, though, and finding 36
+is the second autopsy.** Removing `Build/full` was the goal, so `Build/full` is
+what I verified; the clone needs four *other* things nobody had asked for — a
+vcpkg checkout (globbed with `allow_empty = True`, the same pattern one tree over),
+its `.git`, an unpinned HSTS table, and `pip install ply` inside a vcpkg port that
+`x-block-origin` never sees. **The only check that finds all of them is doing the
+clone**, which is finding 36's one-line summary and took two goes to learn.
 
 ## Why Ladybird
 
@@ -1435,10 +1443,11 @@ Both remaining debts are over-declaration, and they are honest:
 - Each `vcpkg_lib` still declares the whole vcpkg tree as its header input
   (finding 33's leftover). Same shape: paths are per-port, the input *set* is not.
 
-`git clone && bazel build //:ladybird` is now true for the browser. `Build/full`
-is still needed to *regenerate* the BUILD files and to run the parity harness —
-that is a converter-development dependency, not a build dependency, and it is a
-different claim from the one this ring closed.
+Nothing in the emitted build reads `Build/full` any more. It is still needed to
+*regenerate* the BUILD files and to run the parity harness — a converter-development
+dependency, not a build dependency, and a different claim from the one this ring
+closed. (It is also a different claim from "a fresh clone builds", which is still
+false for unrelated reasons — finding 36.)
 
 **That claim was still false when I wrote it, and finding 35 is the autopsy.** I
 had closed the two *binary* dependencies (vcpkg, Rust) and concluded the tree was
@@ -1669,6 +1678,118 @@ detect a missing file; counting matched files cannot detect an empty glob;
 counting green actions cannot detect a header supplied by a shim. Each time, the
 fix was to make the enclosing thing declare how many children it should have.
 
+## Finding 36: I removed the dependency I was looking for, so that is the one I found
+
+Ulf asked, again: *can I clone and build with Bazel?* Finding 35 had just closed the
+741 `Build/full` header dependencies, `cquery` returned 0, and the README said yes.
+This time I did not answer from the README. I ran `git clone` into an empty
+directory, dropped the overlay in, and typed the command.
+
+**It failed. Six times, for six different reasons, and five of them have nothing to
+do with `Build/full`.**
+
+| What was missing | The error a cloner gets | Why my machine hid it |
+|---|---|---|
+| `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s `builtin-baseline` | `/tmp/.../root/vcpkg: No such file or directory` | `Meta/ladybird.py vcpkg` had been run months earlier |
+| its `.git` (120 MB), which vcpkg needs for `git read-tree` to resolve versioned ports — and which the filegroup **excludes** | `fatal: not a git repository: '.git'` … `while checking out port sqlite3` | the action is `no-sandbox`, so it read the real checkout regardless of what was declared |
+| `Build/caches/HSTSPreload/transport_security_state_static.json`, an **unversioned** download CMake does at configure time from Chromium's `main` | `missing input file '//:Build/caches/...'` | CMake's configure had already fetched it |
+| two path bugs in `Meta/vcpkg_build.sh`: the distfile index *and its entries* were execroot-relative, and vcpkg runs the asset script from its own cwd | `awk: cannot open ...`, then `cp: cannot stat ...`, surfacing as `no asset cache hits` and `x-block-origin blocks trying the authoritative source` | the checkout already had `downloads/tools/cmake-4.4.0-linux`, so vcpkg never *asked* the script for a tool |
+| `ply`, which the `angle` port installs with **`pip install ply`** | `No matching distribution found for ply` | this sandbox exports `HTTP_PROXY`, and the action inherits it |
+| the four `vcpkg_from_git` archives, staged from a directory I had made **by hand** — `vcpkg_git_archives.bzl` is generated, committed, documented, and **loaded by nothing** | 20 minutes in: `git fetch https://android.googlesource.com/.../piex.git … Error code: 128` | the directory existed on my disk from when I built the pin |
+
+### Three of them are the same bug as finding 35, in three different syntaxes
+
+`//Build/vcpkg:tree` is `glob(["**"], allow_empty = True)` over a directory a fresh
+clone does not have. It matches exactly one file — *its own `BUILD.bazel`* — reports
+nothing, and the build dies later somewhere else. That is the finding-35 pattern
+verbatim; I had deleted the three `Build/full` shims and left a fourth shim, over a
+different tree, in place. **I had been looking for `Build/full`, so `Build/full` is
+what I removed.**
+
+The git-archive staging is the same idea written in bash, and it is worth quoting
+because it packs three independent ways to succeed while doing nothing into four
+lines:
+
+```bash
+if [ -d "$SRC/Meta/CMake/vcpkg/git-archives" ]; then                     # skips
+    cp "$SRC/Meta/CMake/vcpkg/git-archives/"*.tar.gz "$ROOT/downloads/" \
+        2>/dev/null || true                                              # hides, forgives
+fi
+```
+
+A directory test that skips silently, a redirect that swallows the error, and a
+`|| true` that forgives the exit code. The four tarballs it was supposed to place
+only ever existed because *I* had made that directory while capturing the pin.
+`vcpkg_git_archives.bzl` — generated, checked in, listed in the README's file table
+— is loaded by **nothing**; it is documentation wearing a `.bzl` extension. Without
+those files skia gets 20 minutes in and dies fetching `piex.git` from
+android.googlesource.com, naming neither the directory nor the tarball nor the port
+that pinned it. It now fails in four seconds saying exactly what is missing and
+where it comes from.
+
+The `.git` case is worse than a missing input, because it is a *lie in the
+declaration*: the filegroup explicitly excludes `.git/**`, the port resolution
+genuinely requires it, and the build works anyway because `no-sandbox: "1"` lets the
+action read the real path instead of the declared inputs. An excluded input that the
+action reads is strictly worse than an undeclared one — the exclusion looks like a
+decision.
+
+### The fifth is a hole in a claim I had "verified"
+
+"The 77 vcpkg ports are built with **zero network access**" was measured with
+`x-block-origin`, and that measurement is sound as far as it goes: remove a distfile
+from the index and the build hard-fails instead of fetching. But `x-block-origin`
+governs **vcpkg's own downloader** and nothing else. The `angle` overlay-port calls
+`x_vcpkg_get_python_packages`, which runs `pip install ply` — not a distfile, not an
+asset, never seen by the pin.
+
+And nothing stopped it, because I had written the enforcement as a *label*:
+
+```python
+execution_requirements = {"local": "1", "no-sandbox": "1", "requires-network": "0"}
+```
+
+`requires-network: "0"` is a scheduling hint. It does not build a network namespace,
+and `no-sandbox: "1"` guarantees there is none to build. With
+`use_default_shell_env = True` the action inherits this sandbox's `HTTP_PROXY`, so
+pip quietly succeeded for months. **A control that is not enforced is
+indistinguishable from a control that is not there** — the same sentence as finding
+35's glob, applied to an `execution_requirements` key instead of a `glob()`
+argument.
+
+The fix needs no patch to the portfile, because pip has supported offline switches:
+the wheel is pinned by URL and sha256 (`vcpkg_python_packages.bzl` → `http_file`),
+declared as an input of the vcpkg action, staged into a find-links directory, and pip
+runs with `PIP_NO_INDEX=1` and the proxy variables unset. An unpinned package is then
+`No matching distribution found` — an error, not a download, which is precisely the
+property `x-block-origin` gives the other 76. Two details are worth keeping: the URL
+is `files.pythonhosted.org`'s content-addressed path (immutable for a version, unlike
+`pip install ply`, which resolves against whatever PyPI serves today), and the wheel
+had to be added to `use_repo` *and* to the emitter's `--use-repo` output — it is the
+one vcpkg input no instrument can capture, so it is also the one a regeneration can
+silently drop.
+
+The other half of the fix is not code: **verify in an environment with no route to
+the network.** A flag asserting there is no network is exactly the kind of evidence
+this migration keeps getting wrong.
+
+### What generalizes
+
+Three times now the same shape: a `glob` that cannot fail, test files that ran no
+tests, and an `execution_requirements` key that enforces nothing. Each one was
+*green*, and green was the problem. What is worth taking from finding 36 specifically
+is narrower and more uncomfortable:
+
+**Verification finds what it is aimed at.** "Verified by removal" is the strongest
+check in this document, and it is still only a test of *what you remove*. I removed
+`Build/full` because `Build/full` was the thing I had been arguing about; a clone
+needs `Build/vcpkg`, a `.git`, an HSTS table and a Python package, and no amount of
+rigor about `Build/full` was ever going to mention them. The check that finds all
+five is not a better `cquery` or a wider removal — it is **the actual user's first
+command, run the way the user runs it, in a directory that has never seen this
+project.** That is one line of shell, it costs ten minutes, and I should have run it
+before the first time I said yes.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1734,9 +1855,11 @@ every process (UI, WebContent, Compositor, RequestServer, ImageDecoder)
 Bazel-built, proven by removing the reference services and watching the CMake
 binary fail while the Bazel one renders.
 
-And with findings 33, 34 **and 35** it is a **clone-and-build**: Bazel fetches and
-builds the 77 vcpkg ports, the 10 Rust crates, `flapc`, `cranelift-compiler` and
-every generated header itself, with zero network access in the build actions.
+And with findings 33, 34 **and 35**, Bazel fetches and builds the 77 vcpkg ports,
+the 10 Rust crates, `flapc`, `cranelift-compiler` and every generated header itself,
+with vcpkg's own downloader reaching the network zero times. It is **not** yet a
+clone-and-build: finding 36 lists the four inputs a fresh clone still lacks and the
+one vcpkg port that bypasses the pin with `pip`.
 `Build/full` is now only the *converter's* input — the model the emitters read and
 the baseline the parity harness diffs — not the build's, and this time that is
 measured: **0 targets under `Build/full` in the `cquery` closure of all six
@@ -1753,7 +1876,7 @@ instructive part of this migration — see finding 35.
 from scratch (2,700 C++ plus the vcpkg and Rust rings);
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); 35 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); a fresh clone still needs 4 inputs the overlay does not carry and one port reaches PyPI via pip (finding 36 — found by actually cloning); 36 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 **One number in this scoreboard was wrong for most of the migration, and it is

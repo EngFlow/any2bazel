@@ -60,15 +60,10 @@ def test_render_caps_bazel_only_tail():
     # cmake_only (actionable) is never capped
     assert "-std=gnu++17" in text
 
-
-if __name__ == "__main__":
-    import traceback
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for fn in fns:
-        try:
-            fn(); print(f"PASS {fn.__name__}")
-        except Exception:
-            failed += 1; print(f"FAIL {fn.__name__}"); traceback.print_exc()
-    print(f"\n{len(fns) - failed}/{len(fns)} passed")
-    sys.exit(1 if failed else 0)
+# No `if __name__ == "__main__"` runner here on purpose. There used to be one in
+# every test file, and in this file it sat MID-FILE -- so four tests appended after
+# it were defined, never called, and the file still printed "6/6 passed". The third
+# instance of this session's recurring bug: a report that cannot count what it does
+# not reach. `python3 tests/run_all.py` enumerates the module instead, so a test's
+# POSITION in the file cannot decide whether it runs; it also fails if a file
+# defines no tests at all. Run a single file with `run_all.py <name-substring>`.
