@@ -324,6 +324,10 @@ tests/
   test_extract_npm.py  npm frontend (NDJSON → action IR) + role classification
   test_triage.py       triage grouping/histogram/cap behavior
   test_configure.py    configure_file trace extraction
+  test_diff_ts.py      the standalone TS source→emit diff
+  test_emit_cargo.py   the Ladybird Rust ring emitter (crates/index/ring/binaries)
+  test_emit_vcpkg.py   the Ladybird vcpkg pin emitter (versions db → http_file)
+  test_vcpkg_plumbing.py  what the generated vcpkg BUILD/bzl files must not say
 docs/
   DESIGN-action-based-ir.md    the action-based IR reframe (grounded in CMake/Bazel/Maven)
   proposal-doc.md              the broader Build IR spec (frontends → IR → backends)
@@ -390,13 +394,16 @@ Run as a skill, Claude drives the generation and triage/fix loop automatically.
 ## Tests
 
 ```bash
-python3 tests/test_engine.py
-python3 tests/test_extractors.py
-python3 tests/test_maven.py
-python3 tests/test_extract_npm.py
-python3 tests/test_triage.py
-python3 tests/test_configure.py
+for f in tests/test_*.py; do python3 "$f" || echo "FAILED $f"; done
 ```
+
+Run the glob, not a hand-kept list of files: three of these test files once had
+no `if __name__ == "__main__"` runner at all, so running them **exited 0 having
+executed nothing** — a test suite that cannot fail, which is the same bug as a
+`glob(..., allow_empty = True)` over a directory that is not there (case study
+finding 35). Each file prints `PASS`/`FAIL` per test and an `N/N passed` line, so
+compare the totals against the number of `def test_` in the file rather than
+trusting the exit code.
 
 The extractor tests run against fixtures under `tests/` that mirror the
 documented File API, aquery, Maven argfile, and npm-NDJSON schemas. Real projects

@@ -8,6 +8,13 @@ generated BUILD files — is in [`examples/ladybird/`](../examples/ladybird/),
 along with an honest inventory of what still stops it from being a
 clone-and-build.
 
+`git clone && bazel build //:ladybird` now builds the browser with **nothing**
+read out of CMake's build tree. That was claimed prematurely and was false for
+most of this migration; [finding 35](#finding-35-the-claim-was-false-and-a-glob-is-why-nobody-noticed)
+is the autopsy, and it is the finding to read first if you are migrating a project
+of your own — the bug was in the *shape of the verification*, not in the Bazel
+rules.
+
 ## Why Ladybird
 
 A real, recognizable, from-scratch browser engine — a strong headline for the
@@ -1433,6 +1440,221 @@ is still needed to *regenerate* the BUILD files and to run the parity harness �
 that is a converter-development dependency, not a build dependency, and it is a
 different claim from the one this ring closed.
 
+**That claim was still false when I wrote it, and finding 35 is the autopsy.** I
+had closed the two *binary* dependencies (vcpkg, Rust) and concluded the tree was
+free; it was not. Every binary still depended on **741 targets under `Build/full`**
+for *generated headers*, and I had not checked, because the thing that would have
+told me — a build failure — could not happen: the shims globbed a foreign tree
+with `allow_empty = True`. Read finding 35 before believing any "verified by
+removal" in this document, including the ones above: removal is only a test of
+what you actually remove.
+
+## Finding 35: the claim was false, and a glob is why nobody noticed
+
+Ulf asked where things stood on checking out Ladybird and building it with Bazel.
+I said it worked — findings 33 and 34 had closed vcpkg and Rust, the two *binary*
+dependencies on CMake's tree, and the README said so in bold. Then I checked,
+which I should have done before saying it.
+
+It did not work. Every one of the six binaries depended on **741 targets under
+`Build/full`**, CMake's build tree, and the overlay in `examples/ladybird/`
+shipped four `BUILD.bazel` files and **zero headers**. A fresh clone got no error
+from that — it built for roughly 1,600 actions and then died on `fatal error:
+LibXML/Export.h: No such file or directory`, a message that names neither the shim
+nor the missing tree.
+
+**The mechanism is the finding.** The shims were
+
+```python
+cc_library(
+    name = "generated_lib_headers",
+    hdrs = glob(["**/*.h"], allow_empty = True),
+    includes = ["."],
+)
+```
+
+over a directory that only exists after a CMake build. `allow_empty = True` turns
+"the tree you depend on is absent" into an empty list and no diagnostic. A glob
+over a foreign tree **cannot fail**, so a shim that is broken and a shim that is
+unnecessary are indistinguishable — and I had been reading a green build as
+evidence for the second.
+
+That generalizes past this migration, and it is the transferable lesson: **if the
+emptiness of a glob means "a thing I depend on is missing", `allow_empty = True`
+converts a build error into a mystery.** Either let it fail, or don't pretend the
+input is optional.
+
+### 741 → 31: most of them were not gaps, they were shadows
+
+Counting the true gaps needed care, and my first count was nonsense — "741
+targets, 76 covered", which is impossible. The bug was **matching headers by
+basename**: every `Export.h` matched every other `Export.h`, so coverage looked
+enormous. Comparing exact logical paths gave the real picture:
+
+| | count | what it was |
+|---|---|---|
+| LibWeb bindings headers | 666 | **Bazel already generates all 692.** The shim was *shadowing* Bazel's own outputs, silently winning or losing on include order |
+| `generate_export_header` `Export.h` | 15 | real gap |
+| Rust FFI headers (`RustFFI.h`, `CraneliftFFI.h`) | 15 | real gap |
+| Qt `moc_predefs.h` | 1 | not a gap at all — Bazel runs moc itself via `rules_qt`; nothing referenced it |
+| AK `configure_file` headers | 2 | already closed earlier in the session |
+
+So 666 of the 741 were pure duplication, which I proved by deleting them: the
+build stayed green and recompiled 2,635 actions from Bazel's own headers. The
+honest gap was **31 files**, and the reason a 90%-redundant shim survived is the
+same `allow_empty` — nothing ever compared the two sets.
+
+### The 15 `Export.h`: derive the template, don't copy the output
+
+`Meta/emit_export_headers_bazel.py` emits them, and two decisions in it matter.
+
+All 15 normalize to **one** template; the per-library tokens are derived the way
+`Meta/CMake/targets.cmake` derives them (api = `upper(lib - "Lib") + "_API"`,
+prefix = `upper(lib)`, exports = `lib + "_EXPORTS"`), so adding a library needs no
+edit. All 17 emitted artifacts (15 + AK's two) are **byte-identical to CMake's**,
+checked by `--check Build/full`, and that check earned its keep twice: once on a
+`#cmakedefine` regex (the templates put the `#` at column 0 with the indent
+*after* it — `#    cmakedefine01 FOO`, which two regex attempts got wrong), and
+once on a **1-byte** difference a `render()`-level check could never see — a
+heredoc adds a trailing newline, so the emitted shell needed one stripped from the
+body. Only byte-comparing the *built artifact* catches that.
+
+`AK/Backtrace.h` is deliberately **not** in the parity check, and that is the
+interesting one. It is not a template — CMake writes it from
+`find_package(Backtrace)`, i.e. from a *question about the host*. So the genrule
+**compiles a probe** rather than baking my machine's answer. Comparing the result
+against my own tree would only re-confirm my own tree, which is why it is
+excluded: test the variable, not the value.
+
+`Libraries/LibWeb` needed its own emitter mode, for a reason worth stating because
+Bazel is right and I was wrong: include dirs cannot escape a package, so LibWeb's
+`Export.h` must be an output *of the LibWeb package*. `includes = ["../.."]` is
+rejected ("resolves to the workspace root"). It lands at `genroot/LibWeb/Export.h`
+with `includes = ["genroot"]`.
+
+### Bug 1: eight crates ship a `RustFFI.h`, and LibRegex had the wrong one
+
+Removing the shim exposed a **real, pre-existing correctness bug**. Eight of the
+ten Rust crates emit a header named literally `RustFFI.h`, and four TUs include it
+with no directory (`#include <RustFFI.h>`). CMake is unambiguous because
+`FFI_OUTPUT_DIR` defaults to the consuming library's *own* binary dir. Bazel puts
+every dep's include dirs on one command line, and my rules published every
+crate's unprefixed `ffi/` dir to every consumer — so **LibRegex was compiling
+against LibUnicode's header**, and the only thing hiding it was a leftover
+`-IBuild/full/Libraries/LibRegex` that shadowed both. Delete the tree and it
+becomes `'RustRegexFlags' has not been declared`.
+
+The fix needed **two** steps, and the first one alone looked sufficient — which is
+the part I would otherwise have shipped:
+
+1. **Publish the unprefixed dir on its own target** (`cargo_bare_include`), not on
+   `cargo_lib`. Necessary because `CcInfo`'s `system_includes` propagate
+   transitively: folded into `cargo_lib`, LibGfx inherited LibRegex's *and*
+   LibTextCodec's bare dirs and failed with `'FFI' does not name a type`.
+   (`cc_common.create_compilation_context` has no settable "local includes";
+   I tried.)
+2. **Depend on it through `implementation_deps`.** Step 1 stops the dir leaking out
+   of `cargo_lib`; it does *not* stop it leaking out of **LibTextCodec**. Include
+   dirs propagate along the C++ dep graph too, so `LibGfx → LibTextCodec` handed
+   LibGfx someone else's `RustFFI.h` anyway, and `YUVData.cpp` failed identically.
+
+`implementation_deps` is Bazel's name for exactly the scope CMake's
+`target_include_directories(... PRIVATE)` has — which is *why* a bare include is
+unambiguous in CMake, and what had to be reproduced rather than approximated. The
+three crates that need it are **derived by scanning the source** for a
+directory-less include, not hardcoded, and the build emitter now **imports** that
+derived set instead of keeping its own copy beside it (it had one; a hand-kept copy
+of a derived set is finding 23 in miniature).
+
+### Bug 2: an entire Rust target was missing, behind two host escapes
+
+`//:WebContent` and four others then failed with one error:
+`CraneliftBridge.cpp:13:10: fatal error: CraneliftFFI.h: No such file or directory`.
+
+Cranelift — Ladybird's AOT WebAssembly compiler, `ENABLE_CRANELIFT_JIT=ON` — was
+absent from the Bazel graph **entirely**. `Libraries/LibWasm/CMakeLists.txt` was
+not in the emitter's `CMAKELISTS`, and it declares its crate with
+`build_rust_binary()`, which the parser did not handle at all. Two host escapes had
+been covering for it:
+
+- the FFI header sat in `Build/full/Libraries/LibWasm`, which a global `-I` reached;
+- the compiler binary was named by **an absolute path to my machine**, baked into
+  `-DWASM_CRANELIFT_COMPILER_PATH="/home/ubuntu/ladybird-work/Build/full/bin/cranelift-compiler"`.
+
+The second one alone would have broken every other checkout on earth, and it was
+in a checked-in generated file. Nothing was going to tell me: it is a *define*, so
+it compiles fine and the lookup only fails at run time, on a code path that needs a
+WebAssembly page big enough to trigger AOT compilation.
+
+A `build_rust_binary` crate is a genuinely different shape, not a variant spelling,
+and the rules now say so: there is **no archive to link** (`cargo rustc --bin` is
+the whole build, and what C++ consumes is the *executable*, spawned at run time),
+but it **still emits a cbindgen header** its caller includes. So `cargo_binary`
+declares FFI headers like `cargo_crate` does, `cargo_lib` yields a headers-only
+`CcInfo` when the archive is absent, and the crate is consumed through the same two
+labels a staticlib crate is.
+
+For the binary itself, the fix is *not* to point the define at `bazel-bin` — that
+is the same escape with a nicer prefix. Ladybird already resolves the compiler
+through a chain (`resolve_cranelift_compiler_path`: `$LADYBIRD_CRANELIFT_COMPILER`
+→ compile-time path → **sibling-of-self**), and Bazel puts every root-package
+output in one bin directory, so link 3 finds it with no path baked in at all. The
+define becomes the bare filename and the binary is attached as `data`, so it is
+genuinely *there* in the runfiles of everything that links LibWasm. **The
+dependency is declared; the path is not asserted.**
+
+### What actually verified it
+
+Not "the build is green" — that was the state I started from. The header is
+byte-identical to CMake's; then `Build/full/{Libraries,Services,UI,bin,cargo}` was
+moved off the machine and the three shim packages **deleted**, leaving zero
+Ladybird-generated headers under `Build/full`; all six binaries rebuilt from
+scratch (2,704 actions); and both `--headless=text` and `--headless=layout-tree`
+came out byte-identical to the CMake reference on three pages, two of which execute
+WebAssembly. `cquery` over the closure of all six binaries now returns **0** targets
+under `Build/full`.
+
+One control worth recording, because it is the kind of check that keeps an
+enthusiastic conclusion honest: I instrumented `cranelift-compiler` with a wrapper
+to prove the browser was invoking it, and **it never was** — even on a
+300-function module. Before concluding the wiring was broken I ran the same probe
+against the *CMake reference build*, which also never invoked it. Compilation is
+submitted to a thread pool and the page finishes first; the Bazel build matches the
+reference exactly. Without the reference-side control I would have "fixed" a
+non-bug.
+
+Two smaller repairs fell out of the same pass, both drift the emitter rule exists
+to prevent: `emit_libweb_bazel.py` did not emit LibWeb's export-header block, so
+regenerating would have silently truncated it; and six of the seven per-target
+`-IBuild/full` copts existed only because CMake spells a target's own binary dir
+relative to itself (`Build/full/Services/WebContent/../..`) and the emitter
+compared paths as **strings** against its global-roots set. `os.path.normpath`
+before the comparison removed all six.
+
+### The same bug, a third time, in this repo's own tests
+
+Having learned that a check which cannot fail is indistinguishable from one that
+is not needed, I applied it to the test suite itself — by counting, not by reading
+the exit code. `for f in tests/test_*.py; do python3 "$f"; done` exited 0 for all
+ten files, but three of them (`test_emit_cargo.py`, `test_emit_vcpkg.py`,
+`test_vcpkg_plumbing.py`) had **no `if __name__ == "__main__"` runner at all**:
+Python imported the module, defined 46 `def test_` functions, called none of them,
+and exited 0. There is no pytest in this sandbox, so nothing else was calling them
+either. Exactly the shape of `allow_empty = True` — a green result carrying no
+information.
+
+With runners added, 6 of those 46 failed, and every one was a *true* report about
+the finding-35 changes rather than a stale assertion: the ring emitter had grown a
+third parameter (the binary crates), `cargo_lib` had gained an
+`archive == None` branch for a `--bin` crate that has no archive, the shared
+FFI-header lookup had moved into `cargo_vendor.sh` so both drivers use one copy,
+and one test read `Build/full/Libraries/BUILD.bazel` — a file whose *deletion* was
+the fix. That last one is the pleasing part: the test failed because the thing it
+asserted about no longer exists, so it became the stronger assertion that the path
+**must not** exist. The suite is now 128 tests over 10 files, all passing, and the
+README documents running the glob rather than a hand-kept list of filenames,
+because a list of files to run is one more thing that can silently omit an entry.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -1498,18 +1720,35 @@ every process (UI, WebContent, Compositor, RequestServer, ImageDecoder)
 Bazel-built, proven by removing the reference services and watching the CMake
 binary fail while the Bazel one renders.
 
-And with findings 33 and 34 it is a **clone-and-build**: Bazel fetches and builds
-the 77 vcpkg ports *and* the 10 Rust crates + `flapc` itself, with zero network
-access in the build actions, verified by removing each reference tree from the
-machine in turn. `Build/full` is now only the *converter's* input — the model the
-emitters read and the baseline the parity harness diffs — not the build's.
+And with findings 33, 34 **and 35** it is a **clone-and-build**: Bazel fetches and
+builds the 77 vcpkg ports, the 10 Rust crates, `flapc`, `cranelift-compiler` and
+every generated header itself, with zero network access in the build actions.
+`Build/full` is now only the *converter's* input — the model the emitters read and
+the baseline the parity harness diffs — not the build's, and this time that is
+measured: **0 targets under `Build/full` in the `cquery` closure of all six
+binaries** (down from 741), the three shim packages deleted outright, and all six
+binaries rebuilt from scratch with CMake's generated tree moved off the machine,
+rendering `--headless=text` *and* `--headless=layout-tree` byte-identically on
+three pages including two that execute WebAssembly.
+
+Findings 33 and 34 alone were **not** enough, and the gap between "I closed the
+binary dependencies" and "the build does not read the tree" is the most
+instructive part of this migration — see finding 35.
 
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~4,400 Bazel actions
 from scratch (2,700 C++ plus the vcpkg and Rust rings);
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; 34 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); 35 findings, 3 of them real any2bazel engine fixes with
 regression tests.
+
+**One number in this scoreboard was wrong for most of the migration, and it is
+worth ending on.** "Clone and build" was claimed after the two *binary*
+dependencies were closed, and the 741 remaining *header* dependencies went uncounted
+because the shims that supplied them could not fail. Every "verified by removal" in
+this document is only as strong as what was actually removed — which is the argument
+for removal as a method, not against it: it is the only check here that ever found
+this class of bug, and each time I widened what I removed, it found another.
 
 ## Environment notes (this sandbox)
 

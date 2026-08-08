@@ -141,3 +141,23 @@ def test_static_libs_go_on_the_link_line_by_path():
     assert 'root + "/lib/lib" + n + ".a"' in impl
     # and the shared ones are -l, so the loader's SONAME lookup keeps working
     assert 'flags.append("-l" + n)' in impl
+
+
+if __name__ == "__main__":
+    # A runner, because without one this file EXITED 0 WITHOUT RUNNING ANYTHING --
+    # a test suite that cannot fail, which is the same bug as a glob that cannot
+    # fail (finding 35). Found by checking that the suite's output accounted for
+    # every test file, rather than trusting the exit code.
+    import sys as _sys, traceback
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"PASS {fn.__name__}")
+        except Exception:
+            failed += 1
+            print(f"FAIL {fn.__name__}")
+            traceback.print_exc()
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    _sys.exit(1 if failed else 0)
