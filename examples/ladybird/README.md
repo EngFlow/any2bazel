@@ -137,10 +137,10 @@ mkdir -p Build/caches/HSTSPreload && curl -Lo Build/caches/HSTSPreload/transport
 #     NB `ply` no longer needs anything: the wheel is pinned and pip runs with
 #         PIP_NO_INDEX (gap 8).
 #
-# 1b. vcpkg's buildtrees peak around 3 GB, and a default /tmp tmpfs is often too
-#     small -- which surfaces as `No space left on device` from the ASSET SCRIPT,
-#     i.e. a message that blames the pin for a full disk.
-#     --action_env=TMPDIR=... if /tmp is small.
+# NB vcpkg's buildtrees peak around 3 GB. They go next to the declared output
+#    (inside bazel-out) rather than $TMPDIR, so a small /tmp tmpfs is not a
+#    problem and no flag is needed -- see the note in Meta/vcpkg_build.sh for why
+#    the --action_env route is two ways wrong.
 # 2. Build. This includes the 77 vcpkg ports (~45 min cold) and the 10 Rust
 #    crates + flapc + cranelift-compiler: the libraries depend on them through
 #    //Meta/vcpkg:<port> and //:<crate>_lib, so there is no separate step. Build

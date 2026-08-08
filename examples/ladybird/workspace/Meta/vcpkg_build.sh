@@ -53,12 +53,27 @@ SRC="${4:?ladybird source root}"
 TRIPLET="${5:-x64-linux-dynamic}"
 WHEELS="${6-}"
 
-# vcpkg's buildtrees peak around 3 GB, and $TMPDIR is often a tmpfs sized well
-# under that (7.9 GB here, shared with everything else) -- which surfaces as
-# `cp: error writing ...: No space left on device` from the ASSET SCRIPT, i.e. a
-# message that blames the pin for a full disk. Honour $TMPDIR when it is set, so a
-# caller can point this at real disk, and say where the scratch went.
-WORK="$(mktemp -d)"
+# vcpkg's buildtrees peak around 3 GB and $TMPDIR is frequently a tmpfs sized well
+# under that (7.9 GB here, shared with everything else), which surfaces as
+# `cp: error writing ...: No space left on device` from the ASSET SCRIPT -- a
+# message that blames the pin for a full disk.
+#
+# So do not use $TMPDIR at all: put the scratch dir NEXT TO THE DECLARED OUTPUT,
+# which is inside bazel-out and therefore on whatever real filesystem the output
+# base lives on. That also removes a flag from the recipe -- pointing $TMPDIR
+# somewhere bigger needs BOTH --action_env and --host_action_env (this action runs
+# in the target AND exec configurations, finding 26's duplication again), and an
+# `env =` on the rule silently beats --action_env anyway, so the flag route is two
+# ways wrong. Report the free space either way: a 3 GB build on a 2 GB disk should
+# say so in its own voice rather than 20 minutes later in someone else's.
+# mkdir first: Bazel creates the declared output dir but not necessarily its parent
+# before the action runs, and mktemp does not create intermediate dirs. Absolute,
+# because vcpkg rejects a relative $HOME outright ("was not an absolute path") and
+# $OUT arrives execroot-relative -- the same relative-vs-absolute distinction that
+# broke the asset index above, in a third place.
+mkdir -p "$(dirname "$OUT")"
+OUT_PARENT="$(cd "$(dirname "$OUT")" && pwd)"
+WORK="$(mktemp -d "$OUT_PARENT/vcpkg-scratch.XXXXXX")"
 echo "vcpkg_build: scratch dir $WORK ($(df -h "$WORK" | awk 'NR==2{print $4}') free)" >&2
 # Cleaned up on the way out INCLUDING on failure -- an interrupted run used to
 # leave a multi-GB tree behind, and several of them is how the disk filled.
