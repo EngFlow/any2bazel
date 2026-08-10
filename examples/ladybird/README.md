@@ -65,6 +65,20 @@ dependency I went looking for, so it is the one I found.** The check that would
 have caught all five is not a better `cquery` — it is doing the clone. See
 [Known gaps](#known-gaps).
 
+### What closing the last three takes
+
+Measured, not estimated — each shortcut below was tested and rejected (finding 36):
+
+| Blocker | What closes it | Shortcuts that do **not** work |
+|---|---|---|
+| Rows 1+2: `Build/vcpkg` and its `.git` | **One custom `repository_rule`** that shells out to `git clone` at `vcpkg.json`'s `builtin-baseline`. It keeps `.git`, and `glob(["**"])` then carries those files as *declared* inputs — which also fixes row 2's undeclared-input lie | `git_repository`/`new_git_repository` **strip `.git`**. `--depth 1` fails (`vcpkg was cloned as a shallow repository`) — the pinned port trees live in history, so it is a full 121 MB clone, ~1 min, once. Dropping `builtin-baseline` "works" and **silently moves 10 dep versions** (ffmpeg 7.1.1→8.1.2, harfbuzz 10.2→14.2.1, mimalloc 2→3, …) |
+| Row 6: the four `git archive` tarballs | **The same rule's second user** — clone at the pinned ref, `git archive`, expose the `.tar.gz`. Makes `vcpkg_git_archives.bzl`'s SHA512s checked instead of decorative | — |
+| Row 3: the HSTS table | **An upstream change to Ladybird**: `Meta/CMake/hsts_preload.cmake` fetches Chromium's `main`, so pin *that* to a revision, then `http_file` the same revision | Pinning only on the Bazel side: the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs, so it would trade a hermeticity gap for a **parity** gap. A converter can *detect* an unpinned input — Bazel already fails with `missing input file` — but cannot pin it unilaterally |
+
+A fresh full clone at the baseline resolves all **78 ports to exactly the versions
+this dev checkout resolves** (`diff`, 0 differences), which is what makes the repo
+rule sound: the checkout carries no local state beyond the ref.
+
 **This claim was false until recently, and the way it was false is the most
 useful thing in this directory.** The README said it worked; it did not. Every
 binary depended on **741 targets under `Build/full`**, the overlay shipped four
