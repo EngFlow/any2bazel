@@ -78,7 +78,7 @@ Ladybird itself. (An earlier draft of this section proposed a custom
 | 6: the four `git archive` tarballs | **~8 lines of shell**: clone each pinned URL, `git archive <ref>`. Verified — the reproduced `libyuv` tarball's SHA512 matches `vcpkg_git_archives.bzl` exactly, so the committed hashes become *checked* rather than decorative |
 | 3: the HSTS table | **An upstream change to Ladybird.** `Meta/CMake/hsts_preload.cmake` fetches Chromium's `main` (unversioned) at configure time; pin *that* to a revision, then `http_file` the same revision so both build systems consume one pinned input. Pinning only on the Bazel side "works" but the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs — trading a hermeticity gap for a **parity** gap |
 
-Two shortcuts tested and rejected, because both look like simplifications:
+Three shortcuts tested and rejected, all of which look like simplifications:
 
 - **`--depth 1` on the vcpkg clone.** 8.7 MB instead of 121 MB, and `read-tree`
   even succeeds for some ports — then resolution fails on ffmpeg and harfbuzz with
@@ -89,6 +89,19 @@ Two shortcuts tested and rejected, because both look like simplifications:
   (ffmpeg 7.1.1#5 → 8.1.2#3, harfbuzz 10.2.0 → 14.2.1#2, mimalloc 2.2.7 → 3.4.3,
   plus zlib, freetype, dbus, fontconfig, libedit, libwebp, cpptrace). A fix for a
   hermeticity blocker that changes ten dependency versions is not a fix.
+- **A git submodule** — git's own answer to this, and it *does* work mechanically
+  (a submodule's `.git` is a gitfile, and vcpkg's `read-tree` follows the
+  indirection: verified). It fails for a better reason: **a submodule pins a
+  checkout, and vcpkg pins history behind a baseline.** 14 of `vcpkg.json`'s 45
+  `overrides` name a version that is *not* what `ports/` holds at the baseline
+  (ffmpeg's pinned port is git-tree `0988005f…`; `HEAD:ports/ffmpeg` is
+  `c40aaa40…`), so the bytes vcpkg builds exist at no single commit. A submodule
+  would deliver precisely the insufficient state, still need the full 119 MB of
+  history in `.git/modules`, sit in a `Build*/`-ignored directory vcpkg fills with
+  ~3 GB of scratch (permanently-dirty submodule), and still not produce the `vcpkg`
+  binary, which is bootstrapped from a tag+SHA512 in `scripts/vcpkg-tool-metadata.txt`.
+  **`Build/vcpkg` is not a vendored dependency; it is a package manager's cache that
+  happens to be a git checkout.** Finding 36.
 
 A fresh full clone at the baseline resolves all **78 ports to exactly the versions
 this dev checkout resolves** (`diff`, 0 differences) — so the checkout carries no

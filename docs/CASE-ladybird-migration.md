@@ -1897,6 +1897,58 @@ the same manifest, resolves all **78 ports to exactly the versions this dev chec
 resolves** (`diff`, 0 differences). The checkout carries no local state beyond the
 ref — which is precisely why a prefetch step is sufficient and a rule is not needed.
 
+### Why not a git submodule?
+
+The obvious question, since a submodule is git's own answer to "vendor another repo at
+a pinned commit" and it would give the cloner `Build/vcpkg` with a working `.git` from
+`git clone --recurse-submodules`. It **does** work mechanically — I checked, because
+the `.git` here is load-bearing and a submodule's `.git` is not a directory but a
+*gitfile* (`gitdir: ../../.git/modules/Build/vcpkg`). vcpkg's
+`git --git-dir .git read-tree <tree>` follows that indirection fine: `READ-TREE OK`.
+So "submodules break vcpkg" is not the reason.
+
+The reason is that **a submodule pins the wrong thing.** A submodule pins one commit
+and gives you its *checkout*; vcpkg's manifest pins a baseline commit and then reads
+**history behind it**. Ladybird's `vcpkg.json` carries 45 `overrides`, and **14 of
+them name a version that is not what `ports/` contains at the baseline**:
+
+| pinned in `vcpkg.json` | what `ports/` holds at the baseline |
+|---|---|
+| ffmpeg 7.1.1#5 | 8.1.2#3 |
+| harfbuzz 10.2.0 | 14.2.1#2 |
+| mimalloc 2.2.7 | 3.4.3 |
+| qtbase 6.10.0#1 | 6.11.1#1 |
+| freetype 2.13.3 | 2.14.3 |
+| simdutf 9.0.0 | 8.2.0 *(older than the pin)* |
+| …plus zlib, dbus, fontconfig, libedit, libwebp, libtommath, cpptrace, angle | |
+
+Concretely: ffmpeg 7.1.1#5's port is git-tree `0988005f…`, while
+`HEAD:ports/ffmpeg` at the baseline is `c40aaa40…`. The bytes vcpkg builds are
+**not in the working tree at any single commit** — they are extracted from the object
+database by `read-tree`, per port, per pinned version. That is what the version
+database *is*, and it is why `--depth 1` fails with vcpkg's own `Try again with a full
+vcpkg clone`: shallow gives you the tree, and the tree is not the pin.
+
+So a submodule would deliver exactly the state that is *insufficient* — the baseline
+checkout — while still requiring the full history behind it to be present, and it
+would add costs of its own: the same 119 MB in `.git/modules` (no saving), plus
+`Build/vcpkg` is inside a `Build*/`-ignored path that vcpkg fills with ~3 GB of
+`downloads/`, `installed/`, `buildtrees/` scratch, so every cloner's `git status`
+would show the submodule dirty forever (needing `ignore = dirty` in `.gitmodules` to
+paper over it), and `git submodule update` would fight vcpkg for who owns the
+directory. And a submodule still would not produce the `vcpkg` **binary** — that is
+not tracked in the repo; it is bootstrapped from a tag+SHA512 pinned in
+`scripts/vcpkg-tool-metadata.txt`. `Meta/ladybird.py vcpkg` does that too.
+
+The generalizable point, and the reason this is worth a section rather than a
+footnote: **`Build/vcpkg` is not a vendored dependency, it is a package manager's
+cache directory that happens to be a git checkout.** Every instinct that treats it as
+"a pinned copy of another repo" — submodule, `git_repository`, `http_archive` of a
+tarball, `--depth 1` — pins the checkout and loses the history, and the history is the
+dependency. Getting this right is what `builtin-baseline` + `overrides` means, and it
+is why the answer to "how do we get it" keeps coming back to *run the project's own
+bootstrap*.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
