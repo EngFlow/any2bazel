@@ -69,36 +69,61 @@ dependency I went looking for, so it is the one I found.** The check that would
 have caught all five is not a better `cquery` — it is doing the clone. See
 [Known gaps](#known-gaps).
 
-### How a Ladybird developer gets these three inputs
+### Getting the three inputs — with and without CMake
 
-**They don't do anything: one ordinary Ladybird build produces all three.** Each is
-a side effect of the CMake+vcpkg path, which is exactly why all three were invisible
-here for months. (Two earlier drafts of this section proposed writing machinery — a
-custom `repository_rule`, then a prefetch script. Both were wrong, and why is in
-finding 36.)
+Two audiences, two answers. **A Ladybird developer stages nothing:** one ordinary
+`./Meta/ladybird.py build` produces all three as side effects, which is exactly why
+they stayed invisible here for months.
+
+| Input | Who produces it in a normal build |
+|---|---|
+| the vcpkg checkout + its `.git` | `Meta/Utils/build_vcpkg.py`, called by `ladybird.py` **`build`** as well as `vcpkg`: clone, checkout `builtin-baseline`, bootstrap the tool at the tag+SHA512 in `scripts/vcpkg-tool-metadata.txt`. ~70 s |
+| `Build/caches/HSTSPreload/transport_security_state_static.json` | the CMake **configure**, via `hsts_preload.cmake` → `download_file`, gated on `ENABLE_NETWORK_DOWNLOADS` (default ON) |
+| the four `git archive` tarballs | **vcpkg itself**, while building skia and angle |
+
+**Without ever running CMake — the actual answer, and it needs no CMake at all:**
 
 ```sh
-./Meta/ladybird.py build     # the normal Ladybird build
-cp Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz Meta/CMake/vcpkg/git-archives/
+python3 Meta/ladybird.py vcpkg               # 1. the checkout + .git (~70s). No CMake:
+                                             #    `vcpkg` is a standalone subcommand.
+python3 Meta/fetch_vcpkg_git_archives.py     # 2. the four git archives (~80s), each
+                                             #    reproduced with git clone + git archive
+                                             #    and VERIFIED against the committed SHA512
+curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
+    "$HSTS_URL"                              # 3. the HSTS table (see caveat below)
+bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder \
+            //:Compositor //:WebWorker
 ```
 
-| Input | Who produces it, in a normal build |
-|---|---|
-| the vcpkg checkout + its `.git` | **`Meta/Utils/build_vcpkg.py`**, called by `ladybird.py` *`build`* as well as `vcpkg`: clones microsoft/vcpkg, checks out `vcpkg.json`'s `builtin-baseline`, bootstraps the tool at the tag+SHA512 in `scripts/vcpkg-tool-metadata.txt`. **~70 s, verified from an empty directory** |
-| `Build/caches/HSTSPreload/transport_security_state_static.json` | **the CMake configure**, via `Meta/CMake/hsts_preload.cmake` → `download_file`, gated on `ENABLE_NETWORK_DOWNLOADS` (**default ON**) |
-| the four `git archive` tarballs | **vcpkg itself**, while building skia and angle: `vcpkg_from_git` writes them to `Build/vcpkg/downloads/`. Verified — those files' SHA512s equal the committed values in `vcpkg_git_archives.bzl`, so the "directory I made by hand" was a copy of vcpkg's own cache. Only the `cp` above is manual, and only because the overlay looks in a different directory |
+Step 2 is `Meta/fetch_vcpkg_git_archives.py`, added here. Verified: **4/4 reproduced
+from scratch and byte-identical to the pinned SHA512s.** Two things about it are worth
+knowing, because both were mistakes I made first:
 
-So for a Ladybird developer this is a **non-problem**; the gap is real only for
-someone who wants Bazel *without* ever running CMake. That distinction is worth
-keeping straight, because it changes what is owed: two of the three need **no new
-code at all** (they need the recipe to say "build once with CMake first", and a
-clear error when you haven't), and only the third is a genuine hermeticity defect:
+- **It takes the *list* from the committed pin, never from parsing portfiles.** A
+  first version derived the list by scanning skia's and angle's portfiles and was
+  wrong in both directions: 8 archives for skia where 4 are real, and libyuv missed
+  entirely. `declare_external_from_git` only *declares*; feature- and
+  platform-conditional `get_externals(${required_externals})` decides what is
+  actually fetched, and libyuv's comes from its own port. **Statically deciding the
+  set is unsound; statically resolving a name to a URL is fine**, and that is all the
+  script does.
+- **Regenerating the pin uses vcpkg as the instrument**, not a parser:
+  `Meta/vcpkg_capture_git_archives.sh` runs `vcpkg install --only-downloads`, which
+  executes the portfiles' fetch phase and stops — ~6 min, no compilation, no CMake.
+  It produces **3 of the 4**: angle's zlib is fetched from angle's *build* phase, so
+  it never appears in a downloads-only run. That asymmetry is recorded in the script
+  rather than smoothed over.
 
-| Blocker | What a Bazel-only clone still needs |
-|---|---|
-| the vcpkg checkout | Nothing to write — `Meta/ladybird.py vcpkg` is the supported way to get it, and it is what Ladybird's own build calls. Documentation and ordering |
-| the four tarballs | Nothing to write — they fall out of the vcpkg build. To get them *without* CMake: clone each pinned URL and `git archive <ref>`; verified byte-identical to the committed hashes (`libyuv`) |
-| the HSTS table | **An upstream change to Ladybird.** `hsts_preload.cmake` fetches Chromium's `main` — unversioned — so pin *that* to a revision, then `http_file` the same revision and both build systems consume one pinned input. Pinning only on the Bazel side "works" but the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs, trading a hermeticity gap for a **parity** gap |
+Step 3 is the **one genuine hermeticity defect** and it cannot be closed here.
+`hsts_preload.cmake` fetches Chromium's **`main`** — unversioned — so there is no
+revision to pin to. Pinning a revision on the Bazel side alone would make Bazel's
+output diverge from CMake's (the file at tag `139.0.7258.5` is 18.7 MB against the
+10.5 MB `main` served when this machine configured, and the generated table differs),
+trading a hermeticity gap for a **parity** gap. The fix is one line upstream: pin the
+URL to a revision in `hsts_preload.cmake`, then `http_file` the same revision, and
+both build systems consume one pinned input. Usefully, `download_file` is already a
+no-op when the file exists (verified with `ENABLE_NETWORK_DOWNLOADS=OFF`), so a pinned
+file staged by Bazel is consumed by CMake unchanged — the upstream change is additive.
 
 Three shortcuts tested and rejected, all of which look like simplifications:
 
@@ -152,7 +177,9 @@ an FFI header collision and an entire missing Rust target. See
 | `Meta/vcpkg_assets.tsv` | **The dependency pin.** 76 `(url, sha512, dst)` rows captured from vcpkg itself via its `x-script` asset hook. Everything below is generated from this, with no vcpkg, no CMake and no network |
 | `vcpkg_distfiles.bzl`, `vcpkg_index.bzl`, `vcpkg_extension.bzl`, `vcpkg_git_archives.bzl` | One `http_file` per distfile, the sha512→label index the asset script resolves through, the module extension that creates the repos, and the 4 `vcpkg_from_git` archives. **Generated** by `Meta/emit_vcpkg_bazel.py` |
 | `vcpkg.bzl`, `Meta/vcpkg_build.sh` | `vcpkg_tree`: builds the whole dep tree as an ordinary Bazel action with `x-block-origin`, so it reaches the network zero times. Deliberately not a `repository_rule` |
-| `Meta/vcpkg_capture_assets.sh` | Records the pin, by *being* vcpkg's asset cache. The one run allowed to fetch |
+| `Meta/vcpkg_capture_assets.sh` | Records the 76-distfile pin, by *being* vcpkg's asset cache. The one run allowed to fetch |
+| `Meta/fetch_vcpkg_git_archives.py` | Produces the 4 `vcpkg_from_git` tarballs **without CMake**: takes the list from the committed pin, resolves each clone URL out of the portfiles, then `git clone` + `git -c core.autocrlf=false archive <ref>` and **verifies against the pinned SHA512**. 4/4 byte-identical |
+| `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
@@ -179,8 +206,9 @@ adds `-I/usr/include/libdrm`), which is gap 3 below, not an emitter bug.
 
 To **build the browser**, no CMake build is needed — Bazel fetches and builds the
 vcpkg *ports* and the Rust crates itself, and vcpkg's own downloader reaches the
-network zero times. Three inputs still have to be present first (step 1a; gaps 7–8),
-and one port bypasses the pin via `pip`, so "no network at all" is not yet true:
+network zero times. Three inputs still have to be present first (step 1a; gaps 7–8)
+— two of them obtainable **without CMake**, the third (the HSTS table) unpinnable
+until fixed upstream, so "no network at all" is not yet true:
 
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
@@ -205,12 +233,18 @@ git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt
 #                                       vcpkg_git_archives.bzl, i.e. the
 #                                       "hand-made" directory was a copy of
 #                                       vcpkg's own cache.
-#     So the one-command answer, for anyone who has ever built Ladybird normally:
-./Meta/ladybird.py build            # CMake+vcpkg; produces (a), (b) and (c)
-cp Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz Meta/CMake/vcpkg/git-archives/
-#     `ladybird.py vcpkg` alone gives you (a) only -- verified from an empty
-#     directory: no downloads/, no HSTS table. And `ply` needs nothing now: the
-#     wheel is pinned and pip runs with PIP_NO_INDEX (gap 8).
+#     WITHOUT CMAKE (the supported path for a Bazel-only clone):
+python3 Meta/ladybird.py vcpkg            # (a) checkout + .git, ~70s, no CMake
+python3 Meta/fetch_vcpkg_git_archives.py  # (c) 4/4 reproduced with git archive and
+                                          #     verified against the pinned SHA512s
+curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
+  https://raw.githubusercontent.com/chromium/chromium/main/net/http/transport_security_state_static.json
+#                                         # (b) unpinnable until fixed upstream
+#     WITH CMake, if you were building Ladybird anyway, all three fall out of:
+#         ./Meta/ladybird.py build
+#         cp Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz Meta/CMake/vcpkg/git-archives/
+#     `ply` needs nothing now: the wheel is pinned and pip runs with
+#     PIP_NO_INDEX (gap 8).
 #
 # NB vcpkg's buildtrees peak around 3 GB. They go next to the declared output
 #    (inside bazel-out) rather than $TMPDIR, so a small /tmp tmpfs is not a

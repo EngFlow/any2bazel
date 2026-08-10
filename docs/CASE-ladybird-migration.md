@@ -1873,16 +1873,62 @@ skia and angle. I checked that last one against my own tree: the SHA512s of
 vcpkg's own download cache — I had not built a pin, I had copied one, and then
 forgotten which.
 
-That reframes the whole finding-36 table. **For a Ladybird developer none of this is
-a problem; it is a problem only for a Bazel-only clone that never runs CMake.** Both
-sentences are worth saying because they carry different debts: the first means two of
-the three "blockers" need *no code*, only a recipe that says "build once with CMake
-first" and a clear error when you have not; the second means the third one — the
-unpinned HSTS fetch — is the only genuine hermeticity defect in the set. My three
-successive answers to "what is needed" were a `repository_rule`, then a prefetch
-script, then a `cp`. Each was smaller than the last because each time I looked
-further into what the project already does, and **the useful move was always reading
-the project rather than designing for it.**
+That reframes the finding-36 table — but it also let me answer the wrong question.
+"Run the normal build first" is fine for a Ladybird developer and **useless for the
+case the whole exercise is about**: Bazel without CMake. Ulf had to ask a third time
+before I built it.
+
+**Without CMake, two of the three are now closed, and the third is a one-line
+upstream fix.**
+
+`Meta/ladybird.py vcpkg` is a standalone subcommand — no configure, no CMake — so the
+checkout and its `.git` cost ~70 s. The four `vcpkg_from_git` tarballs are what
+needed building, and the shape of the solution is the interesting part, because I got
+it wrong twice on the way:
+
+1. **A static parse of the portfiles is unsound, and wrong in both directions at
+   once.** My first script scanned skia's and angle's portfiles for
+   `declare_external_from_git` / `checkout_in_path` and produced **8** archives for
+   skia where 4 are real, while **missing libyuv entirely**. Both errors have one
+   cause: `declare_external_from_git` only *declares*, and
+   `get_externals(${required_externals})` picks from that under feature and platform
+   `if()`s — the set is decided by CMake evaluation, not by the text — while libyuv's
+   archive comes from the libyuv *port* calling `vcpkg_from_git` directly, which a
+   scan of skia+angle cannot see. This is finding 30's lesson recurring: **portfiles
+   are programs, so do not re-derive what they compute.**
+2. **So take the list from the pin and use vcpkg as the instrument for regenerating
+   it.** `vcpkg install --only-downloads` runs the portfiles' fetch phase and stops:
+   ~6 minutes, no compilation, no CMake, and vcpkg_from_git produces its tarballs at
+   the refs the real resolution picks. Same tactic as the 76-distfile asset capture
+   — instrument the foreign build system rather than predicting it.
+3. **`Meta/fetch_vcpkg_git_archives.py` then reproduces each pinned tarball with
+   `git clone` + `git -c core.autocrlf=false archive <ref>`** (byte-for-byte what
+   `vcpkg_from_git.cmake` runs internally) **and verifies it against the committed
+   SHA512.** Result: **4/4 reproduced from scratch, byte-identical to the pin.** The
+   hashes came from vcpkg; git reproducing them is the proof the two agree, so the
+   pin is checked rather than trusted. Static resolution survives only where it is
+   sound: mapping an already-known archive *name* to a clone URL.
+
+One asymmetry is recorded rather than smoothed over: `--only-downloads` yields **3 of
+the 4**, because angle's zlib is fetched from angle's *build* phase via
+`checkout_in_path`, not its fetch phase. The script says so; "--only-downloads gets
+them all" would have been the comfortable, false version.
+
+That leaves **exactly one** genuine hermeticity defect: the HSTS table, fetched from
+Chromium's unversioned `main`, where there is no revision to pin to. A useful detail
+found while checking whether the fix is invasive: CMake's `download_file` is a no-op
+when the file already exists (verified with `ENABLE_NETWORK_DOWNLOADS=OFF`), so a
+pinned file staged by Bazel is consumed by CMake unchanged — **the upstream change is
+additive**, one URL gaining a revision, no restructuring.
+
+My four successive answers to "what is needed" were: a `repository_rule`, a prefetch
+script, a `cp`, and finally a script plus a capture instrument. The middle two were
+smaller because I kept reading further into what the project already does — but the
+last one is *bigger* than the `cp`, and that is the actual lesson. **"It falls out of
+the existing build" was a true sentence that dissolved the question instead of
+answering it.** For the audience that has CMake it is the right answer; for the
+audience this migration exists to serve it is a non-answer, and I gave it because it
+let me stop working.
 
 **The HSTS table (row 3) is the one that genuinely cannot be fixed here, and it is
 not a Bazel problem.** `Meta/CMake/hsts_preload.cmake` fetches
