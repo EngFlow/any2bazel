@@ -27,13 +27,17 @@ the closure of all six returns **0** targets under `Build/full` (down from 741).
 `Build/full` is still needed to *regenerate* the BUILD files and to run the parity
 harness — a converter-development dependency, not a build dependency.
 
-**But `git clone && bazel build //:ladybird` on a fresh clone still does NOT work,
-and this section said it did.** Tested properly for the first time — `git clone`
-into a new directory, overlay dropped in, nothing else — it fails, and it fails
-**six separate times**. `Build/full` was the dependency I removed; it was not the
-only one, and five of the six have nothing to do with it. Two are fixed here
-(#4, #5) and one now fails loudly instead of silently (#6); the rest are inputs the
-recipe must produce or document:
+**A fresh clone now builds and renders — with three inputs staged by hand.** The
+end-to-end test (clone into a new directory, drop in the overlay, nothing else)
+was run for the first time and failed **six separate times**; `Build/full` was
+the dependency I had removed, and **five of the six had nothing to do with it**.
+All six are addressed below, and the result is verified on the clone rather than
+asserted: `//:vcpkg_installed` builds all 76 ports offline, all six binaries
+build (2,842 actions, RC=0), and `--headless=text`/`--headless=layout-tree`
+are **byte-identical to the CMake reference on all three test pages**. Rows 1–3
+are still manual staging: two are fixed bugs (#4, #5), one now fails loudly
+instead of 20 minutes later (#6), and the remainder are inputs the recipe must
+produce or document:
 
 | # | What is missing on a fresh clone | Why the dev machine hid it |
 |---|---|---|
@@ -200,9 +204,27 @@ for b in WebContent RequestServer ImageDecoder Compositor WebWorker; do cp -f ba
 # cranelift-compiler is found as a sibling of the spawning binary (Ladybird's own
 # lookup chain), so it needs no path baked in -- only to be there.
 cp -f bazel-bin/cranelift-compiler "$ER/bazel-out/k8-fastbuild/libexec/"
-ln -sfn "$PWD/Build/full/share/Lagom" "$ER/bazel-out/k8-fastbuild/share"
+# The resource root, assembled from the CLONE and from Bazel's own vcpkg tree.
+# This line used to read `ln -sfn "$PWD/Build/full/share/Lagom" ...` -- i.e. the
+# recipe for running the Bazel build pointed at CMake's build tree, a seventh
+# thing a fresh clone does not have (finding 36). Everything in it is either in
+# Base/res or in //:vcpkg_installed; `chmod u+w` because Bazel's outputs are
+# read-only and `cp -r` preserves that.
+L="$ER/bazel-out/k8-fastbuild/share/Lagom"
+chmod -R u+w "$L" 2>/dev/null; rm -rf "$L"; mkdir -p "$L/ladybird/pdfjs/web"
+cp -r Base/res/. "$L/"
+P=bazel-bin/vcpkg_installed/x64-linux-dynamic/share/pdfjs
+cp -r --no-preserve=mode "$P/build" "$L/ladybird/pdfjs/"
+cp -r --no-preserve=mode "$P/web/." "$L/ladybird/pdfjs/web/"
+# UI/cmake/ResourceFiles.cmake stages this one file into pdfjs/web/, not pdfjs/.
+mv "$L/ladybird/pdfjs/pdfjs-ladybird-transport.mjs" "$L/ladybird/pdfjs/web/"
 ./bazel-bin/ladybird --headless=text file:///tmp/test-page.html
 ```
+
+The assembled tree is byte-identical to CMake's `Build/full/share/Lagom`
+(`diff -rq`, 0 differences), and with it a fresh clone renders `--headless=text`
+and `--headless=layout-tree` byte-identically to the CMake reference on all
+three test pages.
 
 ## Known gaps
 
@@ -414,7 +436,12 @@ Honest inventory of what stops this from being a clone-and-build.
    spawns its service binaries by looking next to itself, and `share/Lagom` for
    resources. A real Bazel setup would express this with `data` + runfiles;
    doing so means teaching Ladybird's process-launch path about runfiles, so it
-   is a change to the target, not just to the BUILD files.
+   is a change to the target, not just to the BUILD files. **The staging block
+   itself was a clone-and-build blocker until now** — its last line symlinked
+   `Build/full/share/Lagom`, CMake's build tree, into place. Everything the
+   resource root needs is in `Base/res` plus `//:vcpkg_installed`'s pdf.js, and
+   the block above assembles it from those; the result is `diff -rq`-identical to
+   CMake's. Finding 36.
 6. **`rules_qt` is not on the BCR.** `MODULE.bazel` uses an `archive_override`
    pointing at kklochkov/rules_qt v2.0.1's release tarball (stock upstream, no
    patches). The BCR's `rules_qt` module is Vertexwahn's unrelated `rules_qt6`.

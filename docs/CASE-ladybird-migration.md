@@ -1790,6 +1790,39 @@ command, run the way the user runs it, in a directory that has never seen this
 project.** That is one line of shell, it costs ten minutes, and I should have run it
 before the first time I said yes.
 
+### Then the seventh: the recipe for running it pointed at CMake's build tree
+
+With all six fixed, the clone builds — `//:vcpkg_installed` offline (76 ports,
+`pip is offline; 1 pinned wheel(s)`), then all six binaries, 2,842 actions, RC=0 —
+and then the *documented run command* fails with `Runtime error: mkdir: Permission
+denied (errno=13)`, which is what Ladybird says when it cannot find its resource
+root. The README's staging block ended with:
+
+```sh
+ln -sfn "$PWD/Build/full/share/Lagom" "$ER/bazel-out/k8-fastbuild/share"
+```
+
+**`Build/full`.** Six findings about a fresh clone not having CMake's build tree,
+and the last line of the recipe symlinks CMake's build tree. It had never been read
+as an instruction, only as something that already worked on my machine — the same
+mechanism as all six, one layer further out, in prose rather than in a `glob`. The
+resource tree needs no CMake at all: it is `Base/res` (in the clone) plus pdf.js from
+`//:vcpkg_installed` (`share/pdfjs/{build,web}`, with
+`pdfjs-ladybird-transport.mjs` moved into `web/`, which is where
+`UI/cmake/ResourceFiles.cmake` puts it). Assembled that way it is `diff -rq`-identical
+to `Build/full/share/Lagom`, and the fresh clone's binaries then render
+`--headless=text` and `--headless=layout-tree` **byte-identically to the CMake
+reference on all three test pages**. Two smaller notes worth keeping: Bazel's outputs
+are read-only, so `cp -r` propagates that and the second staging run fails with
+`Permission denied` (`cp --no-preserve=mode`); and the six render RCs were 1 for a
+*single* reason — a missing resource root — which is a reminder that a nonzero exit
+from a browser is one bit and says nothing about which of six pages failed.
+
+So the honest state is: **a fresh clone builds and renders, with three inputs staged
+by hand** (`Build/vcpkg` + its `.git`, the unpinned HSTS table, the four
+`git archive` tarballs). That is a different sentence from "clone and build", and the
+difference is exactly what rows 1–3 of the README table say.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
