@@ -1860,6 +1860,30 @@ that way and its SHA512 matched `vcpkg_git_archives.bzl`'s committed value **exa
 the reproduction is verifiable in one line rather than trusted. Eight lines of shell,
 against a `repository_rule` I would have had to design, test and maintain.
 
+**Then Ulf asked the question that dissolved even the eight lines: "how does a
+Ladybird developer get the correct stuff on disk?"** The answer is that they do
+nothing, because **one ordinary `./Meta/ladybird.py build` produces all three
+inputs.** `build` calls `build_vcpkg()` itself (not just the `vcpkg` subcommand), so
+the checkout and its `.git` appear; the CMake *configure* downloads the HSTS table via
+`hsts_preload.cmake`, gated on `ENABLE_NETWORK_DOWNLOADS`, **default ON**; and vcpkg
+writes the four `git archive` tarballs into `Build/vcpkg/downloads/` while building
+skia and angle. I checked that last one against my own tree: the SHA512s of
+`Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz` **equal the committed values** in
+`vcpkg_git_archives.bzl`. So "the directory I made by hand months ago" was a copy of
+vcpkg's own download cache — I had not built a pin, I had copied one, and then
+forgotten which.
+
+That reframes the whole finding-36 table. **For a Ladybird developer none of this is
+a problem; it is a problem only for a Bazel-only clone that never runs CMake.** Both
+sentences are worth saying because they carry different debts: the first means two of
+the three "blockers" need *no code*, only a recipe that says "build once with CMake
+first" and a clear error when you have not; the second means the third one — the
+unpinned HSTS fetch — is the only genuine hermeticity defect in the set. My three
+successive answers to "what is needed" were a `repository_rule`, then a prefetch
+script, then a `cp`. Each was smaller than the last because each time I looked
+further into what the project already does, and **the useful move was always reading
+the project rather than designing for it.**
+
 **The HSTS table (row 3) is the one that genuinely cannot be fixed here, and it is
 not a Bazel problem.** `Meta/CMake/hsts_preload.cmake` fetches
 `raw.githubusercontent.com/chromium/chromium/**main**/net/http/transport_security_state_static.json`

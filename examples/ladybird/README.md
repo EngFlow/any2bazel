@@ -27,7 +27,10 @@ the closure of all six returns **0** targets under `Build/full` (down from 741).
 `Build/full` is still needed to *regenerate* the BUILD files and to run the parity
 harness — a converter-development dependency, not a build dependency.
 
-**A fresh clone now builds and renders — with three inputs staged by hand.** The
+**A fresh clone now builds and renders — after one ordinary CMake build has run
+once.** (Three inputs come from that build rather than from Bazel; a Ladybird
+developer therefore stages nothing, and the gap is real only for a Bazel-only clone
+— see [how a Ladybird developer gets them](#how-a-ladybird-developer-gets-these-three-inputs).) The
 end-to-end test (clone into a new directory, drop in the overlay, nothing else)
 was run for the first time and failed **six separate times**; `Build/full` was
 the dependency I had removed, and **five of the six had nothing to do with it**.
@@ -66,17 +69,36 @@ dependency I went looking for, so it is the one I found.** The check that would
 have caught all five is not a better `cquery` — it is doing the clone. See
 [Known gaps](#known-gaps).
 
-### What closing the last three takes
+### How a Ladybird developer gets these three inputs
 
-Two are a **prefetch step**, not new Bazel machinery, and one needs a change to
-Ladybird itself. (An earlier draft of this section proposed a custom
-`repository_rule` for the first two; that was wrong, and why is in finding 36.)
+**They don't do anything: one ordinary Ladybird build produces all three.** Each is
+a side effect of the CMake+vcpkg path, which is exactly why all three were invisible
+here for months. (Two earlier drafts of this section proposed writing machinery — a
+custom `repository_rule`, then a prefetch script. Both were wrong, and why is in
+finding 36.)
 
-| Blocker | What closes it |
+```sh
+./Meta/ladybird.py build     # the normal Ladybird build
+cp Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz Meta/CMake/vcpkg/git-archives/
+```
+
+| Input | Who produces it, in a normal build |
 |---|---|
-| 1+2: the vcpkg checkout and its `.git` | **`python3 Meta/ladybird.py vcpkg`** — Ladybird already ships it. It clones microsoft/vcpkg, checks out `vcpkg.json`'s `builtin-baseline` and bootstraps the tool: **75 s, verified from an empty directory**, producing the 121 MB `.git` that `git read-tree` needs. Nothing to write; this is a documentation and ordering problem |
-| 6: the four `git archive` tarballs | **~8 lines of shell**: clone each pinned URL, `git archive <ref>`. Verified — the reproduced `libyuv` tarball's SHA512 matches `vcpkg_git_archives.bzl` exactly, so the committed hashes become *checked* rather than decorative |
-| 3: the HSTS table | **An upstream change to Ladybird.** `Meta/CMake/hsts_preload.cmake` fetches Chromium's `main` (unversioned) at configure time; pin *that* to a revision, then `http_file` the same revision so both build systems consume one pinned input. Pinning only on the Bazel side "works" but the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs — trading a hermeticity gap for a **parity** gap |
+| the vcpkg checkout + its `.git` | **`Meta/Utils/build_vcpkg.py`**, called by `ladybird.py` *`build`* as well as `vcpkg`: clones microsoft/vcpkg, checks out `vcpkg.json`'s `builtin-baseline`, bootstraps the tool at the tag+SHA512 in `scripts/vcpkg-tool-metadata.txt`. **~70 s, verified from an empty directory** |
+| `Build/caches/HSTSPreload/transport_security_state_static.json` | **the CMake configure**, via `Meta/CMake/hsts_preload.cmake` → `download_file`, gated on `ENABLE_NETWORK_DOWNLOADS` (**default ON**) |
+| the four `git archive` tarballs | **vcpkg itself**, while building skia and angle: `vcpkg_from_git` writes them to `Build/vcpkg/downloads/`. Verified — those files' SHA512s equal the committed values in `vcpkg_git_archives.bzl`, so the "directory I made by hand" was a copy of vcpkg's own cache. Only the `cp` above is manual, and only because the overlay looks in a different directory |
+
+So for a Ladybird developer this is a **non-problem**; the gap is real only for
+someone who wants Bazel *without* ever running CMake. That distinction is worth
+keeping straight, because it changes what is owed: two of the three need **no new
+code at all** (they need the recipe to say "build once with CMake first", and a
+clear error when you haven't), and only the third is a genuine hermeticity defect:
+
+| Blocker | What a Bazel-only clone still needs |
+|---|---|
+| the vcpkg checkout | Nothing to write — `Meta/ladybird.py vcpkg` is the supported way to get it, and it is what Ladybird's own build calls. Documentation and ordering |
+| the four tarballs | Nothing to write — they fall out of the vcpkg build. To get them *without* CMake: clone each pinned URL and `git archive <ref>`; verified byte-identical to the committed hashes (`libyuv`) |
+| the HSTS table | **An upstream change to Ladybird.** `hsts_preload.cmake` fetches Chromium's `main` — unversioned — so pin *that* to a revision, then `http_file` the same revision and both build systems consume one pinned input. Pinning only on the Bazel side "works" but the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs, trading a hermeticity gap for a **parity** gap |
 
 Three shortcuts tested and rejected, all of which look like simplifications:
 
@@ -166,24 +188,29 @@ git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt header
                                                  # that is not self-contained (gap 9)
-# 1a. THE THREE INPUTS THE OVERLAY DOES NOT CARRY. Without these the build fails;
-#     see the table above for how each one stayed invisible on the dev machine.
-#     (a) the vcpkg checkout at vcpkg.json's builtin-baseline, WITH its .git --
-#         vcpkg resolves versioned ports via `git read-tree`. Ladybird's own
-#         helper does exactly this:
-python3 Meta/ladybird.py vcpkg
-#     (b) the HSTS preload table: an unversioned download from Chromium's main
-#         branch that CMake does at configure time. No Bazel rule produces it.
-mkdir -p Build/caches/HSTSPreload && curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
-    https://raw.githubusercontent.com/chromium/chromium/main/net/http/transport_security_state_static.json
-#     (c) the four vcpkg_from_git archives. These are `git archive` output, so
-#         there is no URL to http_file; the hashes ARE pinned
-#         (vcpkg_git_archives.bzl), so reproducing them is a prefetch, not a rule
-#         -- clone each pinned URL and `git archive` the pinned ref. Verified:
-#         the reproduced libyuv tarball's SHA512 matches the committed one.
-#         Absent, the build now fails in 4s naming them (gap 7).
-#     NB `ply` no longer needs anything: the wheel is pinned and pip runs with
-#         PIP_NO_INDEX (gap 8).
+# 1a. THE THREE INPUTS THE OVERLAY DOES NOT CARRY -- all three are produced by
+#     ONE ordinary Ladybird build. A Ladybird developer stages nothing by hand;
+#     these are blockers for a Bazel-ONLY clone, and each one is a thing CMake or
+#     vcpkg produces as a side effect (see finding 36):
+#       (a) Build/vcpkg + its .git   <- python3 Meta/ladybird.py vcpkg  (~70s)
+#       (b) Build/caches/HSTSPreload/transport_security_state_static.json
+#                                    <- the CMake CONFIGURE downloads it
+#                                       (Meta/CMake/hsts_preload.cmake, gated on
+#                                        ENABLE_NETWORK_DOWNLOADS, default ON)
+#       (c) the four Meta/CMake/vcpkg/git-archives/*.tar.gz
+#                                    <- vcpkg writes them into
+#                                       Build/vcpkg/downloads/ while building
+#                                       skia and angle. Verified: those files'
+#                                       SHA512s equal the committed ones in
+#                                       vcpkg_git_archives.bzl, i.e. the
+#                                       "hand-made" directory was a copy of
+#                                       vcpkg's own cache.
+#     So the one-command answer, for anyone who has ever built Ladybird normally:
+./Meta/ladybird.py build            # CMake+vcpkg; produces (a), (b) and (c)
+cp Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz Meta/CMake/vcpkg/git-archives/
+#     `ladybird.py vcpkg` alone gives you (a) only -- verified from an empty
+#     directory: no downloads/, no HSTS table. And `ply` needs nothing now: the
+#     wheel is pinned and pip runs with PIP_NO_INDEX (gap 8).
 #
 # NB vcpkg's buildtrees peak around 3 GB. They go next to the declared output
 #    (inside bazel-out) rather than $TMPDIR, so a small /tmp tmpfs is not a
