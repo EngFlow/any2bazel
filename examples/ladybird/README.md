@@ -28,25 +28,26 @@ the closure of all six returns **0** targets under `Build/full` (down from 741).
 harness — a converter-development dependency, not a build dependency.
 
 **A fresh clone now builds and renders — after one ordinary CMake build has run
-once.** (Three inputs come from that build rather than from Bazel; a Ladybird
+once.** (Two inputs come from that build rather than from Bazel; a Ladybird
 developer therefore stages nothing, and the gap is real only for a Bazel-only clone
-— see [how a Ladybird developer gets them](#how-a-ladybird-developer-gets-these-three-inputs).) The
+— see [how a Ladybird developer gets them](#getting-the-two-remaining-inputs--with-and-without-cmake).
+The third, the HSTS table, is now pinned and fetched by Bazel.) The
 end-to-end test (clone into a new directory, drop in the overlay, nothing else)
 was run for the first time and failed **six separate times**; `Build/full` was
 the dependency I had removed, and **five of the six had nothing to do with it**.
 All six are addressed below, and the result is verified on the clone rather than
 asserted: `//:vcpkg_installed` builds all 76 ports offline, all six binaries
 build (2,842 actions, RC=0), and `--headless=text`/`--headless=layout-tree`
-are **byte-identical to the CMake reference on all three test pages**. Rows 1–3
-are still manual staging: two are fixed bugs (#4, #5), one now fails loudly
-instead of 20 minutes later (#6), and the remainder are inputs the recipe must
-produce or document:
+are **byte-identical to the CMake reference on all three test pages**. Rows 1–2
+are still manual staging (a prefetch, `Meta/ladybird.py vcpkg`); row 3 is now
+**fixed** — Bazel fetches the HSTS table from a pinned commit; #4 and #5 were
+bugs and are fixed; #6 now fails loudly instead of 20 minutes later:
 
 | # | What is missing on a fresh clone | Why the dev machine hid it |
 |---|---|---|
 | 1 | **`Build/vcpkg`** — a git clone of microsoft/vcpkg at `vcpkg.json`'s `builtin-baseline`, which `//Build/vcpkg:tree` globs with `allow_empty = True`. Matches *one* file (its own `BUILD.bazel`) and the build fails with `/tmp/.../root/vcpkg: No such file or directory`. Ladybird's own `Meta/ladybird.py vcpkg` creates it; the recipe above never says so | `Meta/ladybird.py vcpkg` had been run months earlier |
 | 2 | **`.git` inside that checkout** — vcpkg resolves versioned ports with `git read-tree`, so it is load-bearing (120 MB), and the filegroup *excludes* it. The action is `no-sandbox`, so it reads the real path and got it anyway: an **undeclared input the build needs** | `no-sandbox` + a real checkout on disk |
-| 3 | **`Build/caches/HSTSPreload/transport_security_state_static.json`** (10 MB) — an *unversioned, unpinned* network download CMake does at configure time (`Meta/CMake/hsts_preload.cmake` fetches Chromium's `main`). `codegen_root.bzl` names it as a genrule `srcs`, so Bazel fails cleanly with `missing input file` — but there is no rule that produces it | the CMake configure had already downloaded it |
+| 3 | **`Build/caches/HSTSPreload/transport_security_state_static.json`** (10 MB) — an *unversioned, unpinned* network download CMake does at configure time (`Meta/CMake/hsts_preload.cmake` fetches Chromium's `main`). `codegen_root.bzl` named it as a genrule `srcs`, so Bazel failed cleanly with `missing input file` — but nothing produced it. **Fixed:** pinned downstream to a Chromium commit + sha256 ([`hsts_preload.bzl`](workspace/hsts_preload.bzl)), fetched with `http_file`, and the generated table is byte-identical to CMake's — verified with the staged file *deleted* | the CMake configure had already downloaded it |
 | 4 | **Two path bugs in `Meta/vcpkg_build.sh`** — the distfile index and its entries were passed **execroot-relative**, and vcpkg invokes the asset-cache script from its own cwd, so `awk`/`cp` looked in the wrong directory. Every asset lookup failed, reported as `no asset cache hits`, and `x-block-origin` then correctly refused the network. Fixed here (absolutize both) | the vcpkg checkout already had `downloads/tools/cmake-4.4.0-linux` from an earlier run, so vcpkg never *asked* the script for a tool |
 | 5 | **The `angle` port runs `pip install ply`** (`x_vcpkg_get_python_packages`), which is **not** an asset-cache download and therefore not covered by the pin. A real hole in the "zero network access" claim: `vcpkg_tree` set `requires-network: "0"`, but that is a *scheduling hint*, and with `no-sandbox: "1"` **nothing enforced it** — with `use_default_shell_env = True` the action inherited `HTTP_PROXY`/`HTTPS_PROXY` and pip reached PyPI. **Fixed here:** the wheel is pinned by URL+sha256 (`vcpkg_python_packages.bzl`), staged into a find-links dir, and pip runs with `PIP_NO_INDEX` and the proxy variables unset | this sandbox exports a proxy, so pip silently succeeded through it |
 | 6 | **The four `vcpkg_from_git` archives were pre-placed from a directory I had made by hand.** `vcpkg_git_archives.bzl` is generated, committed, listed in the table below — and **loaded by nothing**. The staging was `if [ -d ... ]; then cp ... 2>/dev/null \|\| true; fi`: three ways to succeed while copying nothing. Without them skia fails ~20 min in with `git fetch https://android.googlesource.com/.../piex.git … Error code: 128`, naming neither the directory nor the tarball. **Now a hard error in 4 seconds** naming both; reproducing them is a prefetch, not a rule — they are `git archive` output, so there is no URL to `http_file`, but cloning the pinned URL and `git archive`-ing the pinned ref reproduces the committed SHA512 exactly (verified on `libyuv`) | I created the directory by hand while building the pin, months before |
@@ -69,17 +70,17 @@ dependency I went looking for, so it is the one I found.** The check that would
 have caught all five is not a better `cquery` — it is doing the clone. See
 [Known gaps](#known-gaps).
 
-### Getting the three inputs — with and without CMake
+### Getting the two remaining inputs — with and without CMake
 
 Two audiences, two answers. **A Ladybird developer stages nothing:** one ordinary
-`./Meta/ladybird.py build` produces all three as side effects, which is exactly why
-they stayed invisible here for months.
+`./Meta/ladybird.py build` produces both as side effects, which is exactly why they
+stayed invisible here for months.
 
 | Input | Who produces it in a normal build |
 |---|---|
 | the vcpkg checkout + its `.git` | `Meta/Utils/build_vcpkg.py`, called by `ladybird.py` **`build`** as well as `vcpkg`: clone, checkout `builtin-baseline`, bootstrap the tool at the tag+SHA512 in `scripts/vcpkg-tool-metadata.txt`. ~70 s |
-| `Build/caches/HSTSPreload/transport_security_state_static.json` | the CMake **configure**, via `hsts_preload.cmake` → `download_file`, gated on `ENABLE_NETWORK_DOWNLOADS` (default ON) |
 | the four `git archive` tarballs | **vcpkg itself**, while building skia and angle |
+| ~~the HSTS preload table~~ | **Bazel**, now: `@hsts_preload_json//file`, pinned in `hsts_preload.bzl` |
 
 **Without ever running CMake — the actual answer, and it needs no CMake at all:**
 
@@ -89,8 +90,8 @@ python3 Meta/ladybird.py vcpkg               # 1. the checkout + .git (~70s). No
 python3 Meta/fetch_vcpkg_git_archives.py     # 2. the four git archives (~80s), each
                                              #    reproduced with git clone + git archive
                                              #    and VERIFIED against the committed SHA512
-curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
-    "$HSTS_URL"                              # 3. the HSTS table (see caveat below)
+                                             # (the HSTS table needs no step: Bazel
+                                             #  fetches it from a pinned commit)
 bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder \
             //:Compositor //:WebWorker
 ```
@@ -114,18 +115,55 @@ knowing, because both were mistakes I made first:
   it never appears in a downloads-only run. That asymmetry is recorded in the script
   rather than smoothed over.
 
-Step 3 is the **one genuine hermeticity defect** and it cannot be closed here.
-`hsts_preload.cmake` fetches Chromium's **`main`** — unversioned — so there is no
-revision to pin to. Pinning a revision on the Bazel side alone would make Bazel's
-output diverge from CMake's (the file at tag `139.0.7258.5` is 18.7 MB against the
-10.5 MB `main` served when this machine configured, and the generated table differs),
-trading a hermeticity gap for a **parity** gap. The fix is one line upstream: pin the
-URL to a revision in `hsts_preload.cmake`, then `http_file` the same revision, and
-both build systems consume one pinned input. Usefully, `download_file` is already a
-no-op when the file exists (verified with `ENABLE_NETWORK_DOWNLOADS=OFF`), so a pinned
-file staged by Bazel is consumed by CMake unchanged — the upstream change is additive.
+### The HSTS table: pinned downstream, because upstream is not ours to fix
 
-Three shortcuts tested and rejected, all of which look like simplifications:
+`Meta/CMake/hsts_preload.cmake` downloads Chromium's
+`net/http/transport_security_state_static.json` from **`main`** at configure time.
+The generator turns it into a ~95,000-entry `constexpr Array` of domains LibHTTP
+forces to HTTPS, so *the day you configured* decides a security-relevant table.
+The right fix is one line in that `.cmake` file; we do not control it, so the
+overlay pins it **downstream** and the upstream fetch is a bug report:
+
+- [`hsts_preload.bzl`](workspace/hsts_preload.bzl) — a module extension declaring
+  one `http_file` at an immutable commit URL with a `sha256`. `MODULE.bazel` names
+  it; `codegen_root.bzl`'s `gen_HSTSPreloadData` takes `@hsts_preload_json//file`
+  as `srcs` instead of a path under `Build/caches`.
+- [`Meta/pin_hsts_preload.py`](workspace/Meta/pin_hsts_preload.py) — regenerates
+  that file: resolves the newest commit touching the path, downloads it, and writes
+  **the hash it measured**. `--expect-same-as <file>` refuses to write unless the
+  pinned bytes equal a file you already have, which is how this pin was shown not
+  to move the generated table.
+
+**Verified, on the fresh clone, with the CMake-downloaded file deleted** — so the
+pinned fetch is the only possible source: `bazel build //:gen_HSTSPreloadData`
+produces both outputs **byte-identical to the CMake reference**
+(`HSTSPreloadData.cpp`, 4,873,678 bytes), and `bazel build //:LibHTTP` compiles and
+links them (RC=0, 183 actions).
+
+Two things make this pin honest rather than convenient, and both are measurements:
+
+- **Pin a commit, not a release tag.** A tag is a pin to a *different table*: at
+  `139.0.7258.5` the file is 18.7 MB and generates **168,593** entries against this
+  commit's **94,626**. Pinning a tag would have traded a hermeticity gap for a
+  parity gap. The commit `main` pointed at when the reference build configured
+  serves bytes identical to what CMake downloaded — checked with `cmp`.
+- **Unpinned would have been silently wrong.** `http_file` *does* work with no
+  `sha256` on the `main` URL (it builds, and Bazel prints the integrity it would
+  have used) — but then Bazel caches the first fetch forever: with a local origin,
+  changing the file upstream and rebuilding returned the **old** content in 0.3 s
+  with no warning. And the table moved during this work — `service.gov.scot` left
+  the list, 94,627 → 94,626 entries — so an unpinned fetch would have broken
+  byte-parity for a reason unrelated to the migration.
+
+The cost of pinning downstream only: **CMake still tracks `main`**, so a configure
+newer than the pin disagrees with Bazel. That is now one pinned input versus one
+unpinned one — a visible, dated disagreement with a commit sha to look at — instead
+of two unpinned fetches that happened to agree. And it is closeable without touching
+upstream: `download_file` is a no-op when the file already exists (verified with
+`ENABLE_NETWORK_DOWNLOADS=OFF`), so copying Bazel's fetched file into
+`Build/caches/HSTSPreload/` before configuring makes CMake consume the same pin.
+
+### Three shortcuts tested and rejected, all of which look like simplifications
 
 - **`--depth 1` on the vcpkg clone.** 8.7 MB instead of 121 MB, and `read-tree`
   even succeeds for some ports — then resolution fails on ffmpeg and harfbuzz with
@@ -180,6 +218,8 @@ an FFI header collision and an entire missing Rust target. See
 | `Meta/vcpkg_capture_assets.sh` | Records the 76-distfile pin, by *being* vcpkg's asset cache. The one run allowed to fetch |
 | `Meta/fetch_vcpkg_git_archives.py` | Produces the 4 `vcpkg_from_git` tarballs **without CMake**: takes the list from the committed pin, resolves each clone URL out of the portfiles, then `git clone` + `git -c core.autocrlf=false archive <ref>` and **verifies against the pinned SHA512**. 4/4 byte-identical |
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
+| `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
+| `Meta/pin_hsts_preload.py` | Re-pins it: resolves the newest commit touching the path, downloads it, writes the hash it **measured**; `--expect-same-as` refuses to write unless the pinned bytes equal the file CMake downloaded (parity guard) |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
@@ -206,9 +246,10 @@ adds `-I/usr/include/libdrm`), which is gap 3 below, not an emitter bug.
 
 To **build the browser**, no CMake build is needed — Bazel fetches and builds the
 vcpkg *ports* and the Rust crates itself, and vcpkg's own downloader reaches the
-network zero times. Three inputs still have to be present first (step 1a; gaps 7–8)
-— two of them obtainable **without CMake**, the third (the HSTS table) unpinnable
-until fixed upstream, so "no network at all" is not yet true:
+network zero times. **Two** inputs still have to be present first (step 1a; gaps
+7–8), both obtainable **without CMake**. The third, the HSTS preload table, is now
+fetched by Bazel: it is pinned downstream to a Chromium commit + sha256 in
+[`hsts_preload.bzl`](workspace/hsts_preload.bzl):
 
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
@@ -216,16 +257,12 @@ git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt header
                                                  # that is not self-contained (gap 9)
-# 1a. THE THREE INPUTS THE OVERLAY DOES NOT CARRY -- all three are produced by
-#     ONE ordinary Ladybird build. A Ladybird developer stages nothing by hand;
+# 1a. THE TWO INPUTS THE OVERLAY DOES NOT CARRY -- both are produced by ONE
+#     ordinary Ladybird build. A Ladybird developer stages nothing by hand;
 #     these are blockers for a Bazel-ONLY clone, and each one is a thing CMake or
 #     vcpkg produces as a side effect (see finding 36):
 #       (a) Build/vcpkg + its .git   <- python3 Meta/ladybird.py vcpkg  (~70s)
-#       (b) Build/caches/HSTSPreload/transport_security_state_static.json
-#                                    <- the CMake CONFIGURE downloads it
-#                                       (Meta/CMake/hsts_preload.cmake, gated on
-#                                        ENABLE_NETWORK_DOWNLOADS, default ON)
-#       (c) the four Meta/CMake/vcpkg/git-archives/*.tar.gz
+#       (b) the four Meta/CMake/vcpkg/git-archives/*.tar.gz
 #                                    <- vcpkg writes them into
 #                                       Build/vcpkg/downloads/ while building
 #                                       skia and angle. Verified: those files'
@@ -235,16 +272,15 @@ git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt
 #                                       vcpkg's own cache.
 #     WITHOUT CMAKE (the supported path for a Bazel-only clone):
 python3 Meta/ladybird.py vcpkg            # (a) checkout + .git, ~70s, no CMake
-python3 Meta/fetch_vcpkg_git_archives.py  # (c) 4/4 reproduced with git archive and
+python3 Meta/fetch_vcpkg_git_archives.py  # (b) 4/4 reproduced with git archive and
                                           #     verified against the pinned SHA512s
-curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
-  https://raw.githubusercontent.com/chromium/chromium/main/net/http/transport_security_state_static.json
-#                                         # (b) unpinnable until fixed upstream
-#     WITH CMake, if you were building Ladybird anyway, all three fall out of:
+#     The HSTS preload table needs NOTHING now: Bazel fetches it as
+#     @hsts_preload_json//file, pinned to a Chromium commit + sha256 in
+#     hsts_preload.bzl (below). Ditto `ply`: the wheel is pinned and pip runs
+#     with PIP_NO_INDEX (gap 8).
+#     WITH CMake, if you were building Ladybird anyway, (a) and (b) fall out of:
 #         ./Meta/ladybird.py build
 #         cp Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz Meta/CMake/vcpkg/git-archives/
-#     `ply` needs nothing now: the wheel is pinned and pip runs with
-#     PIP_NO_INDEX (gap 8).
 #
 # NB vcpkg's buildtrees peak around 3 GB. They go next to the declared output
 #    (inside bazel-out) rather than $TMPDIR, so a small /tmp tmpfs is not a
@@ -552,7 +588,7 @@ Honest inventory of what stops this from being a clone-and-build.
    patches). The BCR's `rules_qt` module is Vertexwahn's unrelated `rules_qt6`.
    Qt itself *is* host-portable: `qt.local_repo` discovers the host Qt via
    `qmake -query`, so no Qt SDK is vendored.
-7. **The fresh clone needs three inputs the overlay does not carry** (step 1a
+7. **The fresh clone needs two inputs the overlay does not carry** (step 1a
    above), and each stayed invisible for the same reason: it was already on the
    machine. `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s
    `builtin-baseline`, created by Ladybird's own `Meta/ladybird.py vcpkg` — is
@@ -560,17 +596,22 @@ Honest inventory of what stops this from being a clone-and-build.
    matches one file and the failure names a missing `/tmp/.../root/vcpkg`. Its
    `.git` is *load-bearing* (vcpkg resolves versioned ports with `git read-tree`)
    yet the filegroup **excludes** it — an undeclared input the build reads anyway,
-   because the action is `no-sandbox`. And
-   `Build/caches/HSTSPreload/transport_security_state_static.json` is an
-   *unversioned* download from Chromium's `main` branch that CMake does at
-   configure time; `codegen_root.bzl` names it as a genrule input, so Bazel fails
-   cleanly, but nothing produces it.
+   because the action is `no-sandbox`. The four `vcpkg_from_git` tarballs are the
+   other, reproduced by `Meta/fetch_vcpkg_git_archives.py`. Both are prefetches,
+   not rules: a `git_repository` strips `.git`, and `git archive` output has no URL
+   to `http_file`.
 
-   The honest fix for all three is the same shape as findings 30–33: pin them and
-   let Bazel fetch them. The vcpkg checkout is a `git_repository` at the
-   `builtin-baseline` commit (which `vcpkg.json` already names, so the pin exists
-   — it just is not wired to Bazel); the HSTS table is an `http_file`, and needs a
-   hash Ladybird does not currently pin at all, because the URL tracks `main`.
+   **The third one — the HSTS table — is now closed.** It was the interesting case,
+   because the unpinned fetch is *upstream's* (`hsts_preload.cmake` tracks Chromium's
+   `main`) and we cannot change that. So it is pinned **downstream**: an `http_file`
+   at an immutable commit + `sha256` in `hsts_preload.bzl`, regenerated by
+   `Meta/pin_hsts_preload.py`, verified byte-identical to CMake's generated table
+   with the staged file deleted, and the upstream unpinned fetch filed as a bug. The
+   generalizable shape: **a converter cannot pin an input on the foreign build
+   system's behalf, but it can pin it for itself — provided it pins the revision the
+   foreign system is currently serving, and proves that with a byte comparison
+   rather than a hash it invented.** Pin the wrong revision (a release tag, say) and
+   the hermeticity gap becomes a parity gap.
 
 8. **"Zero network access" is true of vcpkg's downloader, not of the vcpkg
    action.** The pin + `x-block-origin` is verified — a distfile missing from the

@@ -1692,7 +1692,7 @@ do with `Build/full`.**
 |---|---|---|
 | `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s `builtin-baseline` | `/tmp/.../root/vcpkg: No such file or directory` | `Meta/ladybird.py vcpkg` had been run months earlier |
 | its `.git` (120 MB), which vcpkg needs for `git read-tree` to resolve versioned ports — and which the filegroup **excludes** | `fatal: not a git repository: '.git'` … `while checking out port sqlite3` | the action is `no-sandbox`, so it read the real checkout regardless of what was declared |
-| `Build/caches/HSTSPreload/transport_security_state_static.json`, an **unversioned** download CMake does at configure time from Chromium's `main` | `missing input file '//:Build/caches/...'` | CMake's configure had already fetched it |
+| `Build/caches/HSTSPreload/transport_security_state_static.json`, an **unversioned** download CMake does at configure time from Chromium's `main` | `missing input file '//:Build/caches/...'` | CMake's configure had already fetched it. **Now fixed**: pinned downstream to a commit + sha256 (`hsts_preload.bzl`) and fetched by Bazel |
 | two path bugs in `Meta/vcpkg_build.sh`: the distfile index *and its entries* were execroot-relative, and vcpkg runs the asset script from its own cwd | `awk: cannot open ...`, then `cp: cannot stat ...`, surfacing as `no asset cache hits` and `x-block-origin blocks trying the authoritative source` | the checkout already had `downloads/tools/cmake-4.4.0-linux`, so vcpkg never *asked* the script for a tool |
 | `ply`, which the `angle` port installs with **`pip install ply`** | `No matching distribution found for ply` | this sandbox exports `HTTP_PROXY`, and the action inherits it |
 | the four `vcpkg_from_git` archives, staged from a directory I had made **by hand** — `vcpkg_git_archives.bzl` is generated, committed, documented, and **loaded by nothing** | 20 minutes in: `git fetch https://android.googlesource.com/.../piex.git … Error code: 128` | the directory existed on my disk from when I built the pin |
@@ -1914,12 +1914,14 @@ the 4**, because angle's zlib is fetched from angle's *build* phase via
 `checkout_in_path`, not its fetch phase. The script says so; "--only-downloads gets
 them all" would have been the comfortable, false version.
 
-That leaves **exactly one** genuine hermeticity defect: the HSTS table, fetched from
-Chromium's unversioned `main`, where there is no revision to pin to. A useful detail
-found while checking whether the fix is invasive: CMake's `download_file` is a no-op
-when the file already exists (verified with `ENABLE_NETWORK_DOWNLOADS=OFF`), so a
-pinned file staged by Bazel is consumed by CMake unchanged — **the upstream change is
-additive**, one URL gaining a revision, no restructuring.
+That left **exactly one** genuine hermeticity defect: the HSTS table, fetched from
+Chromium's unversioned `main`. It is now closed too — pinned *downstream*, to the
+commit `main` is serving rather than to a release tag, which is the part I got wrong
+first; see below. A useful detail found while checking how invasive the upstream fix
+would be, and which also makes the downstream pin shareable: CMake's `download_file`
+is a no-op when the file already exists (verified with `ENABLE_NETWORK_DOWNLOADS=OFF`),
+so the Bazel-fetched pinned file, copied into `Build/caches/HSTSPreload/` before
+configuring, is consumed by CMake unchanged.
 
 My four successive answers to "what is needed" were: a `repository_rule`, a prefetch
 script, a `cp`, and finally a script plus a capture instrument. The middle two were
@@ -1930,21 +1932,40 @@ answering it.** For the audience that has CMake it is the right answer; for the
 audience this migration exists to serve it is a non-answer, and I gave it because it
 let me stop working.
 
-**The HSTS table (row 3) is the one that genuinely cannot be fixed here, and it is
-not a Bazel problem.** `Meta/CMake/hsts_preload.cmake` fetches
+**The HSTS table (row 3) is the one whose unpinned fetch is not ours to fix — which
+turns out not to mean we cannot pin it.** `Meta/CMake/hsts_preload.cmake` fetches
 `raw.githubusercontent.com/chromium/chromium/**main**/net/http/transport_security_state_static.json`
-— an unversioned ref, at CMake *configure* time. Pinning it on the Bazel side works
-mechanically (I fetched it at tag `139.0.7258.5` and the generator ran fine), but not
-*honestly*: the pinned file is 18.7 MB against the 10.5 MB one this machine
-configured with, and the generated table differs. **Pinning only on the Bazel side
-would make Bazel's output diverge from CMake's — trading a hermeticity gap for a
-parity gap, and the parity baseline is what every claim in this document rests on.**
-The fix is upstream: pin the URL to a revision in Ladybird's CMake, then `http_file`
-that revision. Worth stating plainly as a general shape: **an unpinned input in the
-foreign build system is not something the converter can pin unilaterally.** It can
-*detect* it — Bazel already fails cleanly with `missing input file`, which is how it
-was found — and detecting it is the converter's job; fixing it is a change to the
-project.
+— an unversioned ref, at CMake *configure* time. My first answer was "pin it
+upstream, until then stage it", and it was wrong in the way that matters: **it made
+someone else's repo a prerequisite for our hermeticity.** A converter usually cannot
+change the project it converts, so an answer that requires an upstream patch is an
+answer that never ships.
+
+The correction, and it is a general shape worth stating: **a converter cannot pin an
+input on the foreign build system's behalf, but it can pin it for itself — provided
+it pins the revision the foreign system is currently *serving*, and proves that with
+a byte comparison rather than a hash it invented.** What made me think otherwise was
+picking the wrong revision. I tested a Chromium *release tag* (`139.0.7258.5`): 18.7
+MB against `main`'s 10.5 MB, **168,593** generated entries against **94,626** — so
+pinning *that* really would have traded a hermeticity gap for a parity gap. But the
+commit `main` pointed at when this machine configured serves bytes identical to what
+CMake downloaded (`cmp`, 10,521,748 bytes), and pinning **that** costs no parity at
+all. A tag is a pin to a *different table*; a commit is a pin to *this* one. The
+distinction is the whole finding, and I had generalized "pinning breaks parity" from a
+single badly chosen pin.
+
+So the overlay now pins downstream: `hsts_preload.bzl` (an `http_file` at that commit
++ sha256, consumed by `gen_HSTSPreloadData` as `@hsts_preload_json//file`) and
+`Meta/pin_hsts_preload.py`, which re-pins by *measuring* — it downloads the file and
+writes the hash it computed, and `--expect-same-as` refuses to write a pin whose bytes
+differ from the file the other build system already has. Verified on the fresh clone
+with the CMake-downloaded file **deleted** — so the pin is the only possible source:
+`HSTSPreloadData.h`/`.cpp` byte-identical to the CMake reference, and `//:LibHTTP`
+compiles and links them (RC=0). The residual cost is stated rather than hidden: CMake still
+tracks `main`, so a configure newer than the pin disagrees with Bazel — one pinned
+input against one unpinned one, a dated disagreement with a sha to look at, instead of
+two unpinned fetches that happened to agree. The upstream one-liner is filed as a bug,
+not depended upon.
 
 ### Can we just `http_file` the HSTS table? Measured, all four combinations
 
@@ -1988,15 +2009,14 @@ either: `139.0.7258.5` yields **168,593** entries against today's **94,626** —
 list was pruned hard in between, so pinning unilaterally on the Bazel side doesn't
 drift, it just diverges by 74,000 entries.
 
-That is the whole argument for fixing it upstream in one line
-(`Meta/CMake/hsts_preload.cmake`: pin the URL to a revision) rather than papering over
-it in the overlay: **pinning has to happen where both build systems read it, or the
-pin creates the difference it was supposed to prevent.** And the upstream change is
-additive, which I verified separately: `download_file` is a no-op when the file
-already exists (tested with `ENABLE_NETWORK_DOWNLOADS=OFF`), so a file staged by Bazel
-at a pinned revision is consumed by CMake unchanged. Until then the overlay stages it,
-and the honest reason is in this table — an unpinned `http_file` would be the only
-unpinned input in the overlay, and it would be one whose staleness is invisible.
+So row 1 is out (an unpinned `http_file` is the only input in the overlay whose
+staleness would be invisible), row 3's *tag* is out (it diverges by 74,000 entries),
+and what is left is row 3 with a **commit**: `3d75766` — the newest commit touching
+the path, i.e. what `main` serves — whose bytes are identical to CMake's download.
+That is the pin that shipped. The rule I was reaching for and got backwards on the
+first pass: **pin what the other build system is serving today, and prove it with
+`cmp`; do not pin what looks canonical.** A release tag looks like the responsible
+choice and is the one that breaks parity.
 
 Two shortcuts I tested and rejected, both of which look like simplifications and one
 of which I would have shipped:

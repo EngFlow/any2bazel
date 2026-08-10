@@ -218,20 +218,33 @@ def test_the_network_claim_is_scoped_to_vcpkgs_own_downloader():
         "requires-network is still presented as if it blocked the network"
 
 
-def test_the_unpinned_hsts_download_is_declared_and_documented():
-    """An input with no producing rule, and no hash anywhere.
+def test_the_hsts_download_is_pinned_downstream_and_documented():
+    """The input upstream fetches unpinned, pinned on our side instead.
 
-    codegen_root.bzl names Build/caches/HSTSPreload/...json as a genrule src, so
-    Bazel fails cleanly with `missing input file` rather than generating an empty
-    table. But nothing produces it: CMake downloads it at configure time from
-    Chromium's `main` branch, UNVERSIONED -- so there is no revision to pin even if
-    we wanted to, which is the more interesting half of the problem.
+    CMake downloads the HSTS preload table from Chromium's `main` at configure time
+    -- unversioned -- and that is upstream's code, which we do not control. So the
+    overlay pins it DOWNSTREAM: an http_file at an immutable commit + sha256, which
+    the generator genrule consumes instead of the configure's leftovers under
+    Build/caches. Three things have to hold together or the pin is decoration:
+    the pin exists with a full commit sha (not `main`), the genrule reads it, and
+    the reason it is a commit rather than a release tag is written down (a tag
+    serves a different table, so pinning one would trade hermeticity for parity).
     """
+    pin = _read("hsts_preload.bzl")
+    assert re.search(r'HSTS_PRELOAD_COMMIT = "[0-9a-f]{40}"', pin), \
+        "the HSTS pin must name a full commit sha"
+    assert re.search(r'HSTS_PRELOAD_SHA256 = "[0-9a-f]{64}"', pin)
+    assert "/main/net/http/" not in pin, "the pinned URL must not track main"
+
     codegen = _read("codegen_root.bzl")
-    assert "Build/caches/HSTSPreload" in codegen
+    assert "@hsts_preload_json//file" in codegen, \
+        "the generator genrule must consume the pinned file"
+    assert "Build/caches/HSTSPreload" not in codegen, \
+        "the unpinned CMake download path must be gone"
+
     readme = _example_readme()
-    assert "HSTSPreload" in readme and "unversioned" in readme.lower(), \
-        "the unpinned HSTS download is not documented as a clone blocker"
+    assert "hsts_preload.bzl" in readme and "unversioned" in readme.lower(), \
+        "why the HSTS table needed a downstream pin is not documented"
 
 
 def _example_readme():

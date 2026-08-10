@@ -169,9 +169,28 @@ def parse_flap():
 # referenced as //pkg:path, not as a root-package-relative path.
 SUBPACKAGES = ("Libraries/LibWeb", "Meta")
 
+# Generator inputs that are NOT in the repo: CMake downloads them at configure
+# time into the build tree, so a Bazel-only clone has no file at the path the
+# ninja command line names. Each maps to the label of a pinned fetch.
+#
+# There is exactly one, and it is the HSTS preload table:
+# hsts_preload.cmake downloads Chromium's `main` -- unversioned -- so the path
+# below only exists if someone ran a CMake configure, and its CONTENT depends on
+# the day they ran it. hsts_preload.bzl pins a commit + sha256 downstream (the
+# upstream unpinned fetch is filed as a bug we cannot fix from here), so the
+# genrule takes the pinned file instead of the configure's leftovers. Mapping it
+# here rather than post-editing codegen_root.bzl keeps the emitter the single
+# source of truth for that file.
+DOWNLOADED_INPUTS = {
+    'Build/caches/HSTSPreload/transport_security_state_static.json':
+        '@hsts_preload_json//file',
+}
+
 
 def _label(rel):
     """Root-relative repo path -> a label the root package can reference."""
+    if rel in DOWNLOADED_INPUTS:
+        return DOWNLOADED_INPUTS[rel]
     for pkg in SUBPACKAGES:
         if rel == pkg or rel.startswith(pkg + '/'):
             return '//%s:%s' % (pkg, os.path.relpath(rel, pkg))
