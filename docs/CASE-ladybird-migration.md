@@ -1946,6 +1946,58 @@ foreign build system is not something the converter can pin unilaterally.** It c
 was found — and detecting it is the converter's job; fixing it is a change to the
 project.
 
+### Can we just `http_file` the HSTS table? Measured, all four combinations
+
+Asked directly, so I ran it rather than reasoned about it. `http_file` has two knobs
+that matter — pinned ref or `main`, `sha256` or none — and Bazel behaves differently
+in all four:
+
+| URL ref | `sha256` | what Bazel does | what you get |
+|---|---|---|---|
+| `main` | none | **fetches, builds, and prints** `DEBUG: … a canonical reproducible form can be obtained by modifying arguments integrity = "sha256-ObT9…"` | works; unpinned |
+| `main` | given | fails the moment upstream moves: `Checksum was 5d5df26… but wanted 000…` | a build that breaks on Chromium's commit rate |
+| pinned tag | given | fetches; 18.7 MB | hermetic, **and not what CMake built** |
+| any | none + plain `http://` | refuses outright: `No URLs left after removing plain http URLs due to missing checksum` | — |
+
+So the answer to "can we?" is **yes, mechanically** — row 1 builds today. Two measured
+facts decide whether we should.
+
+**First: unpinned means Bazel caches whatever it saw first, forever.** With a local
+HTTP server as the origin I fetched `VERSION-ONE`, changed the file upstream to
+`VERSION-TWO`, rebuilt: `-> VERSION-ONE`, in 0.3 s, no refetch, no warning. Same with
+a `file://` origin. That is the right behaviour for a *pinned* input and the worst
+possible behaviour for an unpinned one: **two developers who first built on different
+days build different browsers and neither can tell.** The output is a
+94,000-entry `constexpr Array` of domains that get forced to HTTPS — a silent
+difference in security behaviour, not in a log line.
+
+**Second, and this is the number that settles it:** the table moved *while I was
+working on this*. The file this machine's CMake configure fetched from `main` and the
+one `http_file` fetched from `main` today differ by one entry:
+
+```
+< static constexpr Array<HSTSPreloadEntry, 94627> s_hsts_preload_entries { {
+> static constexpr Array<HSTSPreloadEntry, 94626> s_hsts_preload_entries { {
+-     HSTSPreloadEntry { "service.gov.scot"sv, true },
+```
+
+One domain left Chromium's preload list, so `HSTSPreloadData.cpp` is 53 bytes shorter,
+and the byte-parity claim this whole document rests on would have failed for a reason
+that has nothing to do with the migration. And the *pinned* tag is not a way out
+either: `139.0.7258.5` yields **168,593** entries against today's **94,626** — the
+list was pruned hard in between, so pinning unilaterally on the Bazel side doesn't
+drift, it just diverges by 74,000 entries.
+
+That is the whole argument for fixing it upstream in one line
+(`Meta/CMake/hsts_preload.cmake`: pin the URL to a revision) rather than papering over
+it in the overlay: **pinning has to happen where both build systems read it, or the
+pin creates the difference it was supposed to prevent.** And the upstream change is
+additive, which I verified separately: `download_file` is a no-op when the file
+already exists (tested with `ENABLE_NETWORK_DOWNLOADS=OFF`), so a file staged by Bazel
+at a pinned revision is consumed by CMake unchanged. Until then the overlay stages it,
+and the honest reason is in this table — an unpinned `http_file` would be the only
+unpinned input in the overlay, and it would be one whose staleness is invisible.
+
 Two shortcuts I tested and rejected, both of which look like simplifications and one
 of which I would have shipped:
 
