@@ -180,8 +180,10 @@ mkdir -p "$ROOT/downloads"
 # in vcpkg_git_archives.bzl lists the four expected names -- that file is GENERATED
 # and checked in, and (finding 36) is currently loaded by nothing at all, which is
 # the deeper bug this only reports. These are `git archive` output, so unlike the 76
-# distfiles they have no URL to http_file; making Bazel produce them needs a repo
-# rule that clones at the pinned ref (gap 7).
+# distfiles they have no URL to http_file -- but reproducing them is a PREFETCH, not a
+# repo rule: clone the pinned URL and `git archive` the pinned ref, which reproduces
+# the committed SHA512 exactly (verified on libyuv). A repo rule here would be a fork
+# of tooling the project already owns (gap 7).
 GIT_ARCHIVES="$SRC/Meta/CMake/vcpkg/git-archives"
 if ! compgen -G "$GIT_ARCHIVES/*.tar.gz" > /dev/null; then
     echo "vcpkg_build: no git-sourced externals at $GIT_ARCHIVES" >&2

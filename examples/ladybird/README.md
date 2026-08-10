@@ -46,7 +46,7 @@ produce or document:
 | 3 | **`Build/caches/HSTSPreload/transport_security_state_static.json`** (10 MB) — an *unversioned, unpinned* network download CMake does at configure time (`Meta/CMake/hsts_preload.cmake` fetches Chromium's `main`). `codegen_root.bzl` names it as a genrule `srcs`, so Bazel fails cleanly with `missing input file` — but there is no rule that produces it | the CMake configure had already downloaded it |
 | 4 | **Two path bugs in `Meta/vcpkg_build.sh`** — the distfile index and its entries were passed **execroot-relative**, and vcpkg invokes the asset-cache script from its own cwd, so `awk`/`cp` looked in the wrong directory. Every asset lookup failed, reported as `no asset cache hits`, and `x-block-origin` then correctly refused the network. Fixed here (absolutize both) | the vcpkg checkout already had `downloads/tools/cmake-4.4.0-linux` from an earlier run, so vcpkg never *asked* the script for a tool |
 | 5 | **The `angle` port runs `pip install ply`** (`x_vcpkg_get_python_packages`), which is **not** an asset-cache download and therefore not covered by the pin. A real hole in the "zero network access" claim: `vcpkg_tree` set `requires-network: "0"`, but that is a *scheduling hint*, and with `no-sandbox: "1"` **nothing enforced it** — with `use_default_shell_env = True` the action inherited `HTTP_PROXY`/`HTTPS_PROXY` and pip reached PyPI. **Fixed here:** the wheel is pinned by URL+sha256 (`vcpkg_python_packages.bzl`), staged into a find-links dir, and pip runs with `PIP_NO_INDEX` and the proxy variables unset | this sandbox exports a proxy, so pip silently succeeded through it |
-| 6 | **The four `vcpkg_from_git` archives were pre-placed from a directory I had made by hand.** `vcpkg_git_archives.bzl` is generated, committed, listed in the table below — and **loaded by nothing**. The staging was `if [ -d ... ]; then cp ... 2>/dev/null \|\| true; fi`: three ways to succeed while copying nothing. Without them skia fails ~20 min in with `git fetch https://android.googlesource.com/.../piex.git … Error code: 128`, naming neither the directory nor the tarball. **Now a hard error in 4 seconds** naming both; producing them from Bazel still needs a repo rule (they are `git archive` output, so there is no URL to `http_file`) | I created the directory by hand while building the pin, months before |
+| 6 | **The four `vcpkg_from_git` archives were pre-placed from a directory I had made by hand.** `vcpkg_git_archives.bzl` is generated, committed, listed in the table below — and **loaded by nothing**. The staging was `if [ -d ... ]; then cp ... 2>/dev/null \|\| true; fi`: three ways to succeed while copying nothing. Without them skia fails ~20 min in with `git fetch https://android.googlesource.com/.../piex.git … Error code: 128`, naming neither the directory nor the tarball. **Now a hard error in 4 seconds** naming both; reproducing them is a prefetch, not a rule — they are `git archive` output, so there is no URL to `http_file`, but cloning the pinned URL and `git archive`-ing the pinned ref reproduces the committed SHA512 exactly (verified on `libyuv`) | I created the directory by hand while building the pin, months before |
 
 Rows 1–3 are inputs the recipe must produce or document (step 1a). Rows 4–6 were
 bugs, and 5 is the substantive one: **"zero network access" was measured with
@@ -56,9 +56,10 @@ absence of a network — `requires-network: "0"` is a hint, and `no-sandbox: "1"
 means there is no namespace to enforce. `ply` is now pinned like any other
 dependency (URL + sha256 → `http_file` → find-links dir → `PIP_NO_INDEX`), which
 makes an unpinned package a hard error rather than a download. The four
-`vcpkg_from_git` archives are still staged from a directory rather than fetched by
-Bazel — they are `git archive` output with no URL, so they need a repo rule that
-clones at the pinned ref.
+`vcpkg_from_git` archives are still staged from a directory rather than produced by
+the recipe — they are `git archive` output with no URL, so reproducing them means
+cloning each pinned URL and `git archive`-ing the pinned ref (8 lines of shell, and
+the committed SHA512s check it).
 
 The lesson is the same one as finding 35, one layer out: **`Build/full` was the
 dependency I went looking for, so it is the one I found.** The check that would
@@ -67,17 +68,31 @@ have caught all five is not a better `cquery` — it is doing the clone. See
 
 ### What closing the last three takes
 
-Measured, not estimated — each shortcut below was tested and rejected (finding 36):
+Two are a **prefetch step**, not new Bazel machinery, and one needs a change to
+Ladybird itself. (An earlier draft of this section proposed a custom
+`repository_rule` for the first two; that was wrong, and why is in finding 36.)
 
-| Blocker | What closes it | Shortcuts that do **not** work |
-|---|---|---|
-| Rows 1+2: `Build/vcpkg` and its `.git` | **One custom `repository_rule`** that shells out to `git clone` at `vcpkg.json`'s `builtin-baseline`. It keeps `.git`, and `glob(["**"])` then carries those files as *declared* inputs — which also fixes row 2's undeclared-input lie | `git_repository`/`new_git_repository` **strip `.git`**. `--depth 1` fails (`vcpkg was cloned as a shallow repository`) — the pinned port trees live in history, so it is a full 121 MB clone, ~1 min, once. Dropping `builtin-baseline` "works" and **silently moves 10 dep versions** (ffmpeg 7.1.1→8.1.2, harfbuzz 10.2→14.2.1, mimalloc 2→3, …) |
-| Row 6: the four `git archive` tarballs | **The same rule's second user** — clone at the pinned ref, `git archive`, expose the `.tar.gz`. Makes `vcpkg_git_archives.bzl`'s SHA512s checked instead of decorative | — |
-| Row 3: the HSTS table | **An upstream change to Ladybird**: `Meta/CMake/hsts_preload.cmake` fetches Chromium's `main`, so pin *that* to a revision, then `http_file` the same revision | Pinning only on the Bazel side: the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs, so it would trade a hermeticity gap for a **parity** gap. A converter can *detect* an unpinned input — Bazel already fails with `missing input file` — but cannot pin it unilaterally |
+| Blocker | What closes it |
+|---|---|
+| 1+2: the vcpkg checkout and its `.git` | **`python3 Meta/ladybird.py vcpkg`** — Ladybird already ships it. It clones microsoft/vcpkg, checks out `vcpkg.json`'s `builtin-baseline` and bootstraps the tool: **75 s, verified from an empty directory**, producing the 121 MB `.git` that `git read-tree` needs. Nothing to write; this is a documentation and ordering problem |
+| 6: the four `git archive` tarballs | **~8 lines of shell**: clone each pinned URL, `git archive <ref>`. Verified — the reproduced `libyuv` tarball's SHA512 matches `vcpkg_git_archives.bzl` exactly, so the committed hashes become *checked* rather than decorative |
+| 3: the HSTS table | **An upstream change to Ladybird.** `Meta/CMake/hsts_preload.cmake` fetches Chromium's `main` (unversioned) at configure time; pin *that* to a revision, then `http_file` the same revision so both build systems consume one pinned input. Pinning only on the Bazel side "works" but the pinned file (18.7 MB) differs from the one CMake fetched (10.5 MB) and the generated table differs — trading a hermeticity gap for a **parity** gap |
+
+Two shortcuts tested and rejected, because both look like simplifications:
+
+- **`--depth 1` on the vcpkg clone.** 8.7 MB instead of 121 MB, and `read-tree`
+  even succeeds for some ports — then resolution fails on ffmpeg and harfbuzz with
+  vcpkg's own `Try again with a full vcpkg clone`. The pinned versions' port trees
+  live in **history**; that is what a version database *is*.
+- **Dropping `builtin-baseline`** so no `.git` is needed at all. It resolves happily
+  against the checked-out `ports/` — and **silently moves 10 dependency versions**
+  (ffmpeg 7.1.1#5 → 8.1.2#3, harfbuzz 10.2.0 → 14.2.1#2, mimalloc 2.2.7 → 3.4.3,
+  plus zlib, freetype, dbus, fontconfig, libedit, libwebp, cpptrace). A fix for a
+  hermeticity blocker that changes ten dependency versions is not a fix.
 
 A fresh full clone at the baseline resolves all **78 ports to exactly the versions
-this dev checkout resolves** (`diff`, 0 differences), which is what makes the repo
-rule sound: the checkout carries no local state beyond the ref.
+this dev checkout resolves** (`diff`, 0 differences) — so the checkout carries no
+local state beyond the ref, which is what makes the prefetch step sufficient.
 
 **This claim was false until recently, and the way it was false is the most
 useful thing in this directory.** The README said it worked; it did not. Every
@@ -149,8 +164,10 @@ python3 Meta/ladybird.py vcpkg
 mkdir -p Build/caches/HSTSPreload && curl -Lo Build/caches/HSTSPreload/transport_security_state_static.json \
     https://raw.githubusercontent.com/chromium/chromium/main/net/http/transport_security_state_static.json
 #     (c) the four vcpkg_from_git archives. These are `git archive` output, so
-#         there is no URL to http_file and Bazel cannot fetch them yet; the
-#         hashes ARE pinned (vcpkg_git_archives.bzl) so they can be verified.
+#         there is no URL to http_file; the hashes ARE pinned
+#         (vcpkg_git_archives.bzl), so reproducing them is a prefetch, not a rule
+#         -- clone each pinned URL and `git archive` the pinned ref. Verified:
+#         the reproduced libyuv tarball's SHA512 matches the committed one.
 #         Absent, the build now fails in 4s naming them (gap 7).
 #     NB `ply` no longer needs anything: the wheel is pinned and pip runs with
 #         PIP_NO_INDEX (gap 8).

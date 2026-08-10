@@ -1823,65 +1823,79 @@ by hand** (`Build/vcpkg` + its `.git`, the unpinned HSTS table, the four
 `git archive` tarballs). That is a different sentence from "clone and build", and the
 difference is exactly what rows 1–3 of the README table say.
 
-### What closing the last three actually takes — measured, not estimated
+### What closing the last three actually takes — and why my first answer was wrong
 
-Ulf's follow-up was the right one: *so what's needed to make it work?* Three
-staged inputs, and the answers are not symmetric — two are a single Bazel rule, and
-one is an upstream change to Ladybird that no Bazel rule can substitute for.
+Ulf's follow-up was the right one: *so what's needed to make it work?* My first
+answer was "a custom `repository_rule` that clones vcpkg at the baseline — it closes
+two of the three blockers." I had done real work to support it: I confirmed
+`git_repository`/`new_git_repository` **strip `.git`** (so the built-in rule cannot
+deliver the one property this dependency needs), that a custom rule shelling out to
+`git clone` keeps it, and that `glob(["**"])` then carries the `.git` files as
+declared inputs. All true, and all beside the point.
 
-**`Build/vcpkg` + its `.git` (rows 1–2) — one custom `repository_rule`, and the four
-obvious shortcuts are all dead ends.** I tested each rather than reasoning about it:
+**Ladybird already ships the thing I was proposing to write.** `Meta/ladybird.py
+vcpkg` — 45 lines in `Meta/Utils/build_vcpkg.py` — clones microsoft/vcpkg, checks out
+`vcpkg.json`'s `builtin-baseline`, and bootstraps the tool at a tag+SHA512 the
+checkout itself pins. I ran it from an empty directory: **75 seconds, RC=0, `.git`
+present at the right commit, `vcpkg` binary built.** The README's step 1a has been
+telling cloners to run it the whole time. So blockers 1 and 2 are not missing
+machinery; they are a **prefetch step that the recipe must run in the right order**,
+and the honest fix is a `MODULE.bazel`-adjacent note plus a check that fails clearly
+when it has not been run — not a repo rule reimplementing a script the project
+maintains.
 
-- **`git_repository` / `new_git_repository` cannot be used at all: they strip
-  `.git`.** Fetched a small repo with `new_git_repository` — no `.git` in the
-  external directory. So the built-in rule for "get a git repo" cannot deliver the
-  one property this dependency needs. A custom repo rule that shells out to
-  `git clone` *does* keep it, and Bazel's `glob(["**"])` then carries the
-  `.git` files as declared action inputs (in the probe, 29 of 40 `srcs` were
-  under `.git/`) — which also converts row 2 from an *undeclared input the
-  build secretly reads* into a normal one.
-- **`--depth 1` does not work.** A shallow clone at the baseline is 8.7 MB and
-  `read-tree` succeeds for *some* trees, so it looks promising — then resolution
-  fails on ffmpeg and harfbuzz with `failed to unpack tree object` and vcpkg's own
-  advice: `vcpkg was cloned as a shallow repository. Try again with a full vcpkg
-  clone.` The pinned versions' port trees live in **history**, not at the baseline
-  commit; that is the whole point of the version database. So it is a full clone:
-  121 MB of `.git`, ~63–88 s, once, cached in Bazel's repo cache.
-- **Dropping `builtin-baseline` to avoid needing `.git` is the dangerous
-  shortcut, and it is the one I would have been tempted by.** Without the baseline
-  vcpkg resolves against the checked-out `ports/` and needs no `read-tree` at all —
-  it "works". It also **silently moves 10 dependencies**: ffmpeg 7.1.1#5 → 8.1.2#3,
-  harfbuzz 10.2.0 → 14.2.1#2, mimalloc 2.2.7 → 3.4.3, plus zlib, freetype, dbus,
-  fontconfig, libedit, libwebp and cpptrace. A "fix" for a hermeticity blocker that
-  changes ten dependency versions is not a fix; it is the same class of error as
-  everything else in this document, dressed as simplification.
-- The positive control: a **fresh** full clone at the baseline, driven by the same
-  manifest, resolves all **78 ports to exactly the versions my dev checkout
-  resolves** (`diff`, 0 differences). So the checkout carries no local state beyond
-  the ref — which is what makes the repo rule sound.
+Two lessons, and the second is the uncomfortable one. First: **a repo rule that
+re-implements the foreign project's own bootstrap script is a fork of it.** It would
+drift the moment Ladybird bumps its baseline or its tool metadata, and the drift
+would look like a Bazel bug. Second: **I answered a "what's needed" question by
+designing, not by reading the project.** Nothing in the environment stopped me from
+opening `Meta/Utils/build_vcpkg.py` before proposing to duplicate it — the same
+failure mode as answering from the README instead of doing the clone, one level up:
+the fix I imagine is more available to me than the fix that exists.
 
-**The four `git archive` tarballs (row 6) are the same rule's second user.** Clone at
-the pinned ref, `git archive`, expose the `.tar.gz`; `vcpkg_from_git` honours a
-pre-placed `downloads/<PORT>-<REF>.tar.gz`, and `git archive` is byte-deterministic
-for a fixed ref. That makes `vcpkg_git_archives.bzl`'s SHA512s *checked* rather than
-decorative — one rule closes rows 1, 2 and 6.
+**The four `git archive` tarballs (row 6) collapse the same way.** No repo rule
+needed: clone the pinned URL, `git archive <ref>`. I reproduced `libyuv`'s tarball
+that way and its SHA512 matched `vcpkg_git_archives.bzl`'s committed value **exactly**
+— which is the useful part, because it means the committed hashes are *checkable* and
+the reproduction is verifiable in one line rather than trusted. Eight lines of shell,
+against a `repository_rule` I would have had to design, test and maintain.
 
-**The HSTS table (row 3) is not a Bazel problem, and this is the interesting one.**
-`Meta/CMake/hsts_preload.cmake` fetches
+**The HSTS table (row 3) is the one that genuinely cannot be fixed here, and it is
+not a Bazel problem.** `Meta/CMake/hsts_preload.cmake` fetches
 `raw.githubusercontent.com/chromium/chromium/**main**/net/http/transport_security_state_static.json`
 — an unversioned ref, at CMake *configure* time. Pinning it on the Bazel side works
-mechanically (I fetched it at tag `139.0.7258.5` and the generator ran fine), but it
-does not work *honestly*: the pinned file is 18.7 MB against the 10.5 MB one on this
-machine, and the generated table differs. **Pinning only on the Bazel side would
-make Bazel's output diverge from CMake's — trading a hermeticity gap for a parity
-gap, and the parity baseline is what every claim in this document rests on.** The
-real fix is upstream: pin the URL to a revision in Ladybird's CMake, then `http_file`
-the same revision with the same sha256 and both build systems consume one pinned
-input. Worth stating plainly because it is a general shape: **an unpinned input in
-the foreign build system is not something the converter can pin unilaterally.** It
-can *detect* it (Bazel already fails cleanly with `missing input file`, which is how
-it was found), and detecting it is the converter's job; fixing it is a change to the
+mechanically (I fetched it at tag `139.0.7258.5` and the generator ran fine), but not
+*honestly*: the pinned file is 18.7 MB against the 10.5 MB one this machine
+configured with, and the generated table differs. **Pinning only on the Bazel side
+would make Bazel's output diverge from CMake's — trading a hermeticity gap for a
+parity gap, and the parity baseline is what every claim in this document rests on.**
+The fix is upstream: pin the URL to a revision in Ladybird's CMake, then `http_file`
+that revision. Worth stating plainly as a general shape: **an unpinned input in the
+foreign build system is not something the converter can pin unilaterally.** It can
+*detect* it — Bazel already fails cleanly with `missing input file`, which is how it
+was found — and detecting it is the converter's job; fixing it is a change to the
 project.
+
+Two shortcuts I tested and rejected, both of which look like simplifications and one
+of which I would have shipped:
+
+- **`--depth 1` on the vcpkg clone.** 8.7 MB instead of 121 MB, and `read-tree` even
+  succeeds for some ports — then resolution fails on ffmpeg and harfbuzz with
+  `failed to unpack tree object` and vcpkg's own advice, `Try again with a full vcpkg
+  clone`. The pinned versions' port trees live in **history**, not at the baseline
+  commit; that is what a version database is.
+- **Dropping `builtin-baseline`** so `.git` is not needed at all. vcpkg then resolves
+  against the checked-out `ports/` and needs no `read-tree` — it "works". It also
+  **silently moves 10 dependencies**: ffmpeg 7.1.1#5 → 8.1.2#3, harfbuzz 10.2.0 →
+  14.2.1#2, mimalloc 2.2.7 → 3.4.3, plus zlib, freetype, dbus, fontconfig, libedit,
+  libwebp and cpptrace. A "fix" for a hermeticity blocker that changes ten dependency
+  versions is the same class of error as everything else in this document, dressed as
+  simplification.
+
+The positive control for all of it: a **fresh** full clone at the baseline, driven by
+the same manifest, resolves all **78 ports to exactly the versions this dev checkout
+resolves** (`diff`, 0 differences). The checkout carries no local state beyond the
+ref — which is precisely why a prefetch step is sufficient and a rule is not needed.
 
 ## Plan for the rest
 
