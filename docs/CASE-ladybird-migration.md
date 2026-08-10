@@ -2091,6 +2091,61 @@ dependency. Getting this right is what `builtin-baseline` + `overrides` means, a
 is why the answer to "how do we get it" keeps coming back to *run the project's own
 bootstrap*.
 
+## Finding 37: the overlay was not reproducible, and the thing that proved it was a `cp`
+
+Asked to get the tree onto another machine, I reached for the obvious answer — publish
+the branch, `cp -r workspace/. ladybird/` — and then ran it on an empty directory
+instead of describing it. Four things were wrong, and only the first was one I could
+have found by reading.
+
+**Nothing recorded which Ladybird commit the overlay describes.** The generated BUILD
+files name ~1,961 LibWeb compile inputs and 665 IDL bindings *by path*; they were
+generated from exactly one upstream tree. That tree's sha appeared nowhere — not in
+the README, not in `cmake2bazel.json`, not in a comment. Every parity claim in this
+document is relative to a commit the document never named. This is the same class as
+the `--depth 1` and release-tag mistakes: **a pin that is not written down is not a
+pin**, and the reason it survived so long is that my working copy *was* the pin.
+
+**The interesting one: the overlay and upstream's bootstrap fight over `Build/vcpkg`.**
+`Build/vcpkg/BUILD.bazel` is an overlay file, so a `cp -r` creates the *directory*
+`Build/vcpkg`. Upstream's `Meta/Utils/build_vcpkg.py` then does:
+
+```python
+if not vcpkg_checkout.is_dir():
+    git clone …
+else:
+    bootstrapped = git -C Build/vcpkg rev-parse HEAD
+```
+
+The directory exists, so it takes the `else`, and `git -C Build/vcpkg rev-parse HEAD`
+— with no `.git` inside — **walks up to Ladybird's own repository** and cheerfully
+returns *Ladybird's* HEAD. It then tries to check vcpkg's baseline out of the Ladybird
+repo: `fatal: unable to read tree (40f3c709…)`. Two correct programs, one wrong
+composition: upstream infers "cloned" from `is_dir()`, and the overlay's job is to put
+a file in that directory. **`git`'s upward search for `.git` is what turns a missing
+directory into a wrong answer instead of an error** — the same property that makes
+`git -C` convenient makes it unsafe as an existence check. The fix is ordering
+(prefetch, *then* stage that one file), and `apply_overlay.sh` defers it and explains
+why at the point of deferral.
+
+The other two were mundane and would have cost someone an afternoon: `bazelrc.txt`
+must be renamed to `.bazelrc` (stored under a different name precisely so a `cp -r`
+cannot be mistaken for a working build — and then the recipe relies on a human
+remembering the rename), and the two upstream patches must be *applied*, not merely
+shipped.
+
+So the deliverable is a script, and the part worth keeping is `--verify`, which checks
+what a file copy cannot: HEAD is the pinned commit, all 42 files are byte-identical,
+the patches are applied (`git apply --check -R` succeeding is the proof — a patch that
+reverse-applies cleanly is already in the tree), and the `.sh` files still have their
+executable bit. That last check exists because of an earlier bug of exactly this shape:
+scripts committed `100644` while my dev tree had them `+x` by hand, so only a fresh
+clone failed, and only at action time. **The general rule this migration keeps
+rediscovering: my working tree carries state git does not, and the only way to find it
+is to reconstruct the tree somewhere else and diff.** `apply_overlay.sh /tmp/lbfresh2`
+now produces a tree byte-identical to the one that renders, which is the first time
+that sentence has been checked rather than assumed.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →

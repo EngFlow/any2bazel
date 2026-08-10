@@ -115,6 +115,48 @@ knowing, because both were mistakes I made first:
   it never appears in a downloads-only run. That asymmetry is recorded in the script
   rather than smoothed over.
 
+### Reproducing the tree on another machine
+
+The overlay is **not a fork**: it is a pinned upstream Ladybird commit + two patches
++ 42 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
+that sentence made executable, because *"copy `workspace/` over a clone"* has four
+ways to be silently wrong — and every one of them was found by running it, not by
+reading it:
+
+1. **The Ladybird commit.** The generated BUILD files name ~1,961 LibWeb compile
+   inputs and 665 IDL bindings *by path*, and were generated from one tree.
+   **Nothing in this repo recorded which one** until the script did
+   (`f9e34731`). Against a different tree the build fails on a moved file — or
+   worse, silently omits a new one.
+2. **The patches**, which have to be applied or the build is nondeterministic
+   (dictionaries emitted in `PYTHONHASHSEED` order) or does not compile at all
+   under per-header moc.
+3. **The rename**: `bazelrc.txt` → `.bazelrc`. Stored under a different name so a
+   `cp -r` cannot be mistaken for a working build — and a rename a human does by
+   hand is a rename a human forgets.
+4. **The order**, which is the one I would never have predicted and which the
+   `cp -r` recipe above gets wrong. `Build/vcpkg/BUILD.bazel` makes the *directory*
+   `Build/vcpkg` exist, and upstream's `Meta/Utils/build_vcpkg.py` treats "the
+   directory is there" as "the checkout is there": it skips the clone and runs
+   `git -C Build/vcpkg rev-parse HEAD`, which — there being no `.git` inside —
+   **walks up to Ladybird's own repo** and returns *Ladybird's* HEAD. It then tries
+   to check vcpkg's baseline out of the Ladybird repo:
+   `fatal: unable to read tree (40f3c709…)`. So that one file must be staged
+   **after** the prefetch; the script defers it and says so.
+
+`--verify` checks a tree without changing it, and checks the things a file copy
+cannot: that HEAD is the pinned commit, that all 42 files are byte-identical, that
+the patches are **applied** (`git apply --check -R` succeeding is the proof — a patch
+that reverse-applies cleanly is already in the tree), and that the `.sh` files kept
+their **executable bit**, which is tree state a careless copy drops and which then
+fails deep inside a build action rather than at setup.
+
+Verified end to end: `apply_overlay.sh /tmp/lbfresh2` on an empty directory produced
+a tree byte-identical to the one that renders (`diff -rq`, excluding prefetch
+outputs), `Meta/fetch_vcpkg_git_archives.py` reproduced **4/4** archives verified
+against the pinned SHA512s, and `bazel build` then built the 76 vcpkg ports offline
+and linked `//:LibHTTP`.
+
 ### The HSTS table: pinned downstream, because upstream is not ours to fix
 
 `Meta/CMake/hsts_preload.cmake` downloads Chromium's
@@ -220,6 +262,7 @@ an FFI header collision and an entire missing Rust target. See
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
 | `Meta/pin_hsts_preload.py` | Re-pins it: resolves the newest commit touching the path, downloads it, writes the hash it **measured**; `--expect-same-as` refuses to write unless the pinned bytes equal the file CMake downloaded (parity guard) |
+| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 42 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
@@ -251,8 +294,22 @@ network zero times. **Two** inputs still have to be present first (step 1a; gaps
 fetched by Bazel: it is pinned downstream to a Chromium commit + sha256 in
 [`hsts_preload.bzl`](workspace/hsts_preload.bzl):
 
+**One command does the whole tree**, and it is the recommended path because the
+manual version below has four ways to be silently wrong (see
+[Reproducing the tree](#reproducing-the-tree-on-another-machine)):
+
+```sh
+./apply_overlay.sh ~/ladybird          # clone at the pinned commit, patch, overlay,
+                                       # vcpkg prefetch -- in the order that works
+./apply_overlay.sh --verify ~/ladybird # check an existing tree, change nothing
+```
+
+Or by hand:
+
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
+git checkout f9e34731b85fea1c3517941d8388566cd33277c4   # the commit the generated
+                                                        # BUILD files describe
 # 1. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
 git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt header
