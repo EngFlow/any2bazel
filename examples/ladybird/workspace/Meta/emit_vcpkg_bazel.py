@@ -391,6 +391,117 @@ def load_capture(path):
     return out
 
 
+# The host tools vcpkg fetches for ITSELF (cmake, ninja, ...), as opposed to the
+# distfiles it fetches for ports. Values are (url, sha512, filename).
+#
+# WHY THIS IS NOT PART OF THE CAPTURE. The capture records what vcpkg actually
+# downloaded on the capturing machine, and vcpkg does not download a tool it can
+# already find: `vcpkg_find_acquire_program` probes the host first. My machine has
+# /usr/bin/ninja at exactly 1.13.2 -- the version vcpkg wants -- so ninja was never
+# fetched, never captured, and never pinned; a machine WITHOUT it got
+# `distfile MISSING FROM INDEX ... ninja-linux.zip` followed by x-block-origin
+# correctly refusing the network. cmake made it into the pin only by luck: the host
+# cmake is 4.2.3 against the required 4.4.0, so that one WAS downloaded.
+#
+# So the capture is the wrong instrument for this class: what it observes depends on
+# what the capturing machine happened to have installed. The right source is vcpkg's
+# own tool metadata -- scripts/vcpkg-tools.json, versioned inside the checkout at the
+# baseline commit, carrying url + sha512 + archive name for every tool on every
+# platform. That is a PIN, not an observation, so it is complete regardless of what
+# is installed anywhere.
+# The tools this build's ports can actually ask for. vcpkg-tools.json also pins
+# dotnet, node, powershell-core, azcopy, gsutil, coscli and nuget -- ~400 MB of
+# downloads for a build that never invokes any of them (only the unrelated
+# vbs-enclave-tooling-codegen port does, and it is not in this closure). Pinning
+# those would trade one failure mode for a slower, larger version of the same
+# hermeticity story, so the set is scoped and the scoping is stated: BUILD_TOOLS is
+# what vcpkg needs to configure and build a port at all.
+#
+# cmake and ninja are needed by scripts/detect_compiler -- which runs before any
+# port does, for every triplet -- so they are not optional for anyone.
+BUILD_TOOLS = ("cmake", "ninja")
+
+
+def tool_distfiles(triplet_os="linux", arches=(None, "x64", "amd64"),
+                   want=BUILD_TOOLS, vcpkg=None):
+    """vcpkg's own host tools for one platform, read from its tool metadata.
+
+    Keyed by sha512 like every other distfile, so these merge straight into the
+    index the asset-cache script resolves through.
+    """
+    path = os.path.join(vcpkg or VCPKG, "scripts", "vcpkg-tools.json")
+    if not os.path.exists(path):
+        raise VcpkgUnavailable("no %s (needed for vcpkg's own tool pins)" % path)
+    with open(path) as f:
+        meta = json.load(f)
+    out = {}
+    for t in meta.get("tools", []):
+        if want is not None and t.get("name") not in want:
+            continue
+        if t.get("os") != triplet_os or t.get("arch") not in arches:
+            continue
+        url, sha = t.get("url"), t.get("sha512")
+        if not url or not sha:
+            continue          # a tool vcpkg expects from the system, not a download
+        # vcpkg stores the archive under `archive` when it differs from the URL's
+        # basename (ninja-linux.zip -> ninja-linux-1.13.2.zip): the asset cache is
+        # asked for the name vcpkg will look for, so prefer it.
+        name = t.get("archive") or url.rsplit("/", 1)[-1]
+        out[sha.lower()] = (url, name, "vcpkg-tool:" + t.get("name", "?"), "tools.json")
+    return out
+
+
+# The tool pins are COMMITTED next to the asset capture, in the same 3-column TSV
+# format, and that is not redundancy -- it is what keeps the emitter's central
+# promise true: the committed pin regenerates every Bazel file with no vcpkg
+# checkout, no CMake and no network. Deriving the tools from
+# scripts/vcpkg-tools.json at emit time would have quietly made a vcpkg checkout a
+# requirement again (two tests caught exactly that). So the derivation is a
+# separate, deliberate step -- `--capture-tools` -- and its output is reviewed and
+# committed like any other pin.
+TOOLS_TSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "vcpkg_tool_assets.tsv")
+
+
+def load_tool_pins(path=None):
+    """The committed tool pins -> {sha512: (url, filename, port, source)}."""
+    path = path or TOOLS_TSV
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            url, sha, name = parts
+            if not re.fullmatch(r'[0-9a-fA-F]{128}', sha):
+                continue
+            out[sha.lower()] = (url, name, "vcpkg-tool", "tools.tsv")
+    return out
+
+
+def emit_tool_pins(tools):
+    """Write the tool pin TSV: url, sha512, the filename vcpkg looks for."""
+    print("# vcpkg's OWN host tools, pinned from its scripts/vcpkg-tools.json at the")
+    print("# builtin-baseline. GENERATED by emit_vcpkg_bazel.py --capture-tools.")
+    print("#")
+    print("# Separate from vcpkg_assets.tsv because the asset capture CANNOT see")
+    print("# these: vcpkg_find_acquire_program probes the host first, so a tool the")
+    print("# capturing machine already has is never downloaded and never captured.")
+    print("# That is how ninja went unpinned -- the capturing machine had")
+    print("# /usr/bin/ninja at exactly the required version -- while cmake was pinned")
+    print("# only because the host's was too old. What a pin contains must not depend")
+    print("# on what happens to be installed on one machine.")
+    print("#")
+    print("# url\tsha512\tfilename-vcpkg-looks-for")
+    for sha, (url, name, port, _src) in sorted(tools.items(), key=lambda kv: kv[1][1]):
+        print("%s\t%s\t%s" % (url, sha, name))
+
+
 def collect():
     """-> (distfiles, git_externals, unresolved). Ports come from the manifest."""
     pins = pinned_versions()
@@ -671,6 +782,48 @@ def main():
                 sys.stderr.write("    %-40s %s\n"
                                  % (distfiles[sha][1], distfiles[sha][2]))
         distfiles, unexpanded = cap, []
+        # vcpkg's OWN tools are unioned in from their COMMITTED pin, not replaced
+        # and not re-derived: they are a different class from port distfiles, and
+        # the capture cannot see them at all (finding 38).
+        tools = load_tool_pins()
+        if not tools:
+            sys.stderr.write(
+                "error: no %s\n"
+                "vcpkg's own host tools (cmake, ninja) are pinned there, because the\n"
+                "capture cannot see a tool the capturing machine already had. Without\n"
+                "them the index works only on machines that happen to have the same\n"
+                "tools installed. Regenerate with:\n"
+                "    emit_vcpkg_bazel.py --capture-tools > Meta/vcpkg_tool_assets.tsv\n"
+                % TOOLS_TSV)
+            return 2
+        added = [sha for sha in tools if sha not in distfiles]
+        sys.stderr.write("vcpkg host tools: %d pinned from %s (%d not in the capture)\n"
+                         % (len(tools), os.path.basename(TOOLS_TSV), len(added)))
+        for sha in sorted(added):
+            sys.stderr.write("    added %-34s %s\n" % (tools[sha][1], tools[sha][2]))
+        # Cross-check against vcpkg's metadata WHEN a checkout is at hand: a stale
+        # committed pin (baseline bumped, tool version moved) is otherwise invisible
+        # until someone without that tool tries to build.
+        try:
+            live = tool_distfiles()
+        except VcpkgUnavailable:
+            pass
+        else:
+            stale = set(live) - set(tools)
+            gone = set(tools) - set(live)
+            for sha in sorted(stale):
+                sys.stderr.write(
+                    "    WARNING: %s is in vcpkg-tools.json but NOT in the committed"
+                    " pin -- re-run --capture-tools\n" % live[sha][1])
+            for sha in sorted(gone):
+                sys.stderr.write(
+                    "    note: %s is pinned but no longer in vcpkg-tools.json\n"
+                    % tools[sha][1])
+        for sha, row in tools.items():
+            distfiles.setdefault(sha, row)
+    if "--capture-tools" in sys.argv:
+        emit_tool_pins(tool_distfiles())
+        return 0
     if "--git-archives" in sys.argv:
         dl = sys.argv[sys.argv.index("--git-archives") + 1]
         archives, byproducts = observed_git_archives(dl, distfiles)

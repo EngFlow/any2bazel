@@ -176,12 +176,19 @@ def test_emitting_from_the_capture_alone_needs_no_vcpkg():
                         capture_output=True, text=True, env=env)
     assert ok.returncode == 0, ok.stderr
     assert "no local vcpkg checkout" in ok.stderr
-    # The real pin: 76 distfiles, every one keyed by its own sha512.
+    # The real pin: 76 captured distfiles + the ONE vcpkg host tool the capture
+    # could not see (finding 38). It is 77, not 78, and the arithmetic is the
+    # finding in miniature: cmake is in BOTH the capture and the tool pin, because
+    # the capturing machine's cmake was the wrong version and got downloaded, while
+    # its ninja was exactly right and did not. Union by sha, so cmake counts once.
     shas = re.findall(r"^    '([0-9a-f]{128})':", ok.stdout, re.M)
-    assert len(shas) == 76, len(shas)
-    assert len(set(shas)) == 76
+    assert len(shas) == 77, len(shas)
+    assert len(set(shas)) == 77
     repos = re.findall(r"@(vcpkg_[A-Za-z0-9_]+)//file:", ok.stdout)
-    assert len(set(repos)) == 76, "repo names must be unique per distfile"
+    assert len(set(repos)) == 77, "repo names must be unique per distfile"
+    # ...and the tool pins must survive the no-vcpkg path, which is the whole
+    # reason they are committed as a TSV rather than derived at emit time.
+    assert "ninja-linux-1.13.2.zip" in ok.stdout
 
     bad = subprocess.run(["python3", _EMIT, "--index"],
                          capture_output=True, text=True, env=env)
@@ -219,3 +226,118 @@ def test_non_mirrored_urls_are_left_as_a_single_entry():
 # not reach. `python3 tests/run_all.py` enumerates the module instead, so a test's
 # POSITION in the file cannot decide whether it runs; it also fails if a file
 # defines no tests at all. Run a single file with `run_all.py <name-substring>`.
+
+
+# --------------------------------------------------------------------------
+# vcpkg's OWN host tools (finding 38)
+#
+# The capture cannot see a tool the capturing machine already has:
+# vcpkg_find_acquire_program probes the host first, so my /usr/bin/ninja at
+# exactly the required 1.13.2 kept ninja out of the pin entirely, and a machine
+# without it got `distfile MISSING FROM INDEX ... ninja-linux.zip` followed by
+# x-block-origin correctly refusing the network. cmake was in the pin only by
+# luck (host 4.2.3 vs required 4.4.0).
+#
+# The fix reads vcpkg's own tool metadata instead of the capture, so what gets
+# pinned no longer depends on what happens to be installed anywhere. These tests
+# pin that property, the filename vcpkg will look for, and the scoping.
+
+TOOLS_JSON = """{
+  "tools": [
+    {"name": "ninja", "os": "linux", "arch": "x64", "version": "1.13.2",
+     "url": "https://example.test/ninja-linux.zip", "sha512": "%s",
+     "archive": "ninja-linux-1.13.2.zip"},
+    {"name": "ninja", "os": "windows", "arch": "x64", "version": "1.13.2",
+     "url": "https://example.test/ninja-win.zip", "sha512": "%s"},
+    {"name": "cmake", "os": "linux", "arch": "x64", "version": "4.4.0",
+     "url": "https://example.test/cmake-4.4.0-linux-x86_64.tar.gz", "sha512": "%s",
+     "archive": "cmake-4.4.0-linux-x86_64.tar.gz"},
+    {"name": "node", "os": "linux", "arch": "x64", "version": "24.18.0",
+     "url": "https://example.test/node.tar.gz", "sha512": "%s"},
+    {"name": "git", "os": "linux", "arch": "x64", "version": "2.7.4"}
+  ]
+}""" % ("a" * 128, "b" * 128, "c" * 128, "d" * 128)
+
+
+def _vcpkg_with_tools(tmpdir, body=TOOLS_JSON):
+    scripts = os.path.join(tmpdir, "scripts")
+    os.makedirs(scripts, exist_ok=True)
+    with open(os.path.join(scripts, "vcpkg-tools.json"), "w") as f:
+        f.write(body)
+    return tmpdir
+
+
+def test_tool_pins_come_from_vcpkg_metadata_not_the_capture():
+    """The whole point: the pin must not depend on what is installed locally."""
+    with tempfile.TemporaryDirectory() as d:
+        tools = emit.tool_distfiles(vcpkg=_vcpkg_with_tools(d))
+    assert set(tools) == {"a" * 128, "c" * 128}, \
+        "expected exactly the linux/x64 cmake+ninja pins, got %r" % (list(tools),)
+
+
+def test_tool_pin_uses_the_archive_name_vcpkg_will_look_for():
+    """The asset script is asked for vcpkg's OWN filename, not the URL basename.
+
+    ninja's URL basename is ninja-linux.zip but vcpkg stores (and looks for)
+    ninja-linux-1.13.2.zip. Emitting the URL basename would put a row in the index
+    under a name vcpkg never asks about -- a pin that looks present and is not.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        tools = emit.tool_distfiles(vcpkg=_vcpkg_with_tools(d))
+    assert tools["a" * 128][1] == "ninja-linux-1.13.2.zip"
+
+
+def test_tool_pins_are_scoped_to_what_this_build_can_invoke():
+    """node/dotnet/powershell are ~400MB no port in this closure ever runs."""
+    assert "node" not in emit.BUILD_TOOLS
+    assert set(emit.BUILD_TOOLS) == {"cmake", "ninja"}
+    with tempfile.TemporaryDirectory() as d:
+        vc = _vcpkg_with_tools(d)
+        names = {r[2] for r in emit.tool_distfiles(vcpkg=vc).values()}
+        everything = {r[2] for r in emit.tool_distfiles(want=None, vcpkg=vc).values()}
+    assert "vcpkg-tool:node" not in names
+    assert "vcpkg-tool:node" in everything, "want=None must mean every tool"
+
+
+def test_a_tool_with_no_url_is_skipped():
+    """`git` has no url: vcpkg expects it from the system, so there is nothing to pin."""
+    with tempfile.TemporaryDirectory() as d:
+        rows = emit.tool_distfiles(want=None, vcpkg=_vcpkg_with_tools(d))
+    assert not any(r[2] == "vcpkg-tool:git" for r in rows.values())
+
+
+def test_missing_tool_metadata_is_an_error_not_an_empty_pin():
+    """Silently emitting no tool pins is what broke a clone: fail loudly instead."""
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            emit.tool_distfiles(vcpkg=d)   # exists, but has no vcpkg-tools.json
+        except emit.VcpkgUnavailable as e:
+            assert "vcpkg-tools.json" in str(e)
+        else:
+            raise AssertionError("expected VcpkgUnavailable")
+
+
+def test_the_committed_pin_carries_ninja_and_cmake():
+    """The regression test for the actual bug report, against the committed files.
+
+    Ulf's clone failed at `Detecting compiler hash` because ninja was absent from
+    the index; cmake was present. Both must be there now, and the index is what
+    the asset script resolves through, so check the index -- not just the
+    http_file list.
+    """
+    ws = os.path.join(os.path.dirname(__file__), "..", "examples", "ladybird",
+                      "workspace")
+    index = open(os.path.join(ws, "vcpkg_index.bzl")).read()
+    for tool in ("ninja-linux-1.13.2.zip", "cmake-4.4.0-linux-x86_64.tar.gz"):
+        assert tool in index, "%s is missing from the distfile index" % tool
+    distfiles = open(os.path.join(ws, "vcpkg_distfiles.bzl")).read()
+    assert "ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip" in distfiles
+
+    # ...and bzlmod only creates a repo the MODULE names, so an http_file with no
+    # use_repo entry is invisible: that asymmetry is why the emitter emits the
+    # use_repo list too.
+    module = open(os.path.join(ws, "MODULE.bazel")).read()
+    names = re.findall(r"name = '(vcpkg_ninja[A-Za-z0-9_]*)'", distfiles)
+    assert names, "no ninja http_file found"
+    for n in names:
+        assert "'%s'" % n in module, "%s is fetched but not named in use_repo" % n

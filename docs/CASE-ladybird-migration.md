@@ -2146,6 +2146,74 @@ is to reconstruct the tree somewhere else and diff.** `apply_overlay.sh /tmp/lbf
 now produces a tree byte-identical to the one that renders, which is the first time
 that sentence has been checked rather than assumed.
 
+## Finding 38: the pin recorded what my machine lacked, not what the build needs
+
+Ulf's clone failed where mine never could:
+
+```
+vcpkg_build: distfile MISSING FROM INDEX:
+    .../ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip
+error: there were no asset cache hits, and x-block-origin blocks trying the
+       authoritative source
+```
+
+The 76-distfile pin came from *instrumenting vcpkg's own downloader* (finding 28) —
+the strongest evidence available, and the thing I have leaned on hardest in this
+document, because the capture cannot invent a URL and cannot miss one vcpkg asked
+for. It has one blind spot, and it is not in the instrument, it is in the
+**subject**: `vcpkg_find_acquire_program` probes the host *before* downloading. My
+machine has `/usr/bin/ninja` at exactly 1.13.2 — the version vcpkg wants — so vcpkg
+never asked for ninja, so the capture never saw it, so the pin never had it. Nothing
+was broken. The observation was faithful; it was an observation *of my machine*.
+
+The reason this went unnoticed is the reason it is worth a finding: **cmake is in the
+pin, and only by luck.** The host cmake is 4.2.3 against the required 4.4.0, so vcpkg
+*did* download that one — and its presence made the whole class look covered. One
+member of a category being present by accident is what a partial pin looks like from
+the inside.
+
+Two general shapes, both of which I had already written down in weaker forms:
+
+- **An instrument that records what a program *did* cannot pin what the program
+  *would do elsewhere*, when the program's behaviour depends on the machine.** The
+  capture is exact about vcpkg's requests and silent about vcpkg's *decisions*.
+  Finding 36 said "a green check has to be compared against something it did not
+  produce"; the comparand here is vcpkg's own tool metadata,
+  `scripts/vcpkg-tools.json`, versioned inside the checkout at the baseline, carrying
+  url + sha512 + archive name for every tool on every platform. That is a **pin**
+  rather than an observation, so it is complete regardless of what is installed
+  anywhere.
+- **Host-tool discovery is a hermeticity boundary that looks like a convenience.**
+  Every `find_program`/`find_package` is a place where the build's inputs depend on
+  the machine, and a capture-based pin will silently record the *complement* of
+  whatever is installed. The pin's contents should not be a function of one
+  machine's `/usr/bin`.
+
+The fix that first suggested itself — derive the tools from `vcpkg-tools.json` at emit
+time — was wrong, and **two existing tests caught it before Ulf could**: the emitter's
+central promise is that *the committed pin alone regenerates every Bazel file with no
+vcpkg checkout, no CMake and no network*, and reading vcpkg's metadata during emit
+quietly made a vcpkg checkout a requirement again. So the derivation is a separate,
+deliberate step (`--capture-tools`) whose output is committed as
+`Meta/vcpkg_tool_assets.tsv`, exactly like the asset capture; emitting unions it in
+and, *when* a checkout happens to be present, cross-checks it and warns if the
+committed pin has gone stale. That is the same division as everywhere else here:
+regenerating a pin may use the world, consuming one may not.
+
+Scoping, stated because a reviewer should not have to infer it:
+`vcpkg-tools.json` also pins dotnet, node, powershell-core, azcopy, gsutil, coscli and
+nuget — ~400 MB for tools no port in this closure invokes (only the unrelated
+`vbs-enclave-tooling-codegen` does). `BUILD_TOOLS` is `("cmake", "ninja")`, the two
+`scripts/detect_compiler` needs before any port builds at all, and the emitter
+*reports* the ones it skipped rather than hiding the decision.
+
+Verified: the ninja `http_file` fetches and integrity-checks (sha512 confirmed against
+upstream independently of Ulf's error text), `bazel query 'deps(//:vcpkg_installed, 1)'`
+now lists **78** distfiles including ninja, and the index the asset script reads
+resolves that hash to the Bazel-fetched file — the exact lookup that failed on his
+machine. Suite 182/182, six new tests, one of which is the regression test for the
+bug report itself.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →

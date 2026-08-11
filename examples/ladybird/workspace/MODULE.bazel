@@ -118,6 +118,14 @@ use_repo(
     'vcpkg_ngtcp2_nghttp3_v1_17_0_tar_gz_23d85a2abfa8',
     'vcpkg_ngtcp2_ngtcp2_v1_24_0_tar_gz_04a5762d6eac',
     'vcpkg_ngtcp2_sfparse_f2046eaa1acba7c5467399b1e1e1f354d22d1f48_tar_gz_b3cbcce6d96d',
+    # A host tool vcpkg fetches for ITSELF, pinned from Meta/vcpkg_tool_assets.tsv
+    # (derived from vcpkg scripts/vcpkg-tools.json) rather than from the download
+    # capture: vcpkg does not download a tool the machine already has, so a
+    # capturing machine carrying /usr/bin/ninja at exactly the required 1.13.2 kept
+    # ninja out of the pin, and a machine without it hit
+    # `distfile MISSING FROM INDEX` (finding 38). cmake is in this list already,
+    # but only by luck -- the capturing host had the wrong version.
+    'vcpkg_ninja_linux_1_13_2_zip_714b900cf10b',
     'vcpkg_openssl_openssl_openssl_3_6_3_tar_gz_a89c08101fa1',
     'vcpkg_patchelf_0_19_0_x86_64_tar_gz_2a65c9cbdddc',
     'vcpkg_pdfjs_5_6_205_dist_zip_66fecdb8a80d',
