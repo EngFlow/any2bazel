@@ -26,6 +26,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import subprocess
 import tempfile
 
 _EMIT = os.path.join(
@@ -341,3 +342,244 @@ def test_the_committed_pin_carries_ninja_and_cmake():
     assert names, "no ninja http_file found"
     for n in names:
         assert "'%s'" % n in module, "%s is fetched but not named in use_repo" % n
+
+
+# --- host prerequisites (finding 39) ---------------------------------------
+#
+# The class of input that CANNOT be pinned: tools vcpkg has no Linux download
+# for. What is tested here is therefore not "the pin is complete" but "the gap is
+# named accurately and early" -- and above all that it does not cry wolf, because
+# a preflight with false positives demands packages nothing needs and gets
+# deleted by the third person who hits it.
+
+def _acquire(tmpdir, program, body):
+    d = os.path.join(tmpdir, "scripts", "cmake")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "vcpkg_find_acquire_program(%s).cmake" % program),
+              "w") as f:
+        f.write(body)
+
+
+def _port(tmpdir, port, body, filename="portfile.cmake"):
+    d = os.path.join(tmpdir, "ports", port, os.path.dirname(filename))
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(tmpdir, "ports", port, filename), "w") as f:
+        f.write(body)
+
+
+NASM_LIKE = """set(program_name nasm)
+set(program_version 3.01)
+set(brew_package_name "nasm")
+set(apt_package_name "nasm")
+if(CMAKE_HOST_WIN32)
+    set(download_urls "https://example.com/nasm-win64.zip")
+    set(download_filename "nasm-win64.zip")
+    set(download_sha512 %s)
+endif()
+""" % ("a" * 128)
+
+
+def test_a_windows_only_download_is_a_host_prerequisite_on_linux():
+    """The nasm bug: URLs exist, but only inside if(CMAKE_HOST_WIN32).
+
+    Reading `download_urls` without asking WHICH BRANCH it is in reports nasm as
+    a pinnable download, which is how six ports' worth of hard dependency stayed
+    invisible until libvpx died on it 20 minutes into a build.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _acquire(d, "NASM", NASM_LIKE)
+        _port(d, "libvpx", "vcpkg_find_acquire_program(NASM)\n")
+        reqs = emit.host_tool_requirements(ports=["libvpx"], vcpkg=d)
+    assert "nasm" in reqs, reqs
+    binary, apt, users, _alts = reqs["nasm"]
+    assert (binary, apt, users) == ("nasm", "nasm", ["libvpx"])
+
+
+def test_a_tool_with_a_real_linux_download_is_not_a_prerequisite():
+    """meson/gn ARE downloadable on Linux -- demanding them from apt is wrong."""
+    with tempfile.TemporaryDirectory() as d:
+        _acquire(d, "MESON", 'set(program_name meson)\n'
+                             'set(apt_package_name "meson")\n'
+                             'set(download_urls "https://example.com/meson.tar.gz")\n')
+        _port(d, "vcpkg-tool-meson", "vcpkg_find_acquire_program(MESON)\n")
+        reqs = emit.host_tool_requirements(ports=["vcpkg-tool-meson"], vcpkg=d)
+    assert reqs == {}, "a downloadable tool must not be a host prerequisite: %r" % reqs
+
+
+def test_a_vcpkg_fetch_tool_is_not_a_prerequisite():
+    """NINJA sets no download_urls: it delegates to `vcpkg fetch`, which IS pinned.
+
+    Without this, the fix for finding 38 (pin ninja) and the fix for finding 39
+    (name what cannot be pinned) contradict each other about ninja.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _acquire(d, "NINJA", "z_use_vcpkg_fetch(NINJA)\n")
+        _port(d, "vcpkg-cmake", "vcpkg_find_acquire_program(NINJA)\n")
+        reqs = emit.host_tool_requirements(ports=["vcpkg-cmake"], vcpkg=d)
+    assert reqs == {}, "ninja comes from the tools.json pin, not the host: %r" % reqs
+
+
+def test_a_windows_only_call_site_is_not_a_linux_prerequisite():
+    """openssl and vcpkg-make ask for CLANG only under MSVC -- clang is not needed.
+
+    The first version of this derivation reported clang, which is a false alarm
+    on every Linux machine, and a preflight that demands a 2GB toolchain nobody
+    uses is one that gets ignored.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _acquire(d, "CLANG", 'set(program_name clang)\n'
+                             'set(apt_package_name "clang")\n')
+        _port(d, "vcpkg-make", """
+if(VCPKG_DETECTED_CMAKE_ASM_COMPILER_ID STREQUAL "MSVC")
+    vcpkg_find_acquire_program(CLANG)
+endif()
+""")
+        reqs = emit.host_tool_requirements(ports=["vcpkg-make"], vcpkg=d)
+    assert reqs == {}, "an MSVC-only call site is not a Linux prerequisite: %r" % reqs
+
+
+def test_a_windows_only_subdirectory_is_not_scanned():
+    """openssl splits by FILE: windows/portfile.cmake asks for CLANG at top level.
+
+    No if() guards it -- the guard is the include() in the parent -- so only the
+    path says it is Windows-only.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _acquire(d, "CLANG", "set(program_name clang)\n")
+        _acquire(d, "PERL", 'set(program_name perl)\nset(apt_package_name "perl")\n')
+        _port(d, "openssl", "vcpkg_find_acquire_program(CLANG)\n",
+              filename="windows/portfile.cmake")
+        _port(d, "openssl", "vcpkg_find_acquire_program(PERL)\n",
+              filename="unix/portfile.cmake")
+        reqs = emit.host_tool_requirements(ports=["openssl"], vcpkg=d)
+    assert set(reqs) == {"perl"}, \
+        "windows/ must be skipped and unix/ must not be: %r" % reqs
+
+
+def test_the_else_of_a_negated_windows_test_is_the_windows_branch():
+    """if(NOT VCPKG_TARGET_IS_WINDOWS) ... else() <-- that else is Windows.
+
+    dav1d is written exactly this way. Treating every else() as reachable puts
+    the Windows-only GASPREPROCESSOR into a Linux preflight.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _acquire(d, "GASPREPROCESSOR", "set(program_name gas-preprocessor.pl)\n")
+        _acquire(d, "NASM", NASM_LIKE)
+        _port(d, "dav1d", """
+if(NOT VCPKG_TARGET_IS_WINDOWS)
+    vcpkg_find_acquire_program(NASM)
+else()
+    vcpkg_find_acquire_program(GASPREPROCESSOR)
+endif()
+""")
+        reqs = emit.host_tool_requirements(ports=["dav1d"], vcpkg=d)
+    assert set(reqs) == {"nasm"}, reqs
+
+
+GPERF_LIKE = """
+function(vcpkg_run_autoreconf shell_cmd work_dir)
+    find_program(ACLOCAL NAMES aclocal)
+    find_program(AUTORECONF NAMES autoreconf)
+    find_program(LIBTOOLIZE NAMES libtoolize glibtoolize)
+    if(missing)
+        message(FATAL_ERROR "${PORT} currently requires the following programs from the system package manager:
+    autoconf autoconf-archive automake libtoolize
+
+    On Debian and Ubuntu derivatives:
+        sudo apt install autoconf autoconf-archive automake libtool
+")
+    endif()
+endfunction()
+"""
+
+
+def test_a_fatal_error_naming_apt_packages_is_a_prerequisite_too():
+    """The SECOND mechanism, found after the first shipped.
+
+    vcpkg-make never calls vcpkg_find_acquire_program for autotools: it uses bare
+    find_program and raises FATAL_ERROR with an apt line. Enumerating only
+    acquire-program calls misses all of it -- which is how gperf failed on
+    autoconf AFTER nasm was fixed.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _port(d, "vcpkg-make", GPERF_LIKE, filename="vcpkg_make.cmake")
+        reqs = emit.host_tool_requirements(ports=["vcpkg-make"], vcpkg=d)
+    assert set(reqs) == {"autoconf", "autoconf-archive", "automake", "libtool"}, reqs
+    # libtoolize OR glibtoolize satisfies libtool: alternatives, not two requirements.
+    binary, apt, _users, alts = reqs["libtool"]
+    assert binary == "libtoolize" and apt == "libtool" and alts == ["glibtoolize"]
+    # autoconf-archive is m4 macros: no binary exists to probe for, and claiming
+    # otherwise would report it satisfied on a machine that lacks it.
+    assert reqs["autoconf-archive"][0] == "", reqs["autoconf-archive"]
+
+
+def test_a_warning_about_system_packages_is_not_a_prerequisite():
+    """angle WARNS about mesa-common-dev and separately FATAL_ERRORs on arch.
+
+    A file-level 'does it contain FATAL_ERROR and an apt line' check staples the
+    two together and demands mesa-common-dev, which no build step here requires.
+    Advice is not a requirement.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _port(d, "angle", """
+if (VCPKG_TARGET_IS_LINUX)
+    message(WARNING "${PORT} currently requires the following libraries from the system package manager:\\n    mesa-common-dev\\n\\nThese can be installed via apt-get install mesa-common-dev.")
+endif()
+message(FATAL_ERROR "Unsupported architecture: ${VCPKG_TARGET_ARCHITECTURE}")
+""")
+        reqs = emit.host_tool_requirements(ports=["angle"], vcpkg=d)
+    assert reqs == {}, "a WARNING is advice, not a prerequisite: %r" % reqs
+
+
+def test_the_committed_host_tool_list_names_nasm_and_autotools():
+    """Regression test for both bug reports, against the committed file."""
+    rows = emit.load_host_tools()
+    assert rows, "Meta/vcpkg_host_tools.tsv is missing or empty"
+    by_apt = {apt: (names, users) for names, apt, users in rows}
+    # Ulf's first failure: libvpx, ~20 minutes in.
+    assert "nasm" in by_apt, list(by_apt)
+    assert by_apt["nasm"][0] == ["nasm"]
+    assert "libvpx" in by_apt["nasm"][1]
+    # Ulf's second failure: gperf, via vcpkg-make.
+    for apt in ("autoconf", "automake", "libtool", "autoconf-archive"):
+        assert apt in by_apt, "%s missing from the host tool list" % apt
+    # ...and clang must NOT be there (MSVC-only call sites).
+    assert "clang" not in by_apt, "clang is an MSVC-only requirement"
+
+
+def test_the_preflight_reports_every_missing_tool_at_once():
+    """The actual complaint: one tool per 20-minute build.
+
+    The preflight's value is entirely in reporting the WHOLE set in one run, so
+    this checks the shape of the output, not just the exit code.
+    """
+    ws = os.path.join(os.path.dirname(__file__), "..", "examples", "ladybird",
+                      "workspace")
+    script = open(os.path.join(ws, "Meta", "vcpkg_build.sh")).read()
+    body = script.split("# --- host prerequisites")[1].split(
+        "# --- a writable vcpkg root")[0]
+    # $HOST_TOOLS arrives as the driver's 7th argument (vcpkg.bzl names the file
+    # as a declared input and passes its path); set it the same way here rather
+    # than editing the extracted body, so the test exercises the real contract.
+    body = "HOST_TOOLS=%s\n%s" % (
+        os.path.join(ws, "Meta", "vcpkg_host_tools.tsv"), body)
+    with tempfile.TemporaryDirectory() as d:
+        # A PATH with everything EXCEPT nasm and libtoolize. Empty stubs are
+        # enough: the preflight uses `command -v`, and running the real tools is
+        # not the point.
+        for tool in ("perl", "python3", "pkg-config", "aclocal", "autoreconf"):
+            p = os.path.join(d, tool)
+            open(p, "w").close()
+            os.chmod(p, 0o755)
+        r = subprocess.run(["/bin/bash", "-c", body], capture_output=True,
+                           text=True, env={"PATH": d})
+    assert r.returncode == 1, "expected a hard failure, got %d\n%s" % (
+        r.returncode, r.stderr)
+    # BOTH, from one run -- that is the whole feature.
+    assert "nasm" in r.stderr and "libtoolize" in r.stderr, r.stderr
+    assert "needed by: dav1d" in r.stderr, r.stderr
+    # One pasteable line, and the tools that ARE present must not be in it.
+    apt_line = [l for l in r.stderr.splitlines() if "sudo apt install" in l]
+    assert len(apt_line) == 1, r.stderr
+    assert "nasm" in apt_line[0] and "libtool" in apt_line[0]
+    assert "perl" not in apt_line[0], "must not demand a tool that is present"

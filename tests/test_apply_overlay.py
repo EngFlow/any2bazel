@@ -168,3 +168,25 @@ def test_both_patches_are_referenced_by_glob_not_by_name():
     assert len(names) >= 2
     for n in names:
         assert n not in text, "patch %s is named literally; use the glob" % n
+
+
+def test_the_documented_overlay_file_count_matches_the_overlay():
+    """The README's "N Bazel files" must be the number the script actually copies.
+
+    It said 42 while the overlay held 43, and nothing noticed -- finding 38 added a
+    file and updated the prose in one place but not the others. That is finding
+    39's lesson at the smallest possible scale: a documented number that nothing
+    checks is a number that is wrong as soon as it matters. The script derives the
+    list with `find`, so the overlay is the truth; this makes the prose answerable
+    to it.
+    """
+    workspace = REPO / "examples" / "ladybird" / "workspace"
+    actual = len([p for p in workspace.rglob("*")
+                  if p.is_file() and p.suffix != ".pyc"])
+    readme = (REPO / "examples" / "ladybird" / "README.md").read_text()
+    claims = set(re.findall(r'(\d+) (?:Bazel|overlay) files', readme))
+    claims |= set(re.findall(r'(?:all|the) (\d+) (?:Bazel |overlay )?files', readme))
+    assert claims, "the README no longer states an overlay file count"
+    assert claims == {str(actual)}, \
+        "README claims %s overlay files, the overlay has %d" % (
+            sorted(claims), actual)

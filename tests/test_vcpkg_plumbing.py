@@ -344,3 +344,41 @@ def test_the_git_archive_staging_fails_when_the_archives_are_absent():
 # not reach. `python3 tests/run_all.py` enumerates the module instead, so a test's
 # POSITION in the file cannot decide whether it runs; it also fails if a file
 # defines no tests at all. Run a single file with `run_all.py <name-substring>`.
+
+
+def test_the_host_tool_list_reaches_the_action_as_a_declared_input():
+    """The preflight is only real if the file is in the sandbox.
+
+    Two ways this silently degrades to a no-op, both already made once in this
+    tree: reading it via `dirname $0` (an sh_binary's data lives in
+    <name>.runfiles/, not beside the wrapper Bazel execs -- the trap
+    cargo_vendor.sh documents), or naming it in `data` instead of the action's
+    inputs. The driver skips the check when $HOST_TOOLS is empty, so a broken
+    wiring does not fail the build -- it just stops checking. Hence this test.
+    """
+    bzl = _read("vcpkg.bzl")
+    assert "_host_tools" in bzl, "the host tool list is not an attr at all"
+    assert "ctx.files._host_tools" in bzl, "not added to the action's inputs"
+    assert "ctx.file._host_tools.path" in bzl, "the path is not passed as an argument"
+    # Passed positionally, and the driver reads it from that same position.
+    sh = _read("Meta/vcpkg_build.sh")
+    assert 'HOST_TOOLS="${7-}"' in sh, "the driver does not read argument 7"
+    # Count the top-level entries, tracking bracket depth: a comprehension
+    # (`",".join([f.path for f in ...])`) contains a `]` of its own, and splitting
+    # on the first one silently reads a truncated argument list -- which made this
+    # test fail against correct code.
+    args, depth = [], 0
+    for line in bzl.split("arguments = [", 1)[1].splitlines():
+        stripped = line.strip()
+        if depth == 0 and stripped.startswith("]"):
+            break
+        if stripped and not stripped.startswith("#") and depth == 0:
+            args.append(stripped)
+        depth += line.count("[") - line.count("]")
+    positions = args
+    assert len(positions) == 7, \
+        "the driver reads $7, so the action must pass 7 arguments, got %d" % len(
+            positions)
+    assert "_host_tools" in positions[-1], "the list must be the 7th argument"
+    # And it must be exported, or the label does not resolve.
+    assert 'exports_files(["vcpkg_host_tools.tsv"])' in _read("Meta/BUILD.bazel")

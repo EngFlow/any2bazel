@@ -118,7 +118,7 @@ knowing, because both were mistakes I made first:
 ### Reproducing the tree on another machine
 
 The overlay is **not a fork**: it is a pinned upstream Ladybird commit + two patches
-+ 42 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
++ 44 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
 that sentence made executable, because *"copy `workspace/` over a clone"* has four
 ways to be silently wrong — and every one of them was found by running it, not by
 reading it:
@@ -145,7 +145,7 @@ reading it:
    **after** the prefetch; the script defers it and says so.
 
 `--verify` checks a tree without changing it, and checks the things a file copy
-cannot: that HEAD is the pinned commit, that all 42 files are byte-identical, that
+cannot: that HEAD is the pinned commit, that all 44 files are byte-identical, that
 the patches are **applied** (`git apply --check -R` succeeding is the proof — a patch
 that reverse-applies cleanly is already in the tree), and that the `.sh` files kept
 their **executable bit**, which is tree state a careless copy drops and which then
@@ -156,6 +156,27 @@ a tree byte-identical to the one that renders (`diff -rq`, excluding prefetch
 outputs), `Meta/fetch_vcpkg_git_archives.py` reproduced **4/4** archives verified
 against the pinned SHA512s, and `bazel build` then built the 76 vcpkg ports offline
 and linked `//:LibHTTP`.
+
+#### One thing the overlay cannot carry: vcpkg's host tools
+
+```sh
+sudo apt install nasm autoconf automake libtool autoconf-archive libltdl-dev
+```
+
+Not a courtesy list — the set is derived from vcpkg's own scripts into
+[`Meta/vcpkg_host_tools.tsv`](workspace/Meta/vcpkg_host_tools.tsv), and
+`vcpkg_build.sh` checks all of it before building anything, printing the ports that
+need each missing tool and this exact line. vcpkg has **no Linux download** for
+these (its `nasm` URLs are inside `if(CMAKE_HOST_WIN32)`; `vcpkg-make` demands
+autotools via `find_program` + `FATAL_ERROR`), so they cannot be pinned the way the
+76 distfiles are — the gap is named rather than papered over. Before the check
+existed, each one cost a full ~20-minute build to discover, and the error named the
+wrong place: `nasm` surfaced from inside `libvpx`, autotools from `gperf` via a
+helper port that neither mentions (finding 39).
+
+`glslangValidator` is the same class and still **not** covered: two genrules name
+`/usr/bin/glslangValidator`, and `vcpkg_installed` does not ship it — `apt install
+glslang-tools` for now (see [known gaps](#known-gaps)).
 
 ### The HSTS table: pinned downstream, because upstream is not ours to fix
 
@@ -258,12 +279,13 @@ an FFI header collision and an entire missing Rust target. See
 | `vcpkg_distfiles.bzl`, `vcpkg_index.bzl`, `vcpkg_extension.bzl`, `vcpkg_git_archives.bzl` | One `http_file` per distfile, the sha512→label index the asset script resolves through, the module extension that creates the repos, and the 4 `vcpkg_from_git` archives. **Generated** by `Meta/emit_vcpkg_bazel.py` |
 | `vcpkg.bzl`, `Meta/vcpkg_build.sh` | `vcpkg_tree`: builds the whole dep tree as an ordinary Bazel action with `x-block-origin`, so it reaches the network zero times. Deliberately not a `repository_rule` |
 | `Meta/vcpkg_tool_assets.tsv` | vcpkg's OWN host tools (cmake, ninja) — url + sha512 + the filename vcpkg looks for. **Separate from the asset capture on purpose:** `vcpkg_find_acquire_program` probes the host first, so a tool the capturing machine already had is never downloaded and never captured (that is how ninja went unpinned; finding 38). Regenerate with `emit_vcpkg_bazel.py --capture-tools` |
+| `Meta/vcpkg_host_tools.tsv` | The tools that must come **from the host**, because vcpkg has no Linux download for them at all — `nasm` (6 ports) and the autotools set. The third class of input, and the one that cannot be pinned: `vcpkg_find_acquire_program(NASM)` has URLs only inside `if(CMAKE_HOST_WIN32)`, and `vcpkg-make` demands `autoconf`/`automake`/`libtool` via bare `find_program` + `FATAL_ERROR`. So this file does not close the gap, it **names** it — and `vcpkg_build.sh` checks the whole list before building anything, so a machine missing three tools is told all three in one second instead of one per 20-minute build (finding 39). Regenerate with `emit_vcpkg_bazel.py --host-tools` |
 | `Meta/vcpkg_capture_assets.sh` | Records the 76-distfile pin, by *being* vcpkg's asset cache. The one run allowed to fetch |
 | `Meta/fetch_vcpkg_git_archives.py` | Produces the 4 `vcpkg_from_git` tarballs **without CMake**: takes the list from the committed pin, resolves each clone URL out of the portfiles, then `git clone` + `git -c core.autocrlf=false archive <ref>` and **verifies against the pinned SHA512**. 4/4 byte-identical |
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
 | `Meta/pin_hsts_preload.py` | Re-pins it: resolves the newest commit touching the path, downloads it, writes the hash it **measured**; `--expect-same-as` refuses to write unless the pinned bytes equal the file CMake downloaded (parity guard) |
-| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 42 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
+| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 44 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
@@ -670,6 +692,20 @@ Honest inventory of what stops this from being a clone-and-build.
    foreign system is currently serving, and proves that with a byte comparison
    rather than a hash it invented.** Pin the wrong revision (a release tag, say) and
    the hermeticity gap becomes a parity gap.
+
+   **And a fourth class, which no pin can close: host tools.** vcpkg has no Linux
+   download for `nasm` or the autotools set — its `nasm` URLs live inside
+   `if(CMAKE_HOST_WIN32)`, and `vcpkg-make` demands `autoconf`/`automake`/`libtool`
+   with a bare `find_program` and a `FATAL_ERROR`. So they are *named* instead:
+   `Meta/vcpkg_host_tools.tsv`, derived from vcpkg's own scripts, checked by
+   `vcpkg_build.sh` before anything builds (finding 39). Every one of these was
+   invisible for exactly the reason in this gap's first sentence — **it was already
+   on the machine** — and each cost a full ~20-minute build to find, in an error
+   naming the wrong place. `glslangValidator` is the same class and is **not** yet
+   named: two genrules in `codegen_root.bzl` hardcode `/usr/bin/glslangValidator`
+   and `vcpkg_installed` does not ship it, so it needs a pinned binary or a repo
+   rule that fails legibly. Fixing *how you find out* is not the same as fixing the
+   dependency, and this gap is only the former.
 
 8. **"Zero network access" is true of vcpkg's downloader, not of the vcpkg
    action.** The pin + `x-block-origin` is verified — a distfile missing from the

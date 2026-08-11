@@ -484,6 +484,314 @@ def load_tool_pins(path=None):
     return out
 
 
+# ---------------------------------------------------------------------------
+# The third class of input: tools vcpkg CANNOT download at all.
+#
+# Finding 38 pinned the tools vcpkg fetches for itself (cmake, ninja) after ninja
+# went unpinned because the capturing machine already had it. The same blind spot
+# has a strictly worse case behind it, and nasm is it: on Linux
+# `vcpkg_find_acquire_program(NASM)` has NO download_urls -- the Windows branch
+# has three URLs and a sha512, the Linux branch has an apt package name and
+# nothing else. So there is no pin to add. vcpkg probes the host, does not find
+# it, and stops:
+#
+#   CMake Error at scripts/cmake/vcpkg_find_acquire_program.cmake:201 (message):
+#     Could not find nasm.  Please install it via your package manager
+#
+# ~20 minutes into `bazel build //:vcpkg_installed`, from inside libvpx, naming a
+# scratch path. Six ports in this closure ask for it (dav1d, ffmpeg,
+# libjpeg-turbo, libvpx, openh264, openssl), and the machine this was developed on
+# has nasm, perl, pkg-config and python3 all preinstalled -- which is exactly why
+# neither the capture NOR the tools.json pin could ever have revealed this.
+#
+# These are HOST PREREQUISITES, and calling them that is the point: they are not a
+# hermeticity gap we can close by pinning a URL, they are the current, honest
+# boundary of the port. Two things follow, and both are implemented here:
+#
+#   1. The set is DERIVED from vcpkg's own scripts (which programs the closure's
+#      portfiles invoke, and which of those have no Linux download), not from a
+#      hand-written list that rots at the next baseline bump.
+#   2. It is CHECKED BEFORE the build, all at once, by name, with the ports that
+#      need each one -- so a machine missing three of them learns all three in one
+#      second, instead of one per 20-minute build.
+#
+# The real fix -- pinning these as Bazel-fetched binaries so the build needs no
+# host tools at all -- is the same open work as glslangValidator, and is filed
+# rather than pretended.
+HOST_TOOLS_TSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "vcpkg_host_tools.tsv")
+
+
+def _acquire_script(program, vcpkg=None):
+    p = os.path.join(vcpkg or VCPKG, "scripts", "cmake",
+                     "vcpkg_find_acquire_program(%s).cmake" % program)
+    return p if os.path.exists(p) else None
+
+
+# A condition that selects Windows. `MSVC` counts: an
+# `ASM_COMPILER_ID STREQUAL "MSVC"` branch is Windows-only in practice, and that
+# branch is the ONLY thing in this closure that asks for CLANG -- read naively it
+# reports clang as a Linux prerequisite, which it is not.
+_WIN_TOKEN = re.compile(
+    r'\b(CMAKE_HOST_WIN32|VCPKG_HOST_IS_WINDOWS|VCPKG_TARGET_IS_WINDOWS|WIN32|MSVC|'
+    r'VCPKG_TARGET_IS_UWP|VCPKG_TARGET_IS_MINGW)\b')
+
+
+def _classify(cond):
+    """'win' / 'notwin' / None for a CMake if-condition."""
+    if not _WIN_TOKEN.search(cond):
+        return None
+    return "notwin" if re.match(r'\s*NOT\b', cond) else "win"
+
+
+def strip_windows_blocks(text):
+    """CMake source -> only the lines reachable on a non-Windows host.
+
+    Both halves of this analysis need it, which is why it is one function. When
+    reading an acquire-script, every download URL lives in the Windows branch, so
+    NOT skipping it is exactly the mistake that hides the gap. When reading a
+    portfile, a `vcpkg_find_acquire_program` call inside a Windows branch is not a
+    prerequisite here at all.
+
+    `else()` is the subtle case and is handled rather than guessed: the else of
+    `if(NOT VCPKG_TARGET_IS_WINDOWS)` IS the Windows branch (dav1d's is written
+    exactly that way), so each if-chain remembers whether any of its conditions
+    was a negated Windows test and suppresses its else accordingly.
+    """
+    out, stack = [], []
+    for raw in text.splitlines():
+        s = raw.strip()
+        m = re.match(r'if\s*\((.*)', s, re.S)
+        if m:
+            cls = _classify(m.group(1))
+            stack.append({"suppressed": cls == "win", "saw_notwin": cls == "notwin"})
+            continue
+        m = re.match(r'elseif\s*\((.*)', s, re.S)
+        if m and stack:
+            cls = _classify(m.group(1))
+            stack[-1]["suppressed"] = cls == "win"
+            stack[-1]["saw_notwin"] = stack[-1]["saw_notwin"] or cls == "notwin"
+            continue
+        if re.match(r'else\s*\(', s) and stack:
+            stack[-1]["suppressed"] = stack[-1]["saw_notwin"]
+            continue
+        if re.match(r'endif\b', s):
+            if stack:
+                stack.pop()
+            continue
+        if not any(f["suppressed"] for f in stack):
+            out.append(raw)
+    return "\n".join(out)
+
+
+def _has_non_windows_download(text):
+    """Does this acquire-script offer a download vcpkg can use on Linux?
+
+    A tool with no such download is one vcpkg can only take from the host.
+    """
+    body = strip_windows_blocks(text)
+    # `z_use_vcpkg_fetch` delegates to `vcpkg fetch`, which IS covered by the
+    # tools.json pin (that is how ninja is handled) -- so it is not a host
+    # prerequisite even though it sets no download_urls itself.
+    if "z_use_vcpkg_fetch" in body:
+        return True
+    return bool(re.search(r'set\s*\(\s*download_urls', body))
+
+
+def _port_cmake_files(port, vcpkg=None):
+    """Every .cmake/.json in a port that is reachable on a non-Windows host."""
+    vc = vcpkg or VCPKG
+    for base in (OVERLAY, os.path.join(vc, "ports")):
+        d = os.path.join(base, port)
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            # A port can split itself by platform at the FILE level rather than
+            # with an if(): openssl's portfile.cmake picks between
+            # `unix/portfile.cmake` and `windows/portfile.cmake`, and the windows
+            # one asks for CLANG and NASM at TOP LEVEL, guarded by nothing this
+            # file can see. Skipping windows/ directories is therefore not
+            # cosmetic -- without it openssl reports clang as a Linux
+            # prerequisite. Conservative by construction: a Windows-only
+            # directory can only hold Windows-only requirements.
+            rel = os.path.relpath(root, d).split(os.sep)
+            if any(p.lower() in ("windows", "win32", "uwp", "mingw") for p in rel):
+                continue
+            for fn in sorted(files):
+                if fn.endswith((".cmake", ".json")):
+                    yield os.path.join(root, fn)
+        return
+
+
+# Programs a port probes with a bare `find_program` and then hard-fails on. This
+# is a SECOND mechanism, found the hard way after the first one shipped: gperf
+# died on `autoconf autoconf-archive automake libtoolize` from
+# vcpkg-make/vcpkg_make.cmake, which never calls vcpkg_find_acquire_program at
+# all -- it calls find_program(AUTORECONF NAMES autoreconf) and raises
+# FATAL_ERROR listing apt packages. And it does it from a HELPER port
+# (vcpkg-make), so the error names gperf while the requirement lives somewhere
+# gperf does not mention. Enumerating only the acquire-program calls would have
+# missed every one of these, which is why the preflight scans for both.
+
+
+# Which binary proves an apt package is installed. Only needed where the two
+# names differ; anything absent is probed under its own name, and a package that
+# ships no executable at all maps to "" and is reported as unprobeable.
+_PKG_BINARY = {
+    "autoconf": ["autoreconf", "autoconf"],
+    "automake": ["aclocal", "automake"],
+    "libtool": ["libtoolize", "glibtoolize"],
+    "gettext": ["autopoint"],
+    "gtk-doc-tools": ["gtkdocize"],
+    "autoconf-archive": [],   # m4 macros, no binary
+    "libltdl-dev": [],        # headers
+    "pkg-config": ["pkg-config", "pkgconf"],
+}
+
+
+def _fatal_package_requirements(text):
+    """Packages a file DEMANDS from the system package manager, and how to probe.
+
+    Anchored on the text of the `message(FATAL_ERROR ...)` itself, not on the file
+    containing a FATAL_ERROR somewhere. That distinction is the difference between
+    a useful preflight and a noisy one: angle's portfile has both a FATAL_ERROR
+    (about an unsupported architecture) and a WARNING recommending
+    mesa-common-dev, and a file-level check staples them together and demands a
+    package no build step actually requires. A WARNING is advice; only a
+    FATAL_ERROR is a prerequisite.
+
+    Returns {apt-package: [binaries that prove it, possibly empty]}.
+    """
+    out = {}
+    for m in re.finditer(r'message\(\s*FATAL_ERROR\s+(.*?)\)\s*$',
+                         strip_windows_blocks(text), re.S | re.M):
+        msg = m.group(1)
+        if not re.search(r'package manager|apt(?:-get)? install', msg):
+            continue
+        for am in re.finditer(r'apt(?:-get)? install ([^\n"\\]*)', msg):
+            for pkg in am.group(1).split():
+                if not re.fullmatch(r'[\w.+-]+', pkg) or pkg == "sudo":
+                    continue
+                out.setdefault(pkg, _PKG_BINARY.get(pkg, [pkg]))
+    return out
+
+
+def host_tool_requirements(ports=None, vcpkg=None):
+    """-> {key: (binary, apt-package, [ports that need it], [alternatives])}.
+
+    The programs the closure's portfiles need FROM THE HOST, by both mechanisms:
+    a `vcpkg_find_acquire_program` for a tool with no Linux download, and a bare
+    `find_program` in a file that hard-fails naming a package manager.
+
+    This is a static parse and inherits its limits (a program named through a
+    variable is invisible). Unlike the distfile parse there is no instrument that
+    does better, because the failure only manifests on a machine that LACKS the
+    tool -- so a capture on a machine that has everything sees nothing, which is
+    precisely how nasm and autoconf each got to fail at minute 20. Under-reporting
+    degrades to that same late error; it never invents a prerequisite.
+    """
+    vc = vcpkg or VCPKG
+    if ports is None:
+        ports = sorted(pinned_versions())
+    out, asked = {}, {}
+    for port in ports:
+        for path in _port_cmake_files(port, vc):
+            with open(path, errors="replace") as f:
+                text = f.read()
+            # Mechanism 1: only the calls REACHABLE on a non-Windows host. openssl
+            # and vcpkg-make both ask for CLANG, but only inside an MSVC/Windows
+            # branch -- counting those made clang a prerequisite of a Linux build,
+            # which is a false alarm, and a preflight that cries wolf gets deleted.
+            for m in re.finditer(
+                    r'vcpkg_find_acquire_program\(\s*([A-Z0-9_]+)',
+                    strip_windows_blocks(text)):
+                asked.setdefault(m.group(1), set()).add(port)
+            # Mechanism 2: a FATAL_ERROR naming system packages directly.
+            for apt, binaries in _fatal_package_requirements(text).items():
+                cur = out.setdefault(apt, [binaries[0] if binaries else "", apt,
+                                           set(), binaries[1:]])
+                cur[2].add(port)
+    for program, users in asked.items():
+        script = _acquire_script(program, vc)
+        if not script:
+            continue
+        with open(script, errors="replace") as f:
+            text = f.read()
+        if _has_non_windows_download(text):
+            continue
+        # program_name from the NON-Windows branch: PYTHON3 sets `python` for
+        # Windows and `python3` for everything else, and probing for `python` on
+        # Linux asks for a binary that has not existed by default for years.
+        body = strip_windows_blocks(text)
+        name = re.search(r'set\(program_name\s+"?([\w.+-]+)', body)
+        apt = re.search(r'set\(apt_package_name\s+"?([\w.+-]+)', body)
+        binary = name.group(1) if name else program.lower()
+        cur = out.setdefault(binary, [binary, apt.group(1) if apt else "",
+                                      set(), []])
+        cur[2] |= users
+    return {k: (v[0], v[1], sorted(v[2]), v[3]) for k, v in out.items()}
+
+
+def emit_host_tools(reqs):
+    """Write the host-prerequisite TSV: program, binary, apt package, ports."""
+    print("# Tools the build needs FROM THE HOST, because vcpkg cannot supply them")
+    print("# on Linux at all. GENERATED by emit_vcpkg_bazel.py --host-tools.")
+    print("#")
+    print("# NOT the same class as vcpkg_tool_assets.tsv. Those are tools vcpkg")
+    print("# fetches for ITSELF, and the fix there was a pin. There is no URL to")
+    print("# pin for these, by either of the two mechanisms that produce them:")
+    print("#")
+    print("#   1. vcpkg_find_acquire_program(<X>) whose download URLs are ONLY")
+    print("#      inside `if(CMAKE_HOST_WIN32)`. On Linux vcpkg probes the host and")
+    print("#      hard-fails: 'Could not find nasm. Please install it via your")
+    print("#      package manager'.")
+    print("#   2. a message(FATAL_ERROR ...) naming apt packages outright, after a")
+    print("#      bare find_program. gperf died this way on autoconf/automake/")
+    print("#      libtool -- and the requirement lives in the vcpkg-make HELPER")
+    print("#      port, so the error names gperf while the cause names neither.")
+    print("#")
+    print("# So this file does not pretend to close the gap: it NAMES the gap, and")
+    print("# vcpkg_build.sh checks the whole list up front -- a machine missing")
+    print("# three tools is told about three tools in one second, instead of one")
+    print("# per 20-minute build (nasm surfaced from libvpx at minute ~20).")
+    print("#")
+    print("# ports-that-need-it is where the requirement is WRITTEN, which for")
+    print("# vcpkg-make is not where it fails: every autotools port using it can.")
+    print("#")
+    print("# An empty binary means the package ships no executable to probe for")
+    print("# (autoconf-archive is m4 macros, libltdl-dev is headers), so the")
+    print("# preflight can only name it -- it cannot verify it.")
+    print("#")
+    print("# binary-or-alternatives\tapt-package\tports-that-need-it")
+    for program in sorted(reqs):
+        binary, apt, users, alts = reqs[program]
+        names = "|".join([binary] + list(alts)) if binary else "-"
+        print("%s\t%s\t%s" % (names, apt or program, ",".join(users)))
+
+
+def load_host_tools(path=None):
+    """The committed host-prerequisite list -> [(alternatives, apt, ports)].
+
+    `alternatives` is empty for a package with no binary to probe.
+    """
+    path = path or HOST_TOOLS_TSV
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            names, apt, users = parts
+            out.append(([n for n in names.split("|") if n and n != "-"], apt,
+                        [p for p in users.split(",") if p]))
+    return out
+
+
 def emit_tool_pins(tools):
     """Write the tool pin TSV: url, sha512, the filename vcpkg looks for."""
     print("# vcpkg's OWN host tools, pinned from its scripts/vcpkg-tools.json at the")
@@ -823,6 +1131,9 @@ def main():
             distfiles.setdefault(sha, row)
     if "--capture-tools" in sys.argv:
         emit_tool_pins(tool_distfiles())
+        return 0
+    if "--host-tools" in sys.argv:
+        emit_host_tools(host_tool_requirements())
         return 0
     if "--git-archives" in sys.argv:
         dl = sys.argv[sys.argv.index("--git-archives") + 1]

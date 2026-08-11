@@ -43,7 +43,8 @@ def _vcpkg_tree_impl(ctx):
         outputs = [out],
         inputs = depset(
             [index] + distfile_inputs + ctx.files.python_wheels +
-            ctx.files.vcpkg_tree + ctx.files.source_root,
+            ctx.files.vcpkg_tree + ctx.files.source_root +
+            ctx.files._host_tools,
         ),
         executable = ctx.executable._build,
         arguments = [
@@ -56,6 +57,11 @@ def _vcpkg_tree_impl(ctx):
             # empty when there are none (which is then a hard failure for any port
             # that pip-installs, rather than a silent fetch).
             ",".join([f.path for f in ctx.files.python_wheels]),
+            # The host-prerequisite list, passed BY PATH rather than found with
+            # `dirname $0`: an sh_binary's data lands in <name>.runfiles/, not
+            # beside the wrapper Bazel execs, so dirname finds nothing once the
+            # action is sandboxed -- the same trap cargo_vendor.sh documents.
+            ctx.file._host_tools.path,
         ],
         mnemonic = "VcpkgInstall",
         progress_message = "Building %d vcpkg ports (no network)" % len(ctx.attr.distfiles),
@@ -131,6 +137,16 @@ vcpkg_tree = rule(
             default = "//Meta:vcpkg_build",
             executable = True,
             cfg = "exec",
+        ),
+        "_host_tools": attr.label(
+            default = "//Meta:vcpkg_host_tools.tsv",
+            allow_single_file = True,
+            doc = """The tools this build needs FROM THE HOST (finding 39).
+
+            vcpkg has no Linux download for these, so they cannot be pinned --
+            what CAN be fixed is when you find out. The driver checks the whole
+            list before building anything, so a machine missing three of them is
+            told all three in one second instead of one per 20-minute build.""",
         ),
     },
 )

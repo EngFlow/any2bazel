@@ -2135,7 +2135,7 @@ remembering the rename), and the two upstream patches must be *applied*, not mer
 shipped.
 
 So the deliverable is a script, and the part worth keeping is `--verify`, which checks
-what a file copy cannot: HEAD is the pinned commit, all 42 files are byte-identical,
+what a file copy cannot: HEAD is the pinned commit, all 44 files are byte-identical,
 the patches are applied (`git apply --check -R` succeeding is the proof — a patch that
 reverse-applies cleanly is already in the tree), and the `.sh` files still have their
 executable bit. That last check exists because of an earlier bug of exactly this shape:
@@ -2214,6 +2214,116 @@ resolves that hash to the Bazel-fetched file — the exact lookup that failed on
 machine. Suite 182/182, six new tests, one of which is the regression test for the
 bug report itself.
 
+## Finding 39: the pin fixed one class; the next two failures were a different class
+
+Finding 38's fix was correct and did not survive contact. Ulf pulled it, rebuilt, and
+got — twenty minutes in, from inside `libvpx`:
+
+```
+CMake Error at scripts/cmake/vcpkg_find_acquire_program.cmake:201 (message):
+  Could not find nasm.  Please install it via your package manager:
+```
+
+Installed nasm, rebuilt, twenty more minutes, from `gperf`:
+
+```
+CMake Error at .../share/vcpkg-make/vcpkg_make.cmake:108 (message):
+  gperf currently requires the following programs from the system package
+  manager:
+
+      autoconf autoconf-archive automake libtoolize
+```
+
+Same blind spot as finding 38 — *the capturing machine had the tool* — but a
+different **class**, and I had assumed the class was closed. Finding 38's fix reads
+vcpkg's `scripts/vcpkg-tools.json` and pins url+sha512 for the tools vcpkg fetches
+for itself. That works only for tools vcpkg *can* fetch. On Linux:
+
+```cmake
+set(program_name nasm)
+set(apt_package_name "nasm")
+if(CMAKE_HOST_WIN32)
+    set(download_urls "https://www.nasm.us/.../nasm-3.01-win64.zip" ...)
+endif()
+```
+
+Three URLs and a sha512 — **all inside the Windows branch**. On Linux there is
+nothing to pin. vcpkg probes the host, does not find it, and stops. Six ports in
+this closure need it (`dav1d`, `ffmpeg`, `libjpeg-turbo`, `libvpx`, `openh264`,
+`openssl`). So the honest statement is not "the pin is incomplete" but **"this is
+the boundary of the port"** — and the thing that was actually broken was not the
+hermeticity, it was *how you find out*.
+
+**Three classes of input, not two.** Ring 2 had a two-box model — distfiles Bazel
+fetches, and vcpkg's own tools (finding 38's pin). The third box is tools that can
+only come from the host, and it needs different treatment because there is no URL
+to put in it. Naming a gap is not fixing it; but an unnamed gap costs 20 minutes
+per member to discover, one at a time, in an error that points at the wrong place.
+
+**And it has two mechanisms, which is why my first attempt missed half of it.**
+I generalised from `nasm`, shipped a scan of `vcpkg_find_acquire_program` call
+sites, and that would not have caught the autotools failure at all: `vcpkg-make`
+never calls `vcpkg_find_acquire_program`. It calls bare
+`find_program(AUTORECONF NAMES autoreconf)` and raises `FATAL_ERROR` with an apt
+line. Worse, it does so from a **helper port**, so the error names `gperf` while
+the requirement lives in a file `gperf` does not mention. A scan built from one
+example is a scan calibrated to one example.
+
+So the derivation covers both, and the list is *derived* from vcpkg's own scripts
+(`emit_vcpkg_bazel.py --host-tools` -> committed `Meta/vcpkg_host_tools.tsv`),
+never hand-written: a baseline bump that adds a requirement is a
+regenerate-and-review, not a rediscovery.
+
+**Most of the work was suppressing false positives, and that is the finding.** A
+preflight that demands packages you do not need is one the third person deletes.
+Four separate ways the naive scan cried wolf, each needing a real distinction:
+
+- **`CLANG`.** Both call sites are behind `if(... STREQUAL "MSVC")`. Reading call
+  sites without evaluating their guards demands a 2 GB toolchain on every Linux
+  machine.
+- **`openssl`'s `NASM` and `CLANG`.** In `ports/openssl/windows/portfile.cmake` —
+  guarded by nothing in the file, only by the `include()` in its parent. The
+  platform split is at the **path** level, so the path has to be read.
+- **`else()` after a negated test.** `dav1d` is `if(NOT VCPKG_TARGET_IS_WINDOWS)
+  ... else()` — that `else` *is* the Windows branch. Treating every `else()` as
+  reachable imports the Windows-only `GASPREPROCESSOR`.
+- **`angle`'s `mesa-common-dev`.** A `message(WARNING)`. The portfile *also* has an
+  unrelated `FATAL_ERROR` about architectures, so a file-level "does it contain
+  both a FATAL_ERROR and an apt line" check staples them together. **Advice is not
+  a requirement**; the check anchors on the text of the `FATAL_ERROR` itself.
+
+Two entries can only be *named*, not verified: `autoconf-archive` ships m4 macros
+and `libltdl-dev` ships headers, so there is no binary to probe. They are reported
+as unverifiable rather than assumed satisfied — finding 35's rule again, in a third
+place: a check that cannot fail must not look like a check that passed.
+
+Verified negatively, which finding 38 could not be (`sudo` hangs in this sandbox,
+so I could not hide `/usr/bin/ninja`). Here the probe is `command -v`, so a
+restricted `$PATH` *is* a machine without the tools:
+
+```
+vcpkg_build: MISSING host tool: libtoolize|glibtoolize (apt: libtool)
+vcpkg_build:     needed by: vcpkg-make
+vcpkg_build: MISSING host tool: nasm (apt: nasm)
+vcpkg_build:     needed by: dav1d,ffmpeg,libjpeg-turbo,libvpx,openh264
+vcpkg_build:     sudo apt install libtool nasm autoconf-archive libltdl-dev
+```
+
+Both, from one run, in one second, with the ports that need each and one pasteable
+line — against the two failures that cost Ulf 40 minutes to learn two package
+names. Confirmed in a real `bazel build //:vcpkg_installed`: the TSV is a declared
+input (`aquery` shows `Meta/vcpkg_host_tools.tsv`), and the action ran the
+preflight and proceeded into the build. Suite 193/193, 11 new tests — one per false
+positive above, because each was a real bug in my own derivation.
+
+**The retrospective bit.** The environment notes at the bottom of this document
+have said "plus autoconf/nasm/glslang/mesa GL dev libs" since the beginning. The
+requirement was *documented and never checked* — so it was invisible to everyone
+who did not read the bottom of a 2,300-line file, which is everyone. Prose in a
+case study is not a preflight. `glslangValidator` is the same shape and is still
+open: two genrules in `codegen_root.bzl` name `/usr/bin/glslangValidator`, and
+`vcpkg_installed` does not ship it.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -2283,7 +2393,8 @@ And with findings 33, 34 **and 35**, Bazel fetches and builds the 77 vcpkg ports
 the 10 Rust crates, `flapc`, `cranelift-compiler` and every generated header itself,
 with vcpkg's own downloader reaching the network zero times. It is **not** yet a
 clone-and-build: finding 36 lists the four inputs a fresh clone still lacks and the
-one vcpkg port that bypasses the pin with `pip`.
+one vcpkg port that bypasses the pin with `pip`; findings 38 and 39 add the two
+classes of *host tool* that a capture on one machine structurally cannot see.
 `Build/full` is now only the *converter's* input — the model the emitters read and
 the baseline the parity harness diffs — not the build's, and this time that is
 measured: **0 targets under `Build/full` in the `cquery` closure of all six
@@ -2300,7 +2411,9 @@ instructive part of this migration — see finding 35.
 from scratch (2,700 C++ plus the vcpkg and Rust rings);
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); a fresh clone still needs 4 inputs the overlay does not carry and one port reaches PyPI via pip (finding 36 — found by actually cloning); 36 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); a fresh clone still needs 4 inputs the overlay does not carry and one port reaches PyPI via pip (finding 36 — found by actually cloning), and the host tools vcpkg cannot download are
+now named and preflighted rather than discovered one 20-minute build at a time
+(findings 38, 39); 39 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 **One number in this scoreboard was wrong for most of the migration, and it is
@@ -2315,7 +2428,11 @@ this class of bug, and each time I widened what I removed, it found another.
 
 - Toolchain via apt (needs passwordless sudo): cmake, ninja, ccache,
   build-essential, Qt6 (`qt6-base-dev` etc., 6.10.2), plus autoconf/nasm/
-  glslang/mesa GL dev libs. Rust via rustup (`~/.cargo`). Node/vcpkg bootstrap
+  glslang/mesa GL dev libs. **The vcpkg half of that list is no longer prose:**
+  `Meta/vcpkg_host_tools.tsv` is derived from vcpkg's own scripts and checked
+  before the build starts (finding 39). This line said "autoconf/nasm" for
+  months while both failures below were waiting to happen — documenting a
+  requirement is not checking it. Rust via rustup (`~/.cargo`). Node/vcpkg bootstrap
   per `Meta/Utils/build_vcpkg.py`.
 - `~/lb-env.sh` sets `LADYBIRD_SOURCE_DIR`, `VCPKG_ROOT`, CA certs.
 - Disk ~126G, RAM 16G, 16 cores. vcpkg from-source (no cache hit) for

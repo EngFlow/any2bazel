@@ -52,6 +52,7 @@ VCPKG_TREE="${3:?vcpkg checkout}"
 SRC="${4:?ladybird source root}"
 TRIPLET="${5:-x64-linux-dynamic}"
 WHEELS="${6-}"
+HOST_TOOLS="${7-}"
 
 # vcpkg's buildtrees peak around 3 GB and $TMPDIR is frequently a tmpfs sized well
 # under that (7.9 GB here, shared with everything else), which surfaces as
@@ -157,6 +158,69 @@ echo "vcpkg_build: distfile MISSING FROM INDEX: \$1 sha512=\$2" >&2
 exit 1
 EOF
 chmod +x "$WORK/fetch.sh"
+
+# --- host prerequisites, checked ALL AT ONCE, before anything builds ---------
+#
+# The third class of input, after Bazel-fetched distfiles and vcpkg's own pinned
+# tools: programs vcpkg can only take from the host, because on Linux it has no
+# download for them at all (finding 39). These cannot be pinned here -- that is
+# upstream work -- but the way they FAILED was fixable, and this is that fix.
+#
+# What they cost before this existed: `bazel build //:vcpkg_installed` ran ~20
+# minutes, then died inside libvpx with "Could not find nasm", naming a scratch
+# path under bazel-out. Install nasm, run 20 minutes again, die in gperf on
+# "autoconf autoconf-archive automake libtoolize" -- a message from the vcpkg-make
+# helper port that names gperf and mentions neither. One tool per build, each
+# discovered at the price of the whole build, in an error that points at the wrong
+# place. Three missing tools is an hour to learn three package names.
+#
+# So check the whole committed list up front and report EVERY miss at once, with
+# the ports that need each one and a single apt line to paste. Costs milliseconds.
+# The list is DERIVED from vcpkg's own scripts by `--host-tools`, not hand-written,
+# so a baseline bump that adds a requirement is a regenerate-and-review rather
+# than a rediscovery.
+if [ -n "$HOST_TOOLS" ] && [ -f "$HOST_TOOLS" ]; then
+    missing_pkgs=""
+    unprobeable=""
+    while IFS=$'\t' read -r names apt users; do
+        case "$names" in ''|'#'*) continue ;; esac
+        # No binary to probe: autoconf-archive ships m4 macros, libltdl-dev ships
+        # headers. Reporting these as satisfied would be a lie, so they are listed
+        # as unverified rather than silently assumed -- the pattern from finding 35:
+        # a check that cannot fail must not look like a check that passed.
+        if [ "$names" = "-" ]; then
+            unprobeable="$unprobeable $apt"
+            continue
+        fi
+        # `names` is alternatives separated by |: libtoolize OR glibtoolize.
+        found=""
+        old_ifs="$IFS"; IFS='|'
+        for n in $names; do
+            IFS="$old_ifs"
+            if command -v "$n" > /dev/null 2>&1; then found=1; break; fi
+            IFS='|'
+        done
+        IFS="$old_ifs"
+        if [ -z "$found" ]; then
+            echo "vcpkg_build: MISSING host tool: $names (apt: $apt)" >&2
+            echo "vcpkg_build:     needed by: $users" >&2
+            missing_pkgs="$missing_pkgs $apt"
+        fi
+    done < "$HOST_TOOLS"
+    if [ -n "$missing_pkgs" ]; then
+        echo "vcpkg_build:" >&2
+        echo "vcpkg_build: vcpkg has NO download for these on Linux -- it probes the" >&2
+        echo "vcpkg_build: host and hard-fails partway through the build. Install them:" >&2
+        echo "vcpkg_build:" >&2
+        echo "vcpkg_build:     sudo apt install$missing_pkgs${unprobeable}" >&2
+        echo "vcpkg_build:" >&2
+        echo "vcpkg_build: (list: Meta/vcpkg_host_tools.tsv, regenerate with" >&2
+        echo "vcpkg_build:  Meta/emit_vcpkg_bazel.py --host-tools)" >&2
+        exit 1
+    fi
+    [ -n "$unprobeable" ] && echo \
+        "vcpkg_build: note: cannot verify$unprobeable (no binary to probe for)" >&2
+fi
 
 # --- a writable vcpkg root (vcpkg writes buildtrees/downloads/packages) -----
 ROOT="$WORK/root"
