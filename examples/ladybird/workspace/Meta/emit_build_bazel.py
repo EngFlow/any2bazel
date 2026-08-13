@@ -103,12 +103,50 @@ def global_flags():
 
 GLOBAL_FLAGS = global_flags()
 
+# Flags CMake puts on a target that must NOT be copied into a Bazel copt.
+#
+# -fPIE is the one that matters, and it is a crash, not a nit. CMake adds it to
+# every executable target (CMAKE_POSITION_INDEPENDENT_CODE + an exe => -fPIE),
+# and the capture faithfully recorded it -- so the generated cc_binary carried
+# `copts = ['-fPIE']`. Bazel appends per-target copts AFTER the .bazelrc's
+# --copt=-fPIC, and for GCC the LAST of -fPIC/-fPIE wins. So the UI/Qt objects
+# were compiled -fPIE while every library around them was -fPIC.
+#
+# Under -fPIE, GCC may reference extern data DIRECTLY (PC-relative) instead of
+# through the GOT, and the linker then materialises the definition in the
+# executable with an R_X86_64_COPY relocation. For libraries built with Qt's
+# `reduce_relocations` (every official/aqt Qt SDK; Debian's is built without it)
+# that is fatal: QtCore accesses its own `QCoreApplication::self` PC-relative --
+# its own BSS copy -- while QtGui reads the same symbol through the GOT, which
+# the copy relocation has repointed at the EXECUTABLE's BSS. QApplication's
+# constructor then sets qApp in one place and QtGui reads the other, still null.
+# The first emit through a null sender segfaults: QGuiApplication::screenAdded
+# from QWindowSystemInterface::handleScreenAdded, inside doActivate, on
+# `mov 0x8(%rdi),%rbx` with rdi = 0.
+#
+# Qt's own headers say so and are right: qcompilerdetection.h #errors with
+# "-fPIE is not sufficient ... Compile your code with -fPIC and without -fPIE"
+# -- but only when __PIC__ is unset, and Bazel passes BOTH flags, so __PIC__ is
+# defined at preprocess time and the guard never fires. The build was clean and
+# the binary was broken.
+#
+# Dropping -fPIE is not a divergence from CMake's semantics: Bazel's own
+# toolchain compiles the objects of a cc_binary PIC and links -pie, which is
+# what CMake was asking for. Verified by removal: with -fPIE gone the binary has
+# ZERO R_X86_64_COPY relocations (39 before, incl. qApp) and the GUI starts
+# against an aqt 6.9.2 SDK, where before it segfaulted for both the xcb and the
+# offscreen QPA plugin. -Wl,-z,nocopyreloc is NOT an alternative: it turns the
+# same defect into a link error ("causes overflow in R_X86_64_PC32").
+DROPPED_TARGET_FLAGS = {"-fPIE"}
+
 def target_flags(t):
     """Per-target compile flags (feature/warning) not covered by .bazelrc."""
     flags = set()
     for a in t["actions"]:
         if a["mnemonic"] != "CppCompile": continue
         for x in a["arguments"]:
+            if x in DROPPED_TARGET_FLAGS:
+                continue
             if x.startswith(("-f", "-m", "-p")) and x not in GLOBAL_FLAGS:
                 flags.add(x)
     return sorted(flags)

@@ -2537,6 +2537,103 @@ the distro's), zero `/usr` directories are scanned, and against the host Qt the 
 opens its window on Xvfb and stays up. Headless still renders the reference page.
 Passing because the host happened to agree is how all nine of these got here.
 
+## Finding 41: the plugin fix was right and the crash stayed — `-fPIE` gave `qApp` a copy relocation
+
+Finding 40 fixed the plugin path, Ulf updated his tree, and the GUI segfaulted in
+`QXcbConnection::initializeScreens` **again**, with the same backtrace. That is the
+most useful shape a bug can have: it proves the previous fix was necessary, not
+sufficient, and it means the earlier reasoning had a passenger.
+
+What the new evidence ruled out, before any theory:
+
+- `QT_DEBUG_PLUGINS=1` showed the scan hitting `bazel-out/.../bin/plugins/platforms`
+  and every plugin resolving to *his own* SDK's realpath. `/usr/lib/x86_64-linux-gnu/qt6`
+  was never touched. Finding 40's fix was working exactly as documented.
+- `info sharedlibrary` showed **one** `libQt6Core` in the process, and the `Qt 6.9.2
+  (x86_64-little_endian-lp64 ... GCC 10.3.1)` build strings of the Bazel-staged copy and
+  the SDK copy were byte-identical. Not a version mix, not two Qts.
+- The **offscreen** QPA plugin crashed identically. Whatever this was, it was not the
+  platform plugin, not xcb, not the X server, not a screen enumeration quirk.
+
+### The bug
+
+At the fault, `rdi = 0` and `si_addr = 0x8`, on `mov 0x8(%rdi),%rbx` — inside
+`doActivate` (`libQt6Core` + 0x1e89ce, just past
+`QObjectPrivate::ConnectionData::deleteOrphaned`), reached from
+`QWindowSystemInterface::handleScreenAdded` → `QGuiApplication::screenAdded`. Qt was
+emitting a signal from a **null `qApp`**, in the middle of `QApplication`'s own
+constructor, which had just set it.
+
+`readelf -rW` says why, in three lines:
+
+| object | relocation against `_ZN16QCoreApplication4selfE` |
+|---|---|
+| aqt `libQt6Core.so.6.9.2` | **none** — accessed PC-relative, its own BSS |
+| aqt `libQt6Gui.so.6.9.2` | `R_X86_64_GLOB_DAT` — read through the GOT |
+| `bazel-bin/ladybird` | **`R_X86_64_COPY`** — definition materialised in the exe |
+
+A copy relocation moves the *definition* of an extern data symbol into the
+executable's BSS and repoints every GOT slot at it. So `QApplication`'s constructor
+made Core write `self` in **Core's** BSS, while Gui read the **executable's** BSS,
+which was still zero. The first emit through it dies. His distro Qt 6.4.2 *does*
+carry a `GLOB_DAT` for `self` in Core, so both halves agree there and the bug cannot
+appear — which is why this only ever showed up against an official SDK.
+
+The cause is one flag. CMake puts `-fPIE` on every executable target
+(`CMAKE_POSITION_INDEPENDENT_CODE` + an exe), the capture recorded it faithfully, and
+`emit_build_bazel.py` copied it into `copts` on all seven generated `cc_binary`
+targets. Bazel appends per-target copts **after** the `.bazelrc`'s `--copt=-fPIC`,
+and for GCC the last of the pair wins: the UI/Qt objects compiled `-fPIE` while every
+library around them compiled `-fPIC`. Under `-fPIE` GCC may reference extern data
+directly instead of through the GOT, and the linker turns that into the copy
+relocation. Qt is built with `reduce_relocations` (in `mkspecs/qconfig.pri`;
+Debian's is not), which is what makes Core's side of the disagreement PC-relative.
+
+**Qt diagnoses this and the diagnosis could not fire.**
+`qcompilerdetection.h` has `#error "-fPIE is not sufficient if Qt was configured with
+-DFEATURE_reduce_relocations=ON ... Compile your code with -fPIC and without -fPIE"`
+— guarded by `#if ... || defined(__PIC__)`. Bazel passed **both** flags, so `__PIC__`
+was defined at preprocess time and the guard never triggered. The build was clean and
+the binary was broken: a compiler-authored checker, defeated by flag order.
+
+### Reduced, then fixed
+
+Eight lines, no Ladybird, no Bazel — `QGuiApplication` plus one `printf`, against the
+same SDK:
+
+```
+g++ -fPIE -pie  ... -> R_X86_64_COPY for self -> SIGSEGV (identical stack)
+g++ -fPIC -pie  ... -> GOT, no COPY reloc    -> "instance=0x… screens=1"
+```
+
+`-Wl,-z,nocopyreloc` is **not** an alternative: it converts the same defect into
+`Symbol _ZN16QCoreApplication4selfE causes overflow in R_X86_64_PC32`. The fix is to
+stop asking for `-fPIE`, which is also not a divergence from CMake's semantics —
+Bazel compiles a `cc_binary`'s objects PIC and links `-pie`, which is what
+`POSITION_INDEPENDENT_CODE` was asking for. So the flag is dropped in the generator
+(`DROPPED_TARGET_FLAGS`), not in the generated file, because `BUILD.bazel` is output
+and a hand-edit survives exactly one regeneration.
+
+**Verified by removal**, on both Qts and all six executables: `R_X86_64_COPY` count
+39 → **0** (including `qApp`, and incidentally `stdout`, `QString::_empty` and 20-odd
+`staticMetaObject`s, every one of them the same latent hazard). Against the aqt 6.9.2
+SDK the GUI now starts where it previously segfaulted under *both* the xcb and the
+offscreen plugin; against the distro Qt, unchanged. Guarded by
+`tests/test_pie_copy_relocation.py` (5 tests), which asserts the generated file is
+`-fPIE`-free, that the drop lives in the emitter and is consulted, that the reason is
+written at the drop site, and that global `--copt=-fPIC` — the thing that makes
+dropping `-fPIE` correct — is still in `bazelrc.txt`.
+
+**What this cost, and the lesson.** Two rounds on Ulf's machine for one crash, because
+after finding 40 I read "SIGSEGV in `initializeScreens`" as "the plugin bug, again"
+instead of as an unexplained fault. The plugin evidence was *checkable in one command*
+(`QT_DEBUG_PLUGINS=1`) and I asked for it only on the second pass. A backtrace that
+survives a fix is not the same bug; the frames say where a process died, never why.
+It also makes finding 40's own "verified by removal" honest about its scope: hiding
+the host plugin directory proved the plugins were right, and proved nothing at all
+about the objects that linked them. Two Qts in one process was a real bug. One Qt with
+two copies of one pointer was the next one down.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →
@@ -2626,7 +2723,10 @@ LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
 byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); a fresh clone still needs 4 inputs the overlay does not carry and one port reaches PyPI via pip (finding 36 — found by actually cloning), and the host tools vcpkg cannot download are
 now named and preflighted rather than discovered one 20-minute build at a time
-(findings 38, 39); 39 findings, 3 of them real any2bazel engine fixes with
+(findings 38, 39); the Qt runtime half -- the plugins Qt `dlopen`s -- wired to the
+same SDK as the libraries (finding 40) and the `-fPIE` copy relocation that broke
+`qApp` against any `reduce_relocations` Qt removed (finding 41, 39 -> 0
+`R_X86_64_COPY`); 41 findings, 3 of them real any2bazel engine fixes with
 regression tests.
 
 **One number in this scoreboard was wrong for most of the migration, and it is

@@ -1599,7 +1599,6 @@ cc_binary(
         'Services/ImageDecoder/SandboxLinux.cpp',
         'Services/ImageDecoder/main.cpp',
     ],
-    copts = ['-fPIE'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1623,7 +1622,6 @@ cc_binary(
     srcs = [
         'Services/RequestServer/main.cpp',
     ],
-    copts = ['-fPIE'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1656,7 +1654,6 @@ cc_binary(
         'Services/Compositor/SandboxLinux.cpp',
         'Services/Compositor/main.cpp',
     ],
-    copts = ['-fPIE'],
     linkopts = ['-ldl', '-lpthread', '-lvulkan'],
     deps = [
         '//:AK',
@@ -1687,7 +1684,6 @@ cc_binary(
         'Services/RendererSandboxLinux.cpp',
         'Services/WebWorker/main.cpp',
     ],
-    copts = ['-fPIE'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1722,7 +1718,6 @@ cc_binary(
         'Services/RendererSandboxLinux.cpp',
         'Services/WebContent/main.cpp',
     ],
-    copts = ['-fPIE'],
     linkopts = ['-lvulkan'],
     deps = [
         '//:AK',
@@ -1763,7 +1758,6 @@ cc_binary(
         'Libraries/LibJS/Interpreter/GenerateLayout.cpp',
     ],
     local_defines = ['private=public', 'protected=public'],
-    copts = ['-fPIE'],
     deps = [
         '//:AK',
         '//:all_source_headers',
@@ -1838,7 +1832,6 @@ cc_binary(
         'UI/Qt/main.cpp',
     ],
     local_defines = ['QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_WIDGETS_LIB'],
-    copts = ['-fPIE'],
     linkopts = ['-lGLX', '-lOpenGL', '-lvulkan'],
     data = [':qt_conf', ':qt_plugins'],
     deps = [

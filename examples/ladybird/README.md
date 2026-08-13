@@ -698,6 +698,19 @@ Honest inventory of what stops this from being a clone-and-build.
    pass where they agree. `qt_runtime.bzl` stages the plugins of the SDK @qt itself
    names, points a generated `qt.conf` at them, and enforces the Qt >= 6.9 floor
    `UI/Qt/CMakeLists.txt` declares. Finding 40.
+
+   The same crash then came back from the *other* direction, and it was not Qt's
+   doing: CMake puts `-fPIE` on every executable target, the generator copied it
+   into each `cc_binary`'s `copts`, and Bazel appends those AFTER the global
+   `--copt=-fPIC` — so the last flag won and the UI objects compiled `-fPIE`. That
+   lets GCC reference extern data PC-relative, the linker emits an
+   `R_X86_64_COPY`, and against a Qt built with `reduce_relocations` (every
+   official/aqt SDK; Debian's is built without it) `QCoreApplication::self` ends up
+   defined in the executable while `libQt6Core` writes its own copy: `qApp` is set
+   in one place and read, still null, in another. Qt's headers `#error` on exactly
+   this, but only when `__PIC__` is unset — Bazel passed both flags, so the check
+   never fired. The emitter now drops `-fPIE` (`DROPPED_TARGET_FLAGS`): 39
+   `R_X86_64_COPY` relocations across the six executables, now 0. Finding 41.
 7. **The fresh clone needs two inputs the overlay does not carry** (step 1a
    above), and each stayed invisible for the same reason: it was already on the
    machine. `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s
