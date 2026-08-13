@@ -331,7 +331,13 @@ def dep_label(d, targets, so, ar):
     # Qt6 is a real Bazel dep via rules_qt: its qt.local_repo discovers the host
     # SDK through qmake, so moc/rcc and the Qt cc_librarys all come from one SDK.
     if nm in QT_MAP:
-        return Dep(deps=[QT_MAP[nm]])
+        # Plus @qt_plugins//:runtime_libs -- the PRIVATE libraries an SDK ships
+        # beside Qt (aqt bundles ICU 73) which rules_qt does not stage, and which
+        # libQt6Core cannot find on its own because its RUNPATH $ORIGIN expands to
+        # Bazel's solib dir. Making them link inputs is what removed the need for
+        # LD_LIBRARY_PATH=<sdk>/lib. Empty for a distro Qt. See qt_runtime.bzl /
+        # finding 40.
+        return Dep(deps=[QT_MAP[nm], "@qt_plugins//:runtime_libs"])
     SYS_MAP = {"GLX": "GLX", "OpenGL": "OpenGL"}
     if nm in SYS_MAP:
         return Dep(sys=[SYS_MAP[nm]])
@@ -429,6 +435,11 @@ VCPKG_TAIL = """
 vcpkg_tree(
     name = "vcpkg_installed",
     distfiles = VCPKG_DISTFILE_INDEX,
+    # The wheels for the Python packages a portfile pip-installs (angle asks for
+    # `ply`). Pinned separately from the 76 distfiles because pip bypasses vcpkg's
+    # asset cache entirely, so the capture cannot see them and x-block-origin
+    # cannot block them -- see vcpkg_python_packages.bzl and finding 36.
+    python_wheels = ['@vcpkg_pywheel_ply//file'],
     source_dir = ".",
     source_root = ":vcpkg_source_inputs",
     triplet = "x64-linux-dynamic",
@@ -483,6 +494,7 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":cargo_ring.bzl", "cargo_ring")
 load(":codegen_root.bzl", "root_codegen")
 load(":export_headers.bzl", "export_headers")
+load(":qt_runtime.bzl", "qt_conf", "qt_plugin_tree")
 load(":vcpkg.bzl", "vcpkg_tree", "vcpkg_tree_for_exec")
 load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
@@ -613,6 +625,31 @@ def emit_qt_autogen(moc_hdrs):
     print()
 
 
+QT_RUNTIME_BLOCK = '''
+# === Qt6 RUNTIME: the plugins Qt dlopens, and the qt.conf that finds them ===
+# Not a CMake target -- CMake does not need one, because its binary links a Qt
+# whose baked-in prefix already points at the plugins of that same Qt. Bazel's
+# does not: it links @qt's libraries and then Qt looks for plugins next to the
+# executable, finds none, and falls back to the HOST's plugin directory. Loading
+# another Qt build's QPA plugin into this one is the Ubuntu 24.04 SIGSEGV in
+# QXcbConnection::initializeScreens; on a box where the versions agree it "works".
+# qt_runtime.bzl has the full account (finding 40); both targets below are data of
+# //:ladybird, so they are staged in bazel-bin AND in the runfiles tree.
+qt_plugin_tree(
+    name = "qt_plugins",
+    plugins = ["@qt_plugins//:plugins"],
+)
+
+qt_conf(
+    name = "qt_conf",
+)
+'''
+
+
+def emit_qt_runtime():
+    print(QT_RUNTIME_BLOCK, end="")
+
+
 def moc_headers():
     """UI/Qt headers with Q_OBJECT, i.e. the ones CMake's AUTOMOC would moc.
 
@@ -633,7 +670,7 @@ def moc_headers():
 
 
 def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
-                extra_srcs=()):
+                extra_srcs=(), extra_data=()):
     """Emit one cc_library/cc_binary from the model.
 
     body_only: emit only `name =` + `srcs =` (AK's hand-written block supplies
@@ -757,6 +794,7 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
         # On a cc_library `data` propagates into the runfiles of every binary
         # that links it, which is exactly the reach cranelift-compiler needs
         # (LibWasm is linked by WebContent, WebWorker and ladybird).
+        data = list(data) + list(extra_data)
         if data:
             print("    data = [%s]," % ", ".join("%r" % x for x in sorted(set(data))))
         # PRIVATE deps: used to compile this library, not part of its interface,
@@ -805,9 +843,13 @@ def main():
     for name in ROOT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar)
     emit_qt_autogen(moc_headers())
+    emit_qt_runtime()
     for name in QT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar,
-                    extra_srcs=[":qt_moc", ":qt_rcc"])
+                    extra_srcs=[":qt_moc", ":qt_rcc"],
+                    # The Qt plugins + qt.conf: runtime inputs of the GUI, in the
+                    # same sense as the cranelift-compiler binary LibWasm spawns.
+                    extra_data=[":qt_conf", ":qt_plugins"])
     print(VCPKG_TAIL, end="")
 
 

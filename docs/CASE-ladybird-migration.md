@@ -2324,6 +2324,219 @@ case study is not a preflight. `glslangValidator` is the same shape and is still
 open: two genrules in `codegen_root.bzl` name `/usr/bin/glslangValidator`, and
 `vcpkg_installed` does not ship it.
 
+## Finding 40: nine failures, one bug — a host requirement upstream checks and my overlay inherited silently
+
+Ulf's Ubuntu 24.04 machine ran the Bazel-built Ladybird headless and got a SIGSEGV
+from the GUI:
+
+```
+ladybird(...)
+QApplicationPrivate::init()
+QXcbConnection::initializeScreens(bool)
+QXcbConnection::handleScreenAdded(...)
+--> SIGSEGV in libQt6Core
+```
+
+and offered a deal: *"if you can figure out how to make it work, then I won't
+upgrade."* That machine is the most valuable thing in this migration. It has found
+**eight** real defects (findings 37, 38, 39 and the gaps between them) that this
+sandbox is structurally incapable of finding: gcc 15.2, Qt 6.10.2, ICU 78,
+`nasm`/`perl`/`glslang`/`libdrm` all present, every requirement silently satisfied.
+A machine that *disagrees* with mine is a test oracle, not an inconvenience, and the
+only way to keep it is to stop breaking it.
+
+### The bug
+
+The binary links Qt from the Bazel repo and loads Qt's **plugins** from wherever
+`libQt6Core`'s baked-in prefix points — on his box, the *distro* Qt's plugin
+directory. Two different Qt builds in one process.
+
+Qt does not link its QPA platform plugin; `QApplication`'s constructor `dlopen`s it.
+Where it looks is decided inside `libQt6Core`: `qt.conf` next to the executable, then
+`QT_PLUGIN_PATH`, then the prefix compiled into the library. Qt 6.9.2's `qt_prfxpath`
+is **empty** (`strings lib/libQt6Core.so.6.9.2`), so the prefix falls back to *the
+directory of the executable* — and a Bazel binary's directory has no `platforms/`, so
+the search falls through to the compiled-in system path and Qt loads
+`/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqxcb.so` into a process whose
+`libQt6Core` came from `bazel-bin/_solib_k8/...rules_qt++qt+qt...`.
+
+rules_qt is not at fault: it wires up Qt's *link* half faithfully (one SDK, discovered
+by `qmake -query`; headers, libs and moc all from it). Nothing wired up the *runtime*
+half, because on the machine where the overlay was written there was nothing to
+notice.
+
+**Which way the skew points decides which failure you get.** Both halves reproduced
+here, with a real X server:
+
+| plugin vs. linked libs | Qt's version gate | outcome |
+|---|---|---|
+| plugin **older** | rejects it: `factoryloader: Ignoring QPA plugin due to mismatching Qt versions 395520 394240` | `no Qt platform plugin could be initialized`, clean abort |
+| plugin **newer or equal-minor** | **passes** | plugin calls into an ABI it was not built against → SIGSEGV in `initializeScreens` → `handleScreenAdded` |
+
+(Those integers are Qt versions: `(v>>16, (v>>8)&255, v&255)`, so 395520 = 6.9.0 and
+394240 = 6.4.0.) The gate is the cruel part: it catches the harmless direction and
+waves through the one that corrupts memory.
+
+And on **my** box it passes. `QT_DEBUG_PLUGINS=1` on the Bazel-built binary here
+scanned `/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms` and loaded the **distro**
+`libqxcb.so` — the exact same wrong lookup — while `libQt6Core.so.6.10.2` came from
+Bazel's solib dir. Both are 6.10.2, so the ABI happens to match. **The bug was
+present in every green GUI run this project has ever reported.**
+
+Then the strongest evidence available: pointing `qt.local_repo` at the aqt **6.9.2**
+SDK on this machine and rebuilding reproduced **his backtrace, frame for frame** —
+`Ladybird::Application::create_platform_event_loop` → `QApplicationPrivate::init` →
+`QXcbConnection::initializeScreens` → `handleScreenAdded` → a fault in libQt6Core at
+`mov 0x8(%rdi),%rbx` with `rdi = 0`. Not a machine I cannot see any more.
+
+### The exoneration that mattered
+
+My first hypothesis was two ICUs: the binary needs `libicu*.so.78` (vcpkg) and aqt's
+`libQt6Core` needs `libicu*.so.73`, both in one process, and `ld` even warns *"may
+conflict"*. Wrong — worth recording because it is the kind of theory that sounds too
+good to check. I linked ICU 78 **and** aqt's ICU 73 into one process with
+`-Wl,--no-as-needed` and constructed a `QApplication`: `screens=1 qt=6.9.2`. ICU
+coexists fine; two sonames are two libraries. (The fixed build now does exactly this
+on purpose: `objdump -p` shows `libicu*.so.73` *and* `libicu*.so.78` in one binary,
+and it runs.) Any earlier note here blaming "two ICUs" is superseded: it was never an
+ICU problem, it was this same plugin/library provenance skew seen through a different
+symptom.
+
+### The fix: the Qt edge becomes self-contained, like `vcpkg_lib`
+
+`qt_runtime.bzl`, and the shape is deliberately the one Ring 2 arrived at for vcpkg —
+*the dependency arrives with the dep edge*:
+
+1. **`qt_plugins`** (repository rule) reads **@qt's own generated `qtconf.bzl`** for
+   `QT_INSTALL_PLUGINS` and symlinks every plugin the SDK ships into a repo, one
+   `filegroup` per plugin type. Reading @qt's file rather than a path of my own is the
+   whole point: the plugins cannot come from a different Qt than the libraries,
+   because both names come from one `qmake -query`. Every type, not the four Ladybird
+   needs today — a hand-picked list drifts, and a missing input method or file dialog
+   is a defect nobody notices for a month.
+2. **`qt_plugin_tree`** re-declares them as outputs of the package that holds the
+   binary, so they land at `bazel-bin/plugins/<type>/*.so` — and, as `data` of
+   `//:ladybird`, in the runfiles tree too.
+3. **`qt_conf`** writes the file that redirects the search:
+
+   ```
+   [Paths]
+   Prefix = .
+   Plugins = plugins
+   ```
+
+   Setting `Prefix` **replaces** the compiled-in prefix, so `/usr` is not outranked,
+   it is *never scanned* — `QT_DEBUG_PLUGINS=1` on the fixed build shows zero scans
+   of any `/usr` directory. `Prefix = .` is what makes one file correct in both
+   layouts, because Qt resolves it against the directory of the executable via
+   `/proc/self/exe`, so `bazel-bin/ladybird` and the runfiles tree's symlink to it
+   both land on the staged tree.
+4. **`runtime_libs`** carries the private libraries an SDK bundles beside Qt.
+
+That fourth piece was the hard one, and it is where the loader stopped being
+intuition and became a measurement. aqt's `libQt6Core` needs `libicui18n.so.73`,
+which exists only inside the SDK, so the binary died in `ld.so` before `main()` and
+`LD_LIBRARY_PATH=<sdk>/lib` was the workaround — a workaround a human has to remember
+is a bug that has been rounded down to a habit. **No rpath on the binary can fix
+it**, for two reasons I only believed after reducing them to three generated `.so`
+files:
+
+- `libQt6Core` finds its own ICU through `RUNPATH $ORIGIN`, and `$ORIGIN` is the
+  directory the loader **opened the object by** — Bazel's solib dir, not the SDK. (`ldd`
+  on that very symlink resolves ICU happily, because `ldd`'s `$ORIGIN` is the
+  realpath's directory. That near-miss is what made this look like a path problem.)
+- Adding the SDK dir to *our* rpath does not help either: `DT_RUNPATH` is consulted
+  only for an object's own direct dependencies, and while `DT_RPATH` **is** inherited
+  by transitive loads, an intermediate object that has a `DT_RUNPATH` of its own
+  blocks the inherited `DT_RPATH` entirely. `libQt6Core` has one. All four
+  combinations measured before believing it.
+
+So the fix is not a search path at all: make the SDK's private libraries real link
+inputs, so **Bazel** stages them and the binary's own runpath — the one glibc will
+consult, because they are now direct dependencies — resolves them. The list is
+derived, not written down: DT_NEEDED of the SDK's Qt modules ∩ the non-Qt `.so` files
+beside them. For aqt 6.9.2 that is exactly `libicui18n/libicuuc/libicudata.so.73`;
+for a distro Qt it is empty and the target degenerates to nothing.
+
+Five things I got wrong on the way, each caught by a probe rather than by reasoning:
+
+- **The staged plugins must be SYMLINKS, not copies.** A plugin needs Qt libraries
+  the binary does not link (`libqxcb.so` → `libQt6XcbQpa.so.6`), and aqt's plugins
+  carry `RUNPATH $ORIGIN/../../lib`, resolved from the object's real path. Copying
+  breaks exactly that; the distro's plugins have no `RUNPATH` at all, so a *copied*
+  distro plugin resolves `libQt6XcbQpa.so.6` from `/usr` — reintroducing the bug
+  through the fix.
+- **`plugins/` is a substring of `qt_plugins/`.** My path-stripping matched inside the
+  *repository name* and staged everything one directory too deep
+  (`bazel-bin/plugins/plugins/...`), which built cleanly and pointed `qt.conf` at an
+  empty tree. Found by looking at the output, not by the build failing.
+- **"Non-Qt libraries beside libQt6Core" is the whole system on a distro Qt.** Its lib
+  dir *is* `/usr/lib/x86_64-linux-gnu`, so the first version of the derivation
+  proposed linking 56 `cc_import`s including `ld-linux` into the binary. It is a
+  system directory, so it "worked" — which is precisely the kind of accident this
+  finding is about. The discriminator is whether the Qt lib dir is itself a default
+  loader directory.
+- **An embedded `:/qt/etc/qt.conf` Qt resource does not work.** Tempting, since we
+  already run `rcc`, and Qt 6.9.2 does look for that path — but the resource is
+  registered by a static initialiser in the binary and every variant I built ignored
+  it, while a file on disk worked first try.
+- **`--no-as-needed` is load-bearing.** The binary references no ICU 73 symbol (it has
+  its own ICU 78), so the linker drops the `DT_NEEDED` as unused and the staging
+  silently stops working.
+
+### The class, which is the finding
+
+Every one of the nine failures Ulf's machine has produced is the same sentence:
+
+| # | symptom on his box | the host requirement | who declares it |
+|---|---|---|---|
+| 1 | `vcpkg: No such file or directory` | the `Build/vcpkg` clone | `Meta/ladybird.py vcpkg` |
+| 2 | `fatal: unable to read tree` | that clone's `.git`, at a baseline | vcpkg's baseline resolution |
+| 3 | HSTS table differs | Chromium's JSON, *unpinned* | `Meta/CMake/hsts_preload.cmake` |
+| 4 | `glslangValidator: No such file` | `glslang-tools` | nothing — my genrule hardcodes `/usr/bin` |
+| 5 | `ninja-linux.zip MISSING FROM INDEX` | `ninja` ≥ 1.13.2 | `vcpkg_find_acquire_program` (probes, then downloads) |
+| 6 | `Could not find nasm` | `nasm` | `vcpkg_find_acquire_program` (Linux: no URL to pin) |
+| 7 | `gperf requires autoconf autoconf-archive automake libtoolize` | autotools | `vcpkg-make`'s bare `find_program` |
+| 8 | libdrm headers not found | `libdrm-dev` | CMake `pkg_check_modules(... REQUIRED)` |
+| 9 | **SIGSEGV in `initializeScreens`** | **Qt ≥ 6.9, and its plugins** | **`find_package(Qt6 6.9 REQUIRED)`** — upstream checks it; my overlay did not |
+
+Not nine bugs. One bug, nine times: **a host requirement that upstream declares and
+checks, which the Bazel overlay inherited without inheriting the check.** CMake's
+`find_package`, `pkg_check_modules(REQUIRED)` and `vcpkg_find_acquire_program` are not
+ceremony — they are the *preflight*, and translating a build system means translating
+its preflight, not only its compile lines. Nine times I translated the commands and
+dropped the assertion; nine times the machine that disagreed with mine was the one
+that told me.
+
+So `qt_plugins` also carries the floor. `UI/Qt/CMakeLists.txt` says
+`find_package(Qt6 6.9 REQUIRED COMPONENTS Core Widgets)`; the repo rule now fails at
+fetch time with the version it found, the prefix it found it in, the package to
+install, and a warning not to mix SDKs — the finding-39 mechanism (derive the
+requirement from the source of truth, check it where it is needed, name the fix in the
+error) extended from vcpkg's driver to the overlay's own build. `glslangValidator`
+(#4) is the last member of the table with no check at all.
+
+### One more wrong path, found by walking the recipe
+
+Verifying the GUI meant following the README's own staging recipe, which promptly
+failed with `UNEXPECTED ERROR: stat: No such file or directory at
+UI/Qt/WebContentView.cpp:1047` — the theme `.ini`. Two of its paths were wrong, both
+in the same way as this finding: written down instead of derived. The vcpkg tree it
+copies from is built in the **exec** configuration, so `bazel-bin/vcpkg_installed`
+does not exist at all (`k8-fastbuild-exec` is the directory); and the resource root
+is not `<bindir>/share/Lagom` but `<bindir>/../share/Lagom`, because
+`LibWebView/Utilities.cpp`'s `find_prefix()` takes the **parent** of the binary's
+directory. Both are now `bazel info` / `bazel cquery --output=files` invocations,
+which answer for whatever configuration you are on. Prose describing an output path
+is a pin with no checker (gap 5, closed).
+
+**Verified by removal**, which is the only kind of verification this document
+accepts. With `/usr/lib/x86_64-linux-gnu/qt6/plugins` hidden behind an empty tmpfs and
+**no `LD_LIBRARY_PATH`**: the aqt build loads `libqxcb.so` from the aqt SDK (previously:
+the distro's), zero `/usr` directories are scanned, and against the host Qt the GUI
+opens its window on Xvfb and stays up. Headless still renders the reference page.
+Passing because the host happened to agree is how all nine of these got here.
+
 ## Plan for the rest
 
 - **Ring 1c — BUILD generation to compile+link parity, bottom-up.** AK →

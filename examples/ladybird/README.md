@@ -118,7 +118,7 @@ knowing, because both were mistakes I made first:
 ### Reproducing the tree on another machine
 
 The overlay is **not a fork**: it is a pinned upstream Ladybird commit + two patches
-+ 44 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
++ 45 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
 that sentence made executable, because *"copy `workspace/` over a clone"* has four
 ways to be silently wrong — and every one of them was found by running it, not by
 reading it:
@@ -145,7 +145,7 @@ reading it:
    **after** the prefetch; the script defers it and says so.
 
 `--verify` checks a tree without changing it, and checks the things a file copy
-cannot: that HEAD is the pinned commit, that all 44 files are byte-identical, that
+cannot: that HEAD is the pinned commit, that all 45 files are byte-identical, that
 the patches are **applied** (`git apply --check -R` succeeding is the proof — a patch
 that reverse-applies cleanly is already in the tree), and that the `.sh` files kept
 their **executable bit**, which is tree state a careless copy drops and which then
@@ -285,8 +285,9 @@ an FFI header collision and an entire missing Rust target. See
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
 | `Meta/pin_hsts_preload.py` | Re-pins it: resolves the newest commit touching the path, downloads it, writes the hash it **measured**; `--expect-same-as` refuses to write unless the pinned bytes equal the file CMake downloaded (parity guard) |
-| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 44 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
+| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 45 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
+| `qt_runtime.bzl` | Qt's **runtime** half: a repo rule that stages the plugins of the SDK `@qt` itself names (read out of @qt's generated `qtconf.bzl`, so plugins and libraries cannot come from different Qts), the private libraries an SDK bundles beside Qt (derived from DT_NEEDED), a generated `qt.conf` pointing the binary at them, and the Qt >= 6.9 floor `UI/Qt/CMakeLists.txt` declares. Without it Qt `dlopen`ed the HOST's plugin into Bazel's Qt — finding 40 |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
 | `Libraries/LibWeb/BUILD.bazel`, `generated_srcs.bzl` | LibWeb (~1,961 compile inputs). **Generated** by `Meta/emit_libweb_bazel.py` |
@@ -418,23 +419,39 @@ of `Meta/` — so they work from any checkout path.
 Running the UI currently needs manual staging, which is itself a gap (see
 below):
 
+Every path below is **derived, not written down**, because two of them used to be
+stated as literal `k8-fastbuild` paths and one was simply wrong: the vcpkg tree is
+built in the **exec** configuration (`vcpkg_lib` pins `cfg = "exec"`), so it is
+under `k8-fastbuild-exec` and `bazel-bin/vcpkg_installed` does not exist. The two
+staging roots are also NOT the same directory, which is easy to get backwards:
+helper binaries go in `<bindir>/libexec`, but the resource root is
+`<bindir>/../share/Lagom` -- `LibWebView/Utilities.cpp`'s `find_prefix()` takes the
+PARENT of the binary's directory and appends `share/Lagom`. Ask the build for all
+three rather than spelling any of them out:
+
 ```sh
 export XDG_RUNTIME_DIR=/tmp/xdg-lb && mkdir -p $XDG_RUNTIME_DIR && chmod 700 $XDG_RUNTIME_DIR
-ER=$(bazel info execution_root); mkdir -p "$ER/bazel-out/k8-fastbuild/libexec"
-for b in WebContent RequestServer ImageDecoder Compositor WebWorker; do cp -f bazel-bin/$b "$ER/bazel-out/k8-fastbuild/libexec/"; done
+BIN=$(bazel info bazel-bin)                       # target config: where ladybird is
+mkdir -p "$BIN/libexec"
+for b in WebContent RequestServer ImageDecoder Compositor WebWorker; do cp -f bazel-bin/$b "$BIN/libexec/"; done
 # cranelift-compiler is found as a sibling of the spawning binary (Ladybird's own
 # lookup chain), so it needs no path baked in -- only to be there.
-cp -f bazel-bin/cranelift-compiler "$ER/bazel-out/k8-fastbuild/libexec/"
+cp -f bazel-bin/cranelift-compiler "$BIN/libexec/"
 # The resource root, assembled from the CLONE and from Bazel's own vcpkg tree.
 # This line used to read `ln -sfn "$PWD/Build/full/share/Lagom" ...` -- i.e. the
 # recipe for running the Bazel build pointed at CMake's build tree, a seventh
 # thing a fresh clone does not have (finding 36). Everything in it is either in
 # Base/res or in //:vcpkg_installed; `chmod u+w` because Bazel's outputs are
 # read-only and `cp -r` preserves that.
-L="$ER/bazel-out/k8-fastbuild/share/Lagom"
+#
+# $(dirname $BIN), not $BIN: find_prefix() resolves the resource root against the
+# PARENT of the directory holding the binary.
+L="$(dirname "$BIN")/share/Lagom"
 chmod -R u+w "$L" 2>/dev/null; rm -rf "$L"; mkdir -p "$L/ladybird/pdfjs/web"
 cp -r Base/res/. "$L/"
-P=bazel-bin/vcpkg_installed/x64-linux-dynamic/share/pdfjs
+# ASK for the tree rather than guessing its configuration directory.
+V=$(bazel cquery 'deps(//:ladybird)' --output=files 2>/dev/null | grep 'vcpkg_installed$' | head -1)
+P="$V/x64-linux-dynamic/share/pdfjs"
 cp -r --no-preserve=mode "$P/build" "$L/ladybird/pdfjs/"
 cp -r --no-preserve=mode "$P/web/." "$L/ladybird/pdfjs/web/"
 # UI/cmake/ResourceFiles.cmake stages this one file into pdfjs/web/, not pdfjs/.
@@ -662,12 +679,25 @@ Honest inventory of what stops this from being a clone-and-build.
    `Build/full/share/Lagom`, CMake's build tree, into place. Everything the
    resource root needs is in `Base/res` plus `//:vcpkg_installed`'s pdf.js, and
    the block above assembles it from those; the result is `diff -rq`-identical to
-   CMake's. Finding 36.
+   CMake's. Finding 36. **Two of its paths were also wrong, and are now derived
+   rather than written down** (finding 40): the vcpkg tree is built in the *exec*
+   configuration so `bazel-bin/vcpkg_installed` does not exist, and the resource
+   root is `<bindir>/../share/Lagom` -- `find_prefix()` takes the PARENT of the
+   binary's directory -- not `<bindir>/share/Lagom`. Both now come from
+   `bazel info` / `bazel cquery --output=files`. Qt's plugins USED to belong on
+   this list and no longer do: they are `data` of `//:ladybird` (`qt_runtime.bzl`),
+   which is what that "real Bazel setup" looks like for one of the three things.
 6. **`rules_qt` is not on the BCR.** `MODULE.bazel` uses an `archive_override`
    pointing at kklochkov/rules_qt v2.0.1's release tarball (stock upstream, no
    patches). The BCR's `rules_qt` module is Vertexwahn's unrelated `rules_qt6`.
    Qt itself *is* host-portable: `qt.local_repo` discovers the host Qt via
-   `qmake -query`, so no Qt SDK is vendored.
+   `qmake -query`, so no Qt SDK is vendored. Its **plugins** are host-portable too
+   now, and that took a fix rather than an observation: rules_qt wires up Qt's link
+   half only, so the binary linked @qt's libraries and then `dlopen`ed the HOST's
+   QPA plugin into them -- a SIGSEGV where the two Qt versions differ, and a silent
+   pass where they agree. `qt_runtime.bzl` stages the plugins of the SDK @qt itself
+   names, points a generated `qt.conf` at them, and enforces the Qt >= 6.9 floor
+   `UI/Qt/CMakeLists.txt` declares. Finding 40.
 7. **The fresh clone needs two inputs the overlay does not carry** (step 1a
    above), and each stayed invisible for the same reason: it was already on the
    machine. `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s

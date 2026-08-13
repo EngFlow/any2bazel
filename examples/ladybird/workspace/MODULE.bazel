@@ -30,6 +30,16 @@ qt.active_sdk(name = "qt", repo = "qt6_local")
 use_repo(qt, "qt")
 register_toolchains("@qt//:qt_linux_x86_64_toolchain")
 
+# Qt's RUNTIME half. rules_qt wires up linking; nothing wired up the plugins Qt
+# dlopens at QApplication construction, so the binary linked @qt's libQt6Core and
+# then loaded the HOST's platform plugin into it -- two Qt builds in one process.
+# On a box where SDK and distro versions differ that is a SIGSEGV in
+# QXcbConnection::initializeScreens (reported on Ubuntu 24.04); where they agree it
+# works by accident. @qt_plugins takes the plugins from the same SDK @qt names, and
+# //:qt_conf points the binary at them. See qt_runtime.bzl for the whole story.
+qt_runtime = use_extension("//:qt_runtime.bzl", "qt_runtime")
+use_repo(qt_runtime, "qt_plugins")
+
 # ---------------------------------------------------------------------------
 # Chromium's HSTS preload table: the one input CMake downloads UNPINNED (from
 # `main`, at configure time) and the one thing that made a Bazel-only clone

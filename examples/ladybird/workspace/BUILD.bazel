@@ -3,6 +3,7 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":cargo_ring.bzl", "cargo_ring")
 load(":codegen_root.bzl", "root_codegen")
 load(":export_headers.bzl", "export_headers")
+load(":qt_runtime.bzl", "qt_conf", "qt_plugin_tree")
 load(":vcpkg.bzl", "vcpkg_tree", "vcpkg_tree_for_exec")
 load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
@@ -1790,6 +1791,24 @@ qt_cc_rcc(
     srcs = [":qt_qrc"],
 )
 
+
+# === Qt6 RUNTIME: the plugins Qt dlopens, and the qt.conf that finds them ===
+# Not a CMake target -- CMake does not need one, because its binary links a Qt
+# whose baked-in prefix already points at the plugins of that same Qt. Bazel's
+# does not: it links @qt's libraries and then Qt looks for plugins next to the
+# executable, finds none, and falls back to the HOST's plugin directory. Loading
+# another Qt build's QPA plugin into this one is the Ubuntu 24.04 SIGSEGV in
+# QXcbConnection::initializeScreens; on a box where the versions agree it "works".
+# qt_runtime.bzl has the full account (finding 40); both targets below are data of
+# //:ladybird, so they are staged in bazel-bin AND in the runfiles tree.
+qt_plugin_tree(
+    name = "qt_plugins",
+    plugins = ["@qt_plugins//:plugins"],
+)
+
+qt_conf(
+    name = "qt_conf",
+)
 # === ladybird (executable, 21 TU) ===
 cc_binary(
     name = 'ladybird',
@@ -1821,6 +1840,7 @@ cc_binary(
     local_defines = ['QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_WIDGETS_LIB'],
     copts = ['-fPIE'],
     linkopts = ['-lGLX', '-lOpenGL', '-lvulkan'],
+    data = [':qt_conf', ':qt_plugins'],
     deps = [
         '//:AK',
         '//:LibCore',
@@ -1843,6 +1863,7 @@ cc_binary(
         '@qt//:QtCore',
         '@qt//:QtGui',
         '@qt//:QtWidgets',
+        '@qt_plugins//:runtime_libs',
     ],
 )
 
