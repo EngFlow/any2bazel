@@ -2737,6 +2737,51 @@ this document is only as strong as what was actually removed — which is the ar
 for removal as a method, not against it: it is the only check here that ever found
 this class of bug, and each time I widened what I removed, it found another.
 
+## Finding 42: the browser ran, then ran out of file descriptors — and my first four diagnoses were theories, not counts
+
+The Bazel-built browser worked and then died overnight with `dup: Too many open files
+(errno=24)`. This finding is not about the migration at all: it is an upstream Ladybird
+bug that a long-running browser finds and a short test never does. It earns a place here
+because of *how badly I diagnosed it*, four times, before doing the obvious thing.
+
+The wrong answers, in order: lost fd acknowledgements in `TransportSocket` (Ulf correctly
+objected that a local `SOCK_STREAM` socketpair does not lose acks); a missed
+`AnonymousBuffer` / image-frame cache eviction (there were no memfds at all); leaked
+`TransportSocket`s (an artifact of **my own broken one-liner** — `sed 's/[0-9]*$//'` does
+not strip `pipe:[123]`, and `| head` hid the real distribution); and then
+`MessagePort::entangle_with`, which is a real leak that I read out of the code with high
+confidence and which **is not the bug that killed his browser**.
+
+What settled it was a count, not an argument. Ulf's two `/proc/<pid>/fd` censuses showed
+17,423 → 17,497 `socket:` with a *flat* 18 `pipe:`. The MessagePort leak allocates one
+socketpair **and two `pipe2` pairs** per port, so it leaks pipes and sockets at 4:1 — I
+reproduced it locally at 1,628 pipes : 409 sockets. **It cannot produce a sockets-only
+census.** The signature falsified my own best theory.
+
+Following the signature instead led to a leak of exactly **one socket per completed HTTP
+request** (103 requests → 107 sockets; 1,164 → 1,157; pipes never move), which matches
+Ulf's shape exactly and needs no exotic page — any browsing session leaks monotonically.
+`internals.dumpGCGraph()` names the holder directly, because GC roots carry their source
+location: after 202 requests, `808 Root
+nonstandard_resource_loader_file_or_http_network_fetch Fetching.cpp:2338` — 4 roots ×
+202 requests. The four fetch callbacks are `GC::Root`s (strong, uncollectable) moved into
+lambdas on the refcounted `Requests::Request`, which the `Response` then holds back by
+`RefPtr` — a cycle spanning the GC heap and the refcount heap, which neither collector
+can break, keeping the response fd open forever. `Request::defer_teardown()` is the only
+thing that clears the callbacks, and normal completion never calls it (only `stop()` and
+`did_transfer()` do). The A/B: aborted fetches, which *do* reach `stop()`, leak zero.
+
+Then the last lesson, which is the one I keep having to relearn: I wrote the "obvious"
+one-line fix (`defer_teardown()` at the end of `did_finish()`), rebuilt, and the leak went
+to **zero** — because loading was broken and pages rendered blank. A fix that makes the
+symptom disappear by removing the behaviour is indistinguishable from a fix, unless you
+check that the feature still works. I reverted it, re-verified that the clean build both
+renders *and* leaks, and took the diagnosis upstream without pretending I had the patch.
+
+Write-up for upstream: `docs/UPSTREAM-ladybird-fd-leaks.md` (both bugs, with the
+reproductions, the census method, and the cascade that turns one `EMFILE` into three dead
+processes via `MUST`/`VERIFY`).
+
 ## Environment notes (this sandbox)
 
 - Toolchain via apt (needs passwordless sudo): cmake, ninja, ccache,
