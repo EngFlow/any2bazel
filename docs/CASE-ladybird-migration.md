@@ -2737,7 +2737,7 @@ this document is only as strong as what was actually removed — which is the ar
 for removal as a method, not against it: it is the only check here that ever found
 this class of bug, and each time I widened what I removed, it found another.
 
-## Finding 42: the browser ran, then ran out of file descriptors — and my first four diagnoses were theories, not counts
+## Finding 42: the browser ran, then ran out of file descriptors — and my first four diagnoses were theories, not counts (and my fifth, the patch, was only half of it)
 
 The Bazel-built browser worked and then died overnight with `dup: Too many open files
 (errno=24)`. This finding is not about the migration at all: it is an upstream Ladybird
@@ -2781,6 +2781,26 @@ renders *and* leaks, and took the diagnosis upstream without pretending I had th
 Write-up for upstream: `docs/UPSTREAM-ladybird-fd-leaks.md` (both bugs, with the
 reproductions, the census method, and the cascade that turns one `EMFILE` into three dead
 processes via `MUST`/`VERIFY`).
+
+**Postscript, and the actual lesson.** An upstream patch equivalent to that fix landed;
+Ulf applied it; his browser still leaked. My patch was necessary and not sufficient, and I
+had written the doc as though it were the fix. What resolved it was making the census
+*self-classifying* instead of arguing about which page shape was to blame: an in-process
+`poll()`/`MSG_PEEK` probe on each retained response fd, which reports whether the **peer**
+is dead or alive. That one column splits the leak into two bugs with different fixes —
+peer **dead** means the request completed and WebContent is retaining a corpse (the
+teardown patch fixes exactly this, 143 → 0 locally); peer **alive** means `on_finish`
+never ran, so no teardown at that point can fire, and the fd is held by the GC-root ↔
+`RefPtr` cycle itself (40 → 40, unchanged by the patch). The same probe also separates
+*in-flight* from *retained* by age, which is what stops a freshly restarted process from
+looking like a fix — a mistake I made once already in this investigation.
+
+Two habits earned that: measuring the resource rather than reasoning about the code (the
+`pipe:`-to-`socket:` ratio is what falsified my confident MessagePort diagnosis), and
+making the *instrument* answer the classification question, so the next report is a count
+instead of another theory. The diagnostic build is kept, deliberately outside the overlay's
+`patches/*.patch` glob and pinned there by a test, as
+`examples/ladybird/patches/DIAGNOSTIC-fdleak-census.patch.txt`.
 
 ## Environment notes (this sandbox)
 

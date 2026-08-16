@@ -2,7 +2,7 @@
 """Tests for examples/ladybird/apply_overlay.sh.
 
 The script reproduces the Ladybird tree the migration builds: a pinned upstream
-commit + two patches + the overlay files. It cannot be tested end to end here (that
+commit + three patches + the overlay files. It cannot be tested end to end here (that
 needs a 121 MB clone and the network -- it WAS run end to end, twice, and that is
 recorded in the README), so these tests pin the properties that rot silently:
 
@@ -168,6 +168,27 @@ def test_both_patches_are_referenced_by_glob_not_by_name():
     assert len(names) >= 2
     for n in names:
         assert n not in text, "patch %s is named literally; use the glob" % n
+
+
+def test_the_diagnostic_patch_is_not_applied_by_the_overlay():
+    """The fd-leak census patch must never enter a normal build.
+
+    It adds a per-request HashMap, a repeating timer and a poll()/MSG_PEEK probe on
+    every retained response fd -- fine for a diagnosis, wrong in a browser someone
+    is using. apply_overlay.sh applies `patches/*.patch` by glob, so the only thing
+    keeping it out is its extension. That is exactly the kind of load-bearing
+    filename convention that a later rename breaks silently, so pin it: the
+    diagnostic exists, it is NOT matched by the glob, and it says so in its header.
+    """
+    diagnostics = sorted(PATCHES.glob("DIAGNOSTIC-*"))
+    assert diagnostics, "the fd-leak diagnostic patch is missing"
+    for d in diagnostics:
+        assert d.suffix != ".patch", \
+            "%s would be applied by the overlay's patches/*.patch glob" % d.name
+        assert "NOT AN OVERLAY PATCH" in d.read_text(), \
+            "%s must say why it is not applied" % d.name
+    applied = {p.name for p in PATCHES.glob("*.patch")}
+    assert not any(n.startswith("DIAGNOSTIC") for n in applied)
 
 
 def test_the_documented_overlay_file_count_matches_the_overlay():

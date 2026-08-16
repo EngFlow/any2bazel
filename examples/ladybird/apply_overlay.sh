@@ -173,7 +173,7 @@ else
 fi
 note "at $(git rev-parse HEAD)"
 
-note "applying $(ls "$PATCHES"/*.patch | wc -l) patches (both filed upstream)"
+note "applying $(ls "$PATCHES"/*.patch | wc -l) patches (all reported upstream)"
 for p in "$PATCHES"/*.patch; do
     if git apply --check -R "$p" >/dev/null 2>&1; then
         note "  already applied: $(basename "$p")"

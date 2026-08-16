@@ -117,7 +117,7 @@ knowing, because both were mistakes I made first:
 
 ### Reproducing the tree on another machine
 
-The overlay is **not a fork**: it is a pinned upstream Ladybird commit + two patches
+The overlay is **not a fork**: it is a pinned upstream Ladybird commit + three patches
 + 45 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
 that sentence made executable, because *"copy `workspace/` over a clone"* has four
 ways to be silently wrong — and every one of them was found by running it, not by
@@ -129,8 +129,11 @@ reading it:
    (`f9e34731`). Against a different tree the build fails on a moved file — or
    worse, silently omits a new one.
 2. **The patches**, which have to be applied or the build is nondeterministic
-   (dictionaries emitted in `PYTHONHASHSEED` order) or does not compile at all
-   under per-header moc.
+   (dictionaries emitted in `PYTHONHASHSEED` order), does not compile at all
+   under per-header moc, or leaks one socket fd per completed HTTP request until
+   the browser dies of `EMFILE` overnight
+   ([`0003`](patches/0003-librequests-tear-down-request-when-body-is-delivered.patch);
+   see [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md)).
 3. **The rename**: `bazelrc.txt` → `.bazelrc`. Stored under a different name so a
    `cp -r` cannot be mistaken for a working build — and a rename a human does by
    hand is a rename a human forgets.
@@ -285,7 +288,7 @@ an FFI header collision and an entire missing Rust target. See
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
 | `Meta/pin_hsts_preload.py` | Re-pins it: resolves the newest commit touching the path, downloads it, writes the hash it **measured**; `--expect-same-as` refuses to write unless the pinned bytes equal the file CMake downloaded (parity guard) |
-| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 45 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
+| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the three patches, copy the 45 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `qt_runtime.bzl` | Qt's **runtime** half: a repo rule that stages the plugins of the SDK `@qt` itself names (read out of @qt's generated `qtconf.bzl`, so plugins and libraries cannot come from different Qts), the private libraries an SDK bundles beside Qt (derived from DT_NEEDED), a generated `qt.conf` pointing the binary at them, and the Qt >= 6.9 floor `UI/Qt/CMakeLists.txt` declares. Without it Qt `dlopen`ed the HOST's plugin into Bazel's Qt — finding 40 |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
@@ -336,8 +339,9 @@ git checkout f9e34731b85fea1c3517941d8388566cd33277c4   # the commit the generat
                                                         # BUILD files describe
 # 1. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
-git apply .../examples/ladybird/patches/*.patch   # generator determinism + a Qt header
-                                                 # that is not self-contained (gap 9)
+git apply .../examples/ladybird/patches/*.patch   # generator determinism, a Qt header
+                                                 # that is not self-contained (gap 9),
+                                                 # and the per-request fd leak
 # 1a. THE TWO INPUTS THE OVERLAY DOES NOT CARRY -- both are produced by ONE
 #     ordinary Ladybird build. A Ladybird developer stages nothing by hand;
 #     these are blockers for a Bazel-ONLY clone, and each one is a thing CMake or
@@ -770,7 +774,7 @@ Honest inventory of what stops this from being a clone-and-build.
    that says there is none. Same shape as the shim that could not fail: a control
    that is not enforced is indistinguishable from one that is not there.
 
-9. **Three upstreamable Ladybird fixes.** The first is the `sorted()` determinism
+9. **Four upstreamable Ladybird fixes.** The first is the `sorted()` determinism
    fix in `Meta/Generators/libweb_bindings/to_idl_value.py`, filed as
    [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899) and
    fixed upstream.
@@ -795,3 +799,15 @@ Honest inventory of what stops this from being a clone-and-build.
    any single run — the inherited-seed run was clean. The fix is in
    [`patches/0001-libweb-bindings-deterministic-dictionary-order.patch`](patches/0001-libweb-bindings-deterministic-dictionary-order.patch);
    apply it in the checkout before running the harness.
+
+   A **fourth**, found only because the Bazel-built browser was left running
+   overnight, is a resource leak rather than a build defect:
+   [`patches/0003-librequests-tear-down-request-when-body-is-delivered.patch`](patches/0003-librequests-tear-down-request-when-body-is-delivered.patch).
+   WebContent leaks one AF_UNIX socket fd per *completed* HTTP request — a cycle
+   between the GC heap (four `GC::Root`s from `Fetching.cpp:2338`) and the
+   refcount heap (`Response` holding `Requests::Request` by `RefPtr`) that neither
+   collector can break — until `EMFILE` aborts three processes at once. The patch
+   is **necessary but not sufficient**: it fixes the completed-request class
+   (identifiable in `ss -np` by a dead peer, `* 0`), while a stalled-body class
+   with a live peer survives it. Both are written up with reproductions in
+   [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md).

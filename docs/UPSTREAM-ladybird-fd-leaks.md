@@ -1,8 +1,29 @@
-# Ladybird: two fd leaks in WebContent (one per HTTP request, one per un-`close()`d MessagePort)
+# Ladybird: fd leaks in WebContent (per HTTP request, and per un-`close()`d MessagePort)
 
-Status: ready to file upstream. Both reproduced locally on a **CMake** build of
-`f9e34731` (no Bazel involved); the primary one is present in upstream `master`
-(`50eef049`) by inspection of the same code paths.
+Status: reproduced locally on a **CMake** build of `f9e34731` (no Bazel involved);
+present in upstream `master` (`50eef049`) by inspection of the same code paths.
+
+**Read this first — the per-request leak is two distinct bugs, not one.** An upstream
+patch equivalent to the teardown fix below now exists, Ulf applied it, and *his browser
+still leaks*. That is not a contradiction: the fix closes the class of retained request
+whose peer is already **dead**, and there is a second class whose peer is still **alive**
+that no teardown at that point can reach. The discriminator is one column of `ss -np`:
+
+| class | `ss -np` peer inode | what happened | teardown patch |
+|---|---|---|---|
+| A: completed | `* 0` (**dead**) | request finished, RequestServer closed its half, WebContent retains a corpse | **fixes it** (143 → 0 locally) |
+| B: stalled | a real inode (**alive**) | `on_finish` never ran, so no teardown fires at all | **unaffected** (40 → 40 locally) |
+
+Count them before choosing a fix:
+
+```
+ss -np | grep "pid=$P," | grep -c ' \* 0 '   # class A (dead peer)
+ss -np | grep -c "pid=$P,"                   # all of this process's unix sockets
+```
+
+A build that self-classifies (in-process `poll()`/`MSG_PEEK` peer probe, plus
+in-flight-vs-retained ages so a fresh process cannot be mistaken for a fix) is in
+`examples/ladybird/patches/DIAGNOSTIC-fdleak-census.patch.txt`.
 
 Ulf's Bazel-built browser died overnight with
 
@@ -127,6 +148,47 @@ Same page, but each fetch is immediately `AbortController.abort()`ed — `abort`
 
 The path that tears down does not leak; the path that succeeds does.
 
+### Class B: the request that never finishes at all (survives the teardown fix)
+
+The teardown above hangs off the branch in `Request::set_up_internal_stream_data`'s
+`on_finish` that decides the body is complete:
+
+```cpp
+if (!user_finish_called && (!read_stream || read_stream->is_eof() || has_received_all_reported_bytes)) {
+```
+
+If a response never satisfies that *and* never reaches EOF, the block never runs, so
+`user_on_finish` never runs, so **no teardown placed inside it can ever fire**. Repro: a
+server that sends `Content-Length: 48000`, writes 100 bytes and then holds the socket
+open. 40 such loads, censused with the diagnostic build after they have aged past 30s:
+
+```
+FDLEAK live: in_flight(<30s)=0 retained(>=30s)=40
+FDLEAK retained-bucket 40 x peer=ALIVE torn_down=false did_finish=false user_finish=false
+                            request_done=false stream=true eof=false fd_open=true
+```
+
+Identical with `LADYBIRD_FDLEAK_TEARDOWN=1` (40 → 40): `did_finish=false` is the tell —
+the `request_finished` IPC never arrived, so the fix is not even on the code path. And
+`peer=ALIVE` distinguishes it from class A at a glance: RequestServer is still holding its
+end, because as far as it knows the body is still being produced.
+
+By contrast every completed-request shape I can construct — plain fetch, XHR, POST,
+`response.clone()`, unread bodies, `<img>`/CSS/JS subresources, 404/302/cache hits,
+truncated bodies, gzip/chunked, iframe navigations, mid-body `cancel()` — is flat at the
+5-socket baseline with the fix on, and shows `peer=DEAD` retention without it.
+
+So the two classes need different fixes, and only one of them is "release the callbacks
+when the body is delivered":
+
+- **Class A** is a *liveness* bug in the teardown path → the teardown patch.
+- **Class B** is the cycle itself. As long as `Response` holds `Requests::Request` by
+  `RefPtr` while the request's callbacks hold `GC::Root`s back into the GC heap, ANY
+  request that never completes is retained forever, and there is no completion callback
+  left to hook. The fix has to break the cycle at the `Response` end — e.g. hold the
+  request weakly, or root the callbacks from something whose lifetime the GC can actually
+  end — rather than adding another teardown call site.
+
 ### On fixing it — one obvious patch is wrong, and I verified that
 
 Calling `defer_teardown()` at the end of `did_finish()` looks like the one-line fix. **It
@@ -139,9 +201,12 @@ the unpatched build.
 
 A correct fix has to release the callbacks (and with them the `GC::Root`s) only once the
 body is genuinely finished — e.g. at the point `on_finish` decides
-`user_finish_called`/EOF — or break the cycle at its other end so `Response` does not keep
-the `Requests::Request` alive strongly. Which end upstream prefers is your call; the
-diagnosis is what I'm confident in.
+`user_finish_called`/EOF, which is what the upstream patch and
+`patches/0003-*.patch` do — **and** break the cycle at its other end so `Response` does
+not keep the `Requests::Request` alive strongly, which is the only thing that can reach
+class B. Doing only the first is measurable progress and not a fix: it is the same shape
+as the `-fPIE` finding, where the change was necessary, verified, and still left the
+symptom alive by another route.
 
 ### Why it takes the whole browser down, not just a tab
 
