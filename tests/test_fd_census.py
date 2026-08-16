@@ -20,6 +20,7 @@ turn a number into a diagnosis:
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -230,10 +231,89 @@ def test_script_is_executable_and_standalone():
     The whole point is that a colleague with their own tree can run it without
     applying anything, so it must not import from any2bazel or need the overlay.
     """
-    import os
     assert os.access(SCRIPT, os.X_OK), "fd_census.py must be executable"
     text = SCRIPT.read_text()
     assert "any2bazel" not in text.split('"""', 2)[2] or True  # docstring may mention it
     for forbidden in ("from tests", "import engine", "sys.path.insert"):
         assert forbidden not in text, "must be standalone (found %r)" % forbidden
     assert text.startswith("#!/usr/bin/env python3")
+
+
+# --- fdtrace: the companion that names the CALL SITE, not just the class -------
+
+FDTRACE_C = REPO / "examples" / "ladybird" / "fdtrace.c"
+FDTRACE_REPORT = REPO / "examples" / "ladybird" / "fdtrace_report.py"
+
+
+def _report_module():
+    spec = importlib.util.spec_from_file_location("fdtrace_report", FDTRACE_REPORT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_fdtrace_hooks_recvmsg_because_that_is_how_the_fd_arrives():
+    """The leaked fd is never opened by WebContent; it is RECEIVED.
+
+    RequestServer creates the socketpair and passes a half over IPC, so the fd is
+    materialised by the kernel inside recvmsg() as an SCM_RIGHTS attachment. A
+    tracer that only wraps open()/socket() sees nothing at all -- which is why the
+    hook list is worth pinning.
+    """
+    text = FDTRACE_C.read_text()
+    assert "SCM_RIGHTS" in text and "CMSG_NXTHDR" in text
+    for hook in ("recvmsg", "close", "socketpair", "dup", "dup2", "dup3",
+                 "pipe2", "accept4"):
+        assert ("int %s(" % hook) in text or ("ssize_t %s(" % hook) in text, \
+            "missing hook: %s" % hook
+    # close() must un-record, or every fd looks leaked
+    assert "forget(fd)" in text
+
+
+def test_fdtrace_records_maps_for_offline_symbolisation():
+    """Return addresses are meaningless without the load addresses (PIE + ASLR)."""
+    text = FDTRACE_C.read_text()
+    assert "/proc/self/maps" in text
+    assert "# map " in text
+    report = _report_module()
+    maps = report.Maps()
+    maps.add(0x1000, 0x2000, 0x0, "/lib/foo.so")
+    maps.finish()
+    assert maps.resolve(0x1500) == ("/lib/foo.so", 0x500)
+    assert maps.resolve(0x9999) is None
+
+
+def test_fdtrace_report_pairs_acquisitions_with_releases():
+    """Only fds with no matching close are leaks; the seq number pairs them."""
+    import tempfile
+    report = _report_module()
+    log = (
+        "# fdtrace pid=99\n"
+        "# map 1000-2000 r-xp 0 00:00 0 /lib/foo.so\n"
+        "+ fd=7 seq=0 how=recvmsg/SCM_RIGHTS 0x1100 0x1200\n"
+        "+ fd=8 seq=1 how=recvmsg/SCM_RIGHTS 0x1100 0x1200\n"
+        "- fd=7 seq=0\n"
+        "+ fd=9 seq=2 how=pipe2 0x1300\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+        f.write(log)
+        path = f.name
+    maps, acquisitions, live = report.parse(path)
+    os.unlink(path)
+    assert len(acquisitions) == 3
+    assert set(live) == {1, 2}, "the closed fd must not be reported as leaked"
+    assert live[1][1] == "recvmsg/SCM_RIGHTS"
+
+
+def test_fdtrace_report_splits_ipc_attachments_from_local_opens():
+    """The origin split is the real signal, not the stack.
+
+    An SCM_RIGHTS fd's creation stack is ALWAYS the IPC read thread -- true by
+    construction and useless as a culprit. What the trace does establish is how many
+    leaked fds arrived as attachments versus being opened locally, i.e. 'a received
+    response pipe was never closed' versus 'something else entirely'.
+    """
+    text = FDTRACE_REPORT.read_text()
+    assert "still-open by origin" in text
+    assert "RECEIVED ATTACHMENTS" in text
+    assert "peer=DEAD" in text, "must tell the reader to cross-check the census"
