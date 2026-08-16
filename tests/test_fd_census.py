@@ -136,6 +136,94 @@ def test_ages_are_relative_to_first_sighting_and_survive_fd_reuse():
     assert census.first_seen[(7, "socket:[111]")] == 1000.0
 
 
+def test_the_rate_is_reported_because_the_level_cannot_answer_the_question():
+    """Whether a fix works is a question about the SLOPE, not the level.
+
+    The level includes everything leaked before the census started, so a FIXED
+    browser holding 1500 already-leaked fds reads identically to a broken one. Ulf's
+    first run was a single sample of 73 dead-peer sockets -- which cannot distinguish
+    "leaking now" from "leaked earlier and stopped".
+    """
+    c = fd_census.Census(pid=1)
+    c.history = [(0.0, 100, 90), (60.0, 160, 150)]
+    lines = "\n".join(c.rate_lines())
+    assert "+60.0/min" in lines
+    assert "STILL LEAKING" in lines
+    assert "1024-fd limit" in lines, "say when it dies, not just how fast"
+
+    c.history = [(0.0, 1500, 1490), (120.0, 1500, 1490)]
+    flat = "\n".join(c.rate_lines())
+    assert "NOT GROWING" in flat
+    assert "damage already done" in flat
+    assert "BUSY" in flat, "a flat rate on an idle process proves nothing"
+
+
+def test_no_silent_middle_band_in_the_rate_verdict():
+    """A slow leak must be named, not dropped between two thresholds.
+
+    The first version called <0.5/min "flat" and flagged >0.5/min, so exactly
+    +0.5/min was reported as NEITHER. That rate is ~720 fds/day -- the overnight
+    death being investigated. Every positive slope has to say something.
+    """
+    for gained, span in [(1, 120.0), (1, 600.0), (3, 60.0), (200, 60.0)]:
+        c = fd_census.Census(pid=1)
+        c.history = [(0.0, 100, 90), (span, 100 + gained, 90 + gained)]
+        lines = "\n".join(c.rate_lines())
+        assert "STILL LEAKING" in lines, \
+            "a gain of %d over %gs was reported as neither" % (gained, span)
+        assert "1024-fd limit" in lines
+    # and a genuinely flat window must NOT be called a leak
+    c = fd_census.Census(pid=1)
+    c.history = [(0.0, 100, 90), (600.0, 100, 90)]
+    assert "STILL LEAKING" not in "\n".join(c.rate_lines())
+
+
+def test_a_single_sample_says_ages_start_now_rather_than_use_watch():
+    """The old message told a --watch user to use --watch.
+
+    Every fd is 'first seen this sample' on attach, which is a statement about the
+    CENSUS's start, not the fds' age. Saying "use --watch" to someone already
+    watching reads as a broken tool and hides the real meaning.
+    """
+    c = fd_census.Census(pid=1, retained_after=30.0)
+    rows = [{"fd": 3, "target": "socket:[1]", "category": "socket:", "age": 0.0,
+             "peer": "DEAD", "peers": []}]
+    c.history = [(0.0, 1, 1)]
+    text = c.summarize({"rows": rows, "by_category": {"socket:": 1}, "now": 0.0})
+    assert "use --watch" not in text
+    assert "first seen this sample" in text and "ages start" in text
+
+
+def test_the_ipc_mesh_is_separated_from_retained_live_peers():
+    """A live peer is not automatically a leak.
+
+    Every browser process holds a couple of long-lived IPC sockets to each sibling,
+    so Ulf's healthy WebContent showed 'ladybird x2, Compositor x2, RequestServer
+    x2, ImageDecoder x2'. Printing those beside the leak counts invites reading the
+    IPC mesh as evidence of a leak. A peer holding MANY is the real signal.
+    """
+    c = fd_census.Census(pid=1, retained_after=1.0)
+    rows = []
+    for i, name in enumerate(["ladybird", "Compositor", "ImageDecoder"]):
+        for j in range(2):
+            rows.append({"fd": i * 10 + j, "target": "socket:[%d]" % (i * 99 + j),
+                         "category": "socket:", "age": 99.0, "peer": "ALIVE",
+                         "peers": [name]})
+    for j in range(40):
+        rows.append({"fd": 500 + j, "target": "socket:[%d]" % (5000 + j),
+                     "category": "socket:", "age": 99.0, "peer": "ALIVE",
+                     "peers": ["RequestServer"]})
+    c.history = [(0.0, len(rows), 0)]
+    text = c.summarize({"rows": rows, "by_category": {"socket:": len(rows)},
+                        "now": 0.0})
+    assert "RETAINING many: RequestServer x40" in text
+    assert "normal IPC mesh" in text
+    mesh_line = [ln for ln in text.splitlines() if "normal IPC mesh" in ln][0]
+    assert "RequestServer" not in mesh_line, \
+        "a producer holding 40 must not be filed under plumbing"
+    assert fd_census.IPC_MESH_MAX < 10
+
+
 def test_script_is_executable_and_standalone():
     """It has to run on a machine that has only this file, so: no imports of ours.
 

@@ -50,6 +50,12 @@ import time
 
 SOCKET_RE = re.compile(r"^socket:\[(\d+)\]$")
 
+# A peer process holding at most this many of our sockets is the ordinary IPC mesh
+# (each pair of browser processes keeps a couple of long-lived connections), not a
+# producer sitting on unfinished responses. Ulf's healthy WebContent showed exactly
+# 2 each to ladybird, Compositor, RequestServer and ImageDecoder.
+IPC_MESH_MAX = 4
+
 
 def read_fd_targets(pid):
     """{fd: symlink target} for a live pid. Racy by nature; skip what vanishes."""
@@ -156,6 +162,11 @@ class Census:
         self.pid = pid
         self.retained_after = retained_after
         self.first_seen = {}
+        # (timestamp, socket count, dead count) per sample. The RATE is the number
+        # that actually matters -- "is it still leaking, and how fast" -- and a
+        # single census cannot answer it. Reporting a raw count invites the mistake
+        # I already made once: reading a freshly restarted process as a fix.
+        self.history = []
 
     def sample(self, now=None):
         now = time.time() if now is None else now
@@ -188,8 +199,10 @@ class Census:
             if key not in live_keys:
                 del self.first_seen[key]
 
-        return {"rows": rows, "by_category": by_category,
-                "samples_seen": max(1, len(self.first_seen) and 1)}
+        socks = [r for r in rows if r["category"] == "socket:"]
+        self.history.append((now, len(socks),
+                             len([r for r in socks if r["peer"] == "DEAD"])))
+        return {"rows": rows, "by_category": by_category, "now": now}
 
     def summarize(self, snapshot):
         rows = snapshot["rows"]
@@ -218,19 +231,82 @@ class Census:
             ra = len([r for r in retained if r["peer"] == "ALIVE"])
             out.append("  of retained: peer DEAD=%d  peer ALIVE=%d" % (rd, ra))
         else:
-            out.append("sockets by age: (need a second sample -- use --watch)")
+            # Every fd was first seen in THIS sample. With --watch that means the
+            # process was just attached to, not that the fds are new -- ages are
+            # relative to when the census started, and it cannot see further back.
+            out.append("sockets by age: all %d first seen this sample (ages start "
+                       "now; the next sample will age them)" % len(socks))
 
+        out.extend(self.rate_lines())
+
+        # A live peer is NOT automatically a leak: every process in the browser is
+        # connected to its siblings by long-lived IPC sockets, so a healthy
+        # WebContent shows ~2 each to ladybird/Compositor/RequestServer/
+        # ImageDecoder. Reporting those next to the leak counts invites reading the
+        # IPC mesh as evidence. Separate the two: N-of-a-kind at the baseline level
+        # is plumbing; a peer holding MANY is a producer that has not let go.
         holders = {}
         for r in alive:
             for name in r["peers"]:
                 holders[name] = holders.get(name, 0) + 1
         if holders:
-            out.append("live peers held by: %s" % ", ".join(
-                "%s x%d" % (k, v) for k, v in
-                sorted(holders.items(), key=lambda kv: -kv[1])))
+            plumbing = {k: v for k, v in holders.items() if v <= IPC_MESH_MAX}
+            suspect = {k: v for k, v in holders.items() if v > IPC_MESH_MAX}
+            if suspect:
+                out.append("live peers RETAINING many: %s" % ", ".join(
+                    "%s x%d" % (k, v) for k, v in
+                    sorted(suspect.items(), key=lambda kv: -kv[1])))
+            if plumbing:
+                out.append("live peers (normal IPC mesh, not the leak): %s" %
+                           ", ".join("%s x%d" % (k, v) for k, v in
+                                     sorted(plumbing.items(), key=lambda kv: -kv[1])))
 
         out.append(verdict(len(dead), len(alive)))
         return "\n".join(out)
+
+
+    def rate_lines(self):
+        """Growth since the first sample, as a rate. The decisive measurement.
+
+        Whether a fix works is a question about the SLOPE, not the level: the level
+        includes everything leaked before the census started, so a fixed browser
+        with 1500 already-leaked fds looks identical to a broken one until you
+        watch it.
+        """
+        if len(self.history) < 2:
+            return ["growth: (first sample; the next one gives a rate)"]
+        t0, s0, d0 = self.history[0]
+        t1, s1, d1 = self.history[-1]
+        span = t1 - t0
+        if span <= 0:
+            return []
+        per_min = (s1 - s0) * 60.0 / span
+        dead_per_min = (d1 - d0) * 60.0 / span
+        lines = ["growth over %.0fs (%d samples): sockets %+d (%+.1f/min), "
+                 "of which peer DEAD %+d (%+.1f/min)"
+                 % (span, len(self.history), s1 - s0, per_min, d1 - d0,
+                    dead_per_min)]
+        # No silent middle band. An earlier version called <0.5/min "flat" and only
+        # flagged >0.5/min, so a rate of exactly +0.5/min fell through reported as
+        # neither -- and +0.5/min is ~720 fds/day, which is precisely the overnight
+        # death being investigated. Any positive slope gets named, with the time to
+        # the fd limit as the unit that means something.
+        if s1 - s0 <= 0:
+            lines.append("  -> NOT GROWING in this window. A high count with a flat "
+                         "rate is damage already done, not an active leak -- and "
+                         "the process must be BUSY for that to mean anything "
+                         "(load some pages, then re-census).")
+        else:
+            worst = max(dead_per_min, per_min)
+            to_limit = 1024.0 / worst if worst > 0 else float("inf")
+            unit = "min" if to_limit < 120 else "hours"
+            eta = to_limit if to_limit < 120 else to_limit / 60.0
+            which = ("completed requests (peer DEAD)" if dead_per_min > 0
+                     else "sockets (peer still alive)")
+            lines.append("  -> STILL LEAKING %s at %.1f/min: a 1024-fd limit in "
+                         "~%.0f %s. Slow is not safe; this is the shape that dies "
+                         "overnight." % (which, worst, eta, unit))
+        return lines
 
 
 def verdict(dead, alive):
