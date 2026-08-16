@@ -136,12 +136,59 @@ if [ "$VERIFY" -eq 1 ]; then
     # The patches must be APPLIED, not merely present. `git apply --check -R`
     # succeeding is the proof: a patch that reverse-applies cleanly is a patch
     # already in the tree.
+    #
+    # But reverse-apply proves "MY EXACT BYTES are in the tree", which is a
+    # stronger claim than "the defect is fixed" -- and the difference is not
+    # hypothetical: upstream landed its own fix for the fd leak, so a tree that is
+    # CORRECT (and newer than the pin) was reported as PATCH NOT APPLIED, telling
+    # the user to apply a patch that would then conflict. A patch we carry only
+    # until upstream fixes it needs a second, weaker question: is the EFFECT there?
+    # `.effect-grep` next to a patch holds one extended regex per line; if every
+    # one matches the file the patch touches, the effect is present however it got
+    # there. Reverse-apply is still tried first, so the exact-bytes case keeps its
+    # precise answer.
     for p in "$PATCHES"/*.patch; do
+        name="$(basename "$p")"
         if git apply --check -R "$p" >/dev/null 2>&1; then
-            note "patch applied: $(basename "$p")"
-        else
-            echo "PATCH NOT APPLIED: $(basename "$p")" >&2; rc=1
+            note "patch applied: $name"
+            continue
         fi
+        effect="${p%.patch}.effect-grep"
+        if [ -f "$effect" ]; then
+            target="$(sed -n 's|^+++ b/||p' "$p" | head -1)"
+            if [ -f "$target" ]; then
+                # An `@window <n> <regex>` directive narrows the search to the n
+                # lines following the first match, because a whole-file grep is
+                # too weak to be worth anything here: `defer_teardown();` already
+                # occurs in stop() and did_transfer(), so an unpatched tree passed
+                # a whole-file check. A test pins that negative case.
+                win="$(grep -E '^@window ' "$effect" | head -1)"
+                slice="$target"
+                if [ -n "$win" ]; then
+                    n="$(echo "$win" | awk '{print $2}')"
+                    re="$(echo "$win" | cut -d' ' -f3-)"
+                    start="$(grep -nE "$re" "$target" | head -1 | cut -d: -f1)"
+                    if [ -z "$start" ]; then
+                        echo "PATCH NOT APPLIED: $name (anchor not found: $re)" >&2; rc=1
+                        continue
+                    fi
+                    slice="$(mktemp)"
+                    sed -n "${start},$((start + n))p" "$target" > "$slice"
+                fi
+                unmatched=0
+                while IFS= read -r re; do
+                    [ -n "$re" ] || continue
+                    case "$re" in \#*|@*) continue ;; esac
+                    grep -Eq "$re" "$slice" || unmatched=$((unmatched + 1))
+                done < "$effect"
+                [ "$slice" = "$target" ] || rm -f "$slice"
+                if [ "$unmatched" -eq 0 ]; then
+                    note "patch effect present (not our bytes -- fixed upstream?): $name"
+                    continue
+                fi
+            fi
+        fi
+        echo "PATCH NOT APPLIED: $name" >&2; rc=1
     done
 
     # Executable bits are tree state git carries and a `cp` does not always: the

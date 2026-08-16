@@ -1,6 +1,24 @@
 NOT AN OVERLAY PATCH -- do not put this in patches/*.patch, apply_overlay.sh globs
 those and this must never be part of a normal build.
 
+PREFER `examples/ladybird/fd_census.py`, WHICH NEEDS NO PATCH AT ALL.
+
+    python3 examples/ladybird/fd_census.py --find WebContent
+    python3 examples/ladybird/fd_census.py <pid> --watch 30
+
+It reports the same things this build does -- the /proc category census, peer
+DEAD/ALIVE per socket, retained-vs-in-flight by age, and which process holds the
+live peers -- by reading /proc and `ss` from outside a RUNNING browser. Verified
+against this build on the same workload: 143 DEAD / 4 ALIVE from inside, 143 DEAD /
+4 ALIVE from outside.
+
+Use it unless you specifically need something only the in-process build can see
+(the request id, `user_finish_called`, or the `LADYBIRD_FDLEAK_TEARDOWN` A/B).
+Patching a colleague's tree to run a diagnostic is the wrong trade when the
+information is visible from outside: it assumes their tree is at our pinned commit,
+it conflicts with a tree that already carries upstream's fix, and it means "reset
+your tree" for anyone who has their own commits.
+
 This is a temporary DIAGNOSTIC for the remaining Ladybird fd leak (see
 docs/UPSTREAM-ladybird-fd-leaks.md). Apply it to Libraries/LibRequests/Request.cpp
 in a Ladybird checkout, rebuild only LibRequests, and run the browser normally:

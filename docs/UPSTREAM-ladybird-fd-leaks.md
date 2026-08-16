@@ -21,9 +21,21 @@ ss -np | grep "pid=$P," | grep -c ' \* 0 '   # class A (dead peer)
 ss -np | grep -c "pid=$P,"                   # all of this process's unix sockets
 ```
 
-A build that self-classifies (in-process `poll()`/`MSG_PEEK` peer probe, plus
-in-flight-vs-retained ages so a fresh process cannot be mistaken for a fix) is in
-`examples/ladybird/patches/DIAGNOSTIC-fdleak-census.patch.txt`.
+`examples/ladybird/fd_census.py` does the classification from **outside** a running
+browser — no patch, no rebuild, no pinned tree:
+
+```
+python3 examples/ladybird/fd_census.py --find WebContent
+python3 examples/ladybird/fd_census.py <pid> --watch 30
+```
+
+It prints the category census, peer DEAD/ALIVE per socket, retained-vs-in-flight by
+age (so a freshly restarted process cannot be mistaken for a fix), which process holds
+the live peers, and a verdict naming the class. Verified to agree with an
+instrumented build on the same workload (143 DEAD / 4 ALIVE either way). The
+in-process version is kept as
+`examples/ladybird/patches/DIAGNOSTIC-fdleak-census.patch.txt` for the few fields
+only it can see (request id, `user_finish_called`, and a one-build A/B of the fix).
 
 Ulf's Bazel-built browser died overnight with
 

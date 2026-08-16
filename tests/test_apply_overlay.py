@@ -170,6 +170,51 @@ def test_both_patches_are_referenced_by_glob_not_by_name():
         assert n not in text, "patch %s is named literally; use the glob" % n
 
 
+def test_effect_grep_files_exist_for_patches_upstream_may_fix_itself():
+    """A patch we carry until upstream fixes it needs a weaker second question.
+
+    `git apply --check -R` proves MY EXACT BYTES are in the tree, which is a
+    stronger claim than "the defect is fixed". Ulf hit the difference: upstream
+    landed its own fd-leak fix, so a tree that was CORRECT (and newer than our pin)
+    reported `PATCH NOT APPLIED` and told him to apply a patch that would then
+    conflict. So the fd-leak patch carries an `.effect-grep`, and verify falls back
+    to it before failing.
+    """
+    text = _text()
+    assert ".effect-grep" in text, "verify must fall back to an effect check"
+    fd_leak = PATCHES / "0003-librequests-tear-down-request-when-body-is-delivered.patch"
+    assert fd_leak.exists()
+    effect = fd_leak.with_suffix(".effect-grep")
+    assert effect.exists(), \
+        "the fd-leak patch is the one upstream is fixing; it needs an effect check"
+    # reverse-apply must still be tried FIRST, so the exact-bytes case keeps its
+    # precise answer and the weaker check is only a fallback
+    assert text.index("git apply --check -R") < text.index(".effect-grep")
+
+
+def test_effect_grep_is_windowed_not_a_whole_file_grep():
+    """The negative case is what makes an effect check worth anything.
+
+    A whole-file grep for `defer_teardown();` PASSES on a tree without the fix,
+    because that call already occurs in stop() and did_transfer() -- I wrote that
+    version first and it silently accepted an unpatched tree, which is worse than
+    being too strict. The check therefore anchors on the branch condition and
+    requires the call within a window of following lines.
+    """
+    effect = (PATCHES / "0003-librequests-tear-down-request-when-body-is-delivered.effect-grep")
+    lines = [ln for ln in effect.read_text().splitlines()
+             if ln.strip() and not ln.startswith("#")]
+    assert any(ln.startswith("@window ") for ln in lines), \
+        "the effect check must be windowed; a whole-file grep accepts an unpatched tree"
+    window = [ln for ln in lines if ln.startswith("@window ")][0].split()
+    assert window[1].isdigit() and int(window[1]) < 40, \
+        "the window must be tight enough to mean 'in this branch'"
+    assert "$PATCHES" not in effect.read_text()
+    # and the script must implement the window, not just tolerate the directive
+    text = _text()
+    assert "@window " in text
+
+
 def test_the_diagnostic_patch_is_not_applied_by_the_overlay():
     """The fd-leak census patch must never enter a normal build.
 

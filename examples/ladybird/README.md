@@ -811,3 +811,11 @@ Honest inventory of what stops this from being a clone-and-build.
    (identifiable in `ss -np` by a dead peer, `* 0`), while a stalled-body class
    with a live peer survives it. Both are written up with reproductions in
    [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md).
+
+   Diagnose a running browser with [`fd_census.py`](fd_census.py), which needs no
+   patch and no particular tree — `python3 fd_census.py --find WebContent`, then
+   `python3 fd_census.py <pid> --watch 30`. Since upstream has landed its own fix,
+   `--verify` also accepts an equivalent fix in place of our exact bytes: a patch we
+   carry only until upstream fixes it has an `.effect-grep` beside it, and verify
+   falls back to asking whether the *effect* is present before reporting the patch
+   missing.
