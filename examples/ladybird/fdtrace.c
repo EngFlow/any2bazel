@@ -15,8 +15,11 @@
  *     python3 fd_census.py <webcontent-pid>        # how many, and which class
  *     python3 fdtrace_report.py /tmp/fdtrace.<webcontent-pid>.log
  *
- * The report groups still-open fds by the stack that created them, so the answer
- * is a ranked list of call sites rather than a theory. `Requests::Request` fds and
+ * The report leads with WHO SENT each still-open attachment (SO_PEERCRED on the
+ * receiving socket), because that is the field that discriminates. An SCM_RIGHTS fd
+ * is materialised by the kernel on the IPC read thread, so every attachment from
+ * every peer shares one identical acquisition stack -- grouping by stack alone
+ * produces a wall of identical frames and names nothing. `Requests::Request` fds and
  * fds that never reach a Request look completely different here, which is the
  * question the in-process census could not answer (it only ever saw fds that DID
  * reach a Request).
@@ -108,7 +111,59 @@ static void trace_open(void)
     }
 }
 
-static void record(int fd, const char *how)
+/* Which IPC connection did an attachment arrive on, and WHO sent it?
+ *
+ * This is the field the first version lacked, and the reason it mattered: the
+ * acquisition stack of an SCM_RIGHTS fd is always the IPC read thread, identical
+ * for every attachment from every peer, so a log full of identical stacks says
+ * nothing about which subsystem is leaking. SO_PEERCRED on the receiving socket
+ * names the SENDER process, which does discriminate: a response pipe from
+ * RequestServer is the fd under investigation; an attachment from the Compositor or
+ * ImageDecoder is something else entirely.
+ *
+ * Cached per socket fd -- one getsockopt and one /proc read per connection, not per
+ * attachment, because this sits in the IPC hot path.
+ */
+#define MAX_PEER_CACHE 4096
+static struct {
+    int valid;
+    int pid;
+    char comm[32];
+} g_peer_cache[MAX_PEER_CACHE];
+
+static void peer_of(int sock, int *out_pid, const char **out_comm)
+{
+    *out_pid = -1;
+    *out_comm = "?";
+    if (sock < 0 || sock >= MAX_PEER_CACHE)
+        return;
+    if (!g_peer_cache[sock].valid) {
+        struct ucred cred;
+        socklen_t len = sizeof(cred);
+        g_peer_cache[sock].valid = 1;
+        g_peer_cache[sock].pid = -1;
+        strcpy(g_peer_cache[sock].comm, "?");
+        if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+            g_peer_cache[sock].pid = (int)cred.pid;
+            char path[64];
+            snprintf(path, sizeof(path), "/proc/%d/comm", (int)cred.pid);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(g_peer_cache[sock].comm,
+                          (int)sizeof(g_peer_cache[sock].comm), f)) {
+                    char *nl = strchr(g_peer_cache[sock].comm, '\n');
+                    if (nl)
+                        *nl = 0;
+                }
+                fclose(f);
+            }
+        }
+    }
+    *out_pid = g_peer_cache[sock].pid;
+    *out_comm = g_peer_cache[sock].comm;
+}
+
+static void record_from(int fd, const char *how, int sock)
 {
     if (fd < 0 || fd >= MAX_FDS)
         return;
@@ -124,11 +179,23 @@ static void record(int fd, const char *how)
 
     if (g_out) {
         fprintf(g_out, "+ fd=%d seq=%lu how=%s", fd, e->seq, how);
+        if (sock >= 0) {
+            int pid;
+            const char *comm;
+            peer_of(sock, &pid, &comm);
+            fprintf(g_out, " sock=%d from=%s(pid=%d)", sock, comm, pid);
+        }
+        fprintf(g_out, " stack:");
         for (int i = 0; i < e->depth; i++)
             fprintf(g_out, " %p", e->frames[i]);
         fprintf(g_out, "\n");
     }
     g_in_hook = 0;
+}
+
+static void record(int fd, const char *how)
+{
+    record_from(fd, how, -1);
 }
 
 static void forget(int fd)
@@ -164,7 +231,7 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
         size_t count = payload / sizeof(int);
         int *fds = (int *)CMSG_DATA(c);
         for (size_t i = 0; i < count; i++)
-            record(fds[i], "recvmsg/SCM_RIGHTS");
+            record_from(fds[i], "recvmsg/SCM_RIGHTS", sockfd);
     }
     return r;
 }

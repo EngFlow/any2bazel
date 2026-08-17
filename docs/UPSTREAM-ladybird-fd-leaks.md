@@ -26,11 +26,13 @@ ss -np | grep -c "pid=$P,"                   # all of this process's unix socket
 - `examples/ladybird/fd_census.py` — *how many, which class, and is it still growing.*
 - `examples/ladybird/fdtrace.c` + `fdtrace_report.py` — *which call site.* Build once
   (`cc -shared -fPIC -O2 -g -o fdtrace.so fdtrace.c -ldl`), `LD_PRELOAD` it into an
-  unmodified browser, and the report ranks the still-open fds by the stack that
-  acquired them. It hooks `recvmsg`/SCM_RIGHTS because the leaked fd is **received,
-  never opened** — a tracer wrapping only `open()`/`socket()` sees nothing. Validated
-  on the known leak: 148 still-open fds, all arriving as IPC attachments, matching
-  the census exactly.
+  unmodified browser, and the report says **who sent** each fd that was never
+  closed. It hooks `recvmsg`/SCM_RIGHTS because the leaked fd is **received, never
+  opened** — a tracer wrapping only `open()`/`socket()` sees nothing — and it reads
+  `SO_PEERCRED` on the receiving socket, because the acquisition *stack* of an
+  attachment is always the IPC read thread and therefore identical for every peer.
+  Validated on the known leak: `143 from RequestServer, 5 from Ladybird`, matching
+  the census's 143 dead-peer sockets exactly.
 
 `examples/ladybird/fd_census.py` does the classification from **outside** a running
 browser — no patch, no rebuild, no pinned tree:

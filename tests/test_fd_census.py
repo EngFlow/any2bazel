@@ -317,3 +317,57 @@ def test_fdtrace_report_splits_ipc_attachments_from_local_opens():
     assert "still-open by origin" in text
     assert "RECEIVED ATTACHMENTS" in text
     assert "peer=DEAD" in text, "must tell the reader to cross-check the census"
+
+
+def test_fdtrace_records_the_sending_peer_not_just_the_stack():
+    """The sender is the discriminating field; the stack is not.
+
+    Ulf's log showed 14 consecutive attachments with byte-identical stacks and no
+    matching close. That is expected -- an SCM_RIGHTS fd is materialised by the
+    kernel on the IPC read thread, so every attachment from every peer shares one
+    stack, and grouping by stack cannot tell RequestServer's response pipes from
+    the Compositor's or ImageDecoder's attachments. SO_PEERCRED on the receiving
+    socket names the sender, which does.
+    """
+    text = FDTRACE_C.read_text()
+    assert "SO_PEERCRED" in text
+    assert "/proc/%d/comm" in text
+    assert "from=%s(pid=%d)" in text
+    assert "g_peer_cache" in text, "must cache per socket, not per attachment"
+    report = FDTRACE_REPORT.read_text()
+    assert "BY SENDER" in report
+    assert "RequestServer" in report, "must say when the sender IS the suspect"
+    assert "NOT RequestServer" in report, "and when it is not, which is a different bug"
+
+
+def test_fdtrace_report_reads_both_log_formats():
+    """A colleague's existing log must not become unreadable when the format grows.
+
+    Ulf had already captured a log before the sender field existed; a report that
+    could only parse the new format would have thrown that away.
+    """
+    import tempfile
+    report = _report_module()
+    old = ("# fdtrace pid=1\n"
+           "+ fd=173 seq=165 how=recvmsg/SCM_RIGHTS 0x1100 0x1200\n")
+    new = ("# fdtrace pid=1\n"
+           "+ fd=173 seq=165 how=recvmsg/SCM_RIGHTS sock=36 "
+           "from=RequestServer(pid=7) stack: 0x1100 0x1200\n")
+    for text, expect_sender in ((old, None), (new, "RequestServer(pid=7)")):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write(text)
+            path = f.name
+        _maps, acquisitions, live = report.parse(path)
+        os.unlink(path)
+        assert len(live) == 1
+        fd, how, addrs, sender = live[165]
+        assert fd == 173 and how == "recvmsg/SCM_RIGHTS"
+        assert addrs == [0x1100, 0x1200], "the stack must survive either format"
+        assert sender == expect_sender
+
+
+def test_fdtrace_report_hides_the_tracers_own_frames():
+    """The shim's frames are in every stack and would crowd out the real caller."""
+    report = FDTRACE_REPORT.read_text()
+    assert 'fn.startswith("record")' in report
+    assert "skip_internal" in report

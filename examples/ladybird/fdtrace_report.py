@@ -71,9 +71,21 @@ def parse(path):
                 fd = int(parts[1].split("=")[1])
                 seq = int(parts[2].split("=")[1])
                 how = parts[3].split("=")[1]
-                addrs = [int(a, 16) for a in parts[4:]]
+                sender = None
+                rest = parts[4:]
+                # `from=NAME(pid=N)` when the fd arrived as an IPC attachment. Old
+                # logs have no such field and no `stack:` marker; still readable.
+                for tok in list(rest):
+                    if tok.startswith("from="):
+                        sender = tok[len("from="):]
+                    if tok == "stack:":
+                        rest = rest[rest.index(tok) + 1:]
+                        break
+                else:
+                    rest = [t for t in rest if t.startswith("0x")]
+                addrs = [int(a, 16) for a in rest if a.startswith("0x")]
                 open_fds[fd] = seq
-                acquisitions[seq] = (fd, how, addrs)
+                acquisitions[seq] = (fd, how, addrs, sender)
             elif line.startswith("- "):
                 parts = line.split()
                 seq = int(parts[2].split("=")[1])
@@ -119,8 +131,12 @@ def symbolize(maps, addrs, frames, skip_internal=True):
             lines.append("    0x%x (unmapped)" % off)
             continue
         fn, loc = resolved.get((path, off), ("??", "??"))
-        if skip_internal and (fn.startswith("fdtrace") or fn in ("record", "recvmsg",
-                                                                "close", "socketpair")):
+        # The tracer's own frames are noise: they are in every stack by
+        # construction and push the real caller off the end of --frames.
+        if skip_internal and (fn.startswith("fdtrace") or fn.startswith("record")
+                              or fn in ("recvmsg", "close", "socketpair", "forget",
+                                        "peer_of", "dup", "dup2", "dup3", "pipe",
+                                        "pipe2", "socket", "accept", "accept4")):
             continue
         short = os.path.basename(path)
         if fn == "??" and loc == "??":
@@ -148,8 +164,11 @@ def main(argv=None):
         return 1
 
     groups = collections.defaultdict(list)
-    for seq, (fd, how, addrs) in live.items():
+    senders = collections.defaultdict(list)
+    for seq, (fd, how, addrs, sender) in live.items():
         groups[(how, tuple(addrs))].append((seq, fd))
+        if sender:
+            senders[sender].append(fd)
 
     print("fdtrace: %d acquisitions, %d still open, %d distinct call sites"
           % (len(acquisitions), len(live), len(groups)))
@@ -161,6 +180,27 @@ def main(argv=None):
     # useless on its own. What it does establish, precisely, is HOW MANY leaked fds
     # entered as IPC attachments versus being opened locally, which is the split
     # between "a received response pipe was never closed" and "something else".
+    # WHO SENT the leaked attachments. This is the discriminating field, because
+    # every attachment shares one acquisition stack (the IPC read thread) and so the
+    # stacks cannot tell two subsystems apart. A response pipe from RequestServer is
+    # the fd under investigation; one from Compositor or ImageDecoder is not.
+    if senders:
+        print("still-open IPC attachments BY SENDER:")
+        for name, fds in sorted(senders.items(), key=lambda kv: -len(kv[1])):
+            print("  %6d from %s   e.g. fd %s" % (
+                len(fds), name, ", ".join(str(f) for f in sorted(fds)[:6])))
+        top, top_fds = max(senders.items(), key=lambda kv: len(kv[1]))
+        if "RequestServer" in top:
+            print("  -> the leaked fds are RESPONSE PIPES from RequestServer: the")
+            print("     class this investigation is about. Every one is a request")
+            print("     whose response fd WebContent decoded and never closed.")
+        else:
+            print("  -> NOT RequestServer. The leak is attachments from %s, which is"
+                  % top.split("(")[0])
+            print("     a different bug from the per-request response-pipe leak --")
+            print("     look at what decodes IPC::File from that peer.")
+        print()
+
     ipc = sum(len(v) for (how, _), v in groups.items() if how.startswith("recvmsg"))
     local = len(live) - ipc
     print("still-open by origin: %d arrived over IPC (SCM_RIGHTS), %d opened locally"
