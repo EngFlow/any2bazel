@@ -233,6 +233,50 @@ class B. Doing only the first is measurable progress and not a fix: it is the sa
 as the `-fPIE` finding, where the change was necessary, verified, and still left the
 symptom alive by another route.
 
+### The fix that actually closes class A everywhere: release the fd, not just the callbacks
+
+The teardown patch above was **necessary and insufficient**, and I only learned that from
+Ulf's tree, not mine. With the upstream-equivalent teardown applied he still measured
+**97 sockets/min** — 81→823 sockets, 73→815 dead-peer over 458 s — while every local
+workload I could build was flat. Two instruments settled what was leaking:
+
+- `fd_census.py`: every leaked socket was **peer=DEAD**, i.e. RequestServer had already
+  closed its end. So these were completed requests, class A, on a tree carrying the class A
+  fix.
+- `fdtrace.c`: every leaked fd was a **received SCM_RIGHTS attachment** whose sender was
+  **RequestServer** (`SO_PEERCRED`; his log said `from=?(pid=2261433)` because a renderer's
+  landlock policy grants only `/proc/self`, and `ps -p 2261433` named it). That pins the fd
+  exactly: the per-request response pipe from `RequestServer::RequestPipe::create()`, handed
+  over by `request_started`.
+
+The gap is **ownership, not liveness**. Dropping the callbacks unpins the GC cycle, but the
+fd itself is released only by `~Request` — or by the `ReadStream` inside
+`m_internal_stream_data`, which the teardown merely *nulls*. So any surviving reference to
+the `Requests::Request` (the `RefPtr` in `Response`, a callback captured elsewhere, a
+different retention path on a different tree) keeps **one fd per completed request** alive
+even though the teardown ran. That is why the same patch zeroes the leak on my tree and
+leaves 97/min on his: we differ in what else holds a reference, not in what the teardown
+does.
+
+`patches/0004-*.patch` closes the fd explicitly, at the point the code has *already proven*
+the body is complete (the `user_finish_called` branch), deregistering the notifier before
+closing so the event loop is never left polling a closed descriptor. It does **not** close
+on `request_finished` alone — that truncates bodies (verified: blank pages), because
+RequestServer finishes writing long before WebContent drains the pipe.
+
+Measured A/B, same binary, same 200-completed-request workload, only this function differing:
+
+| variant | sockets after 200 completed requests | peer DEAD |
+|---|---|---|
+| clean | 208 | 203 |
+| `0004` applied | **6** | **0** |
+
+and body delivery is intact — `text=10 | stream=10/bytes=48000 | cancel=5` (plain fetch,
+incremental `ReadableStream` reads, mid-body `cancel()`), plus a rendered 800x600 screenshot.
+The generalisable lesson: **"the object is collectable" and "the fd is closed" are different
+claims**, and for a descriptor received over IPC only the second one is the bug. A fix
+verified through the object graph can pass while the resource still leaks.
+
 ### Why it takes the whole browser down, not just a tab
 
 `EMFILE` in WebContent surfaces through `MUST()` on an encode

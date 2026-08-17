@@ -371,3 +371,68 @@ def test_fdtrace_report_hides_the_tracers_own_frames():
     report = FDTRACE_REPORT.read_text()
     assert 'fn.startswith("record")' in report
     assert "skip_internal" in report
+
+
+def test_a_peer_named_question_mark_is_a_permission_failure_not_a_mystery():
+    """`from=?(pid=2261433)` meant landlock, and `ps` proved it was RequestServer.
+
+    Ulf's log named a real pid but no process: SO_PEERCRED is a syscall on a socket,
+    so it works, while /proc/<peer>/comm is a PATH -- and the renderer grants only
+    /proc/self via landlock (Services/RendererSandboxLinux.cpp). Falling back to
+    /proc/<pid>/cmdline or /proc/<pid>/exe would have failed identically, because the
+    barrier is per-path. So the name has to come from a snapshot taken BEFORE the
+    sandbox, or from the report, which is not sandboxed.
+    """
+    text = FDTRACE_C.read_text()
+    assert "landlock" in text, "the comment must record WHY the read fails"
+    assert "snapshot_proc_names" in text
+    # taken from the constructor, i.e. before main() installs the sandbox
+    ctor = text.split("__attribute__((constructor))", 1)[1]
+    assert "snapshot_proc_names();" in ctor.split("}", 1)[0]
+    # and the raw pid must be logged per connection so the report can finish the job
+    assert "# peer sock=%d pid=%d comm=%s via=%s" in text
+
+
+def test_the_report_names_a_pid_the_sandboxed_process_could_not():
+    report = _report_module()
+    # resolvable now: the report is not sandboxed
+    assert report.name_sender("?(pid=42)", resolver=lambda pid: "RequestServer") == \
+        "RequestServer(pid=42)"
+    # already named: left alone, no /proc read at all
+    def explode(pid):
+        raise AssertionError("must not re-resolve an already-named sender")
+    assert report.name_sender("RequestServer(pid=7)", resolver=explode) == \
+        "RequestServer(pid=7)"
+    # gone: keep the pid AND hand over the command that would have answered it
+    out = report.name_sender("?(pid=99)", resolver=lambda pid: None)
+    assert "pid=99" in out and "ps -p 99" in out
+
+
+def test_the_report_resolves_this_process_end_to_end():
+    """Not a mock: the report must name a pid that really exists."""
+    report = _report_module()
+    me = os.getpid()
+    resolved = report.resolve_pid(me)
+    assert resolved and resolved != "?"
+    assert report.name_sender("?(pid=%d)" % me).startswith(resolved)
+    assert report.resolve_pid(-1) is None
+
+
+def test_the_report_explains_an_unnamed_peer_instead_of_printing_a_bare_question_mark():
+    import tempfile
+    report = _report_module()
+    log = ("# fdtrace pid=1\n"
+           "# peer sock=13 pid=2261433 comm=? via=unresolved\n"
+           "+ fd=20 seq=1 how=recvmsg/SCM_RIGHTS sock=13 from=?(pid=2261433) "
+           "stack: 0x1100\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+        f.write(log)
+        path = f.name
+    peers = report.parse_peers(path)
+    assert peers == {13: (2261433, "?", "unresolved")}
+    _maps, _acq, live = report.parse(path)
+    assert live[1][3] == "?(pid=2261433)", "the raw field must survive parsing"
+    os.unlink(path)
+    text = FDTRACE_REPORT.read_text()
+    assert "landlocked to /proc/self" in text, \
+        "the reader must be told why, not just that it failed"

@@ -1,0 +1,72 @@
+diff --git a/Libraries/LibRequests/Request.cpp b/Libraries/LibRequests/Request.cpp
+index 6262425a..c25596b7 100644
+--- a/Libraries/LibRequests/Request.cpp
++++ b/Libraries/LibRequests/Request.cpp
+@@ -253,6 +253,10 @@ void Request::did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo
+     auto effective_network_error = m_body_delivery_error.has_value() ? m_body_delivery_error : network_error;
+     if (on_finish)
+         on_finish(total_size, timing_info, effective_network_error);
++    // A request that finished without stream data (stopped, or completed from cache
++    // before the callbacks were installed) has NOTHING owning the fd but ~Request.
++    if (!m_internal_stream_data)
++        release_response_fd();
+ }
+ 
+ void Request::did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache)
+@@ -281,6 +285,32 @@ void Request::did_transfer(Badge<RequestClient>)
+         on_stop();
+ }
+ 
++void Request::release_response_fd()
++{
++    // Close the response pipe received from RequestServer, at the moment its job is
++    // demonstrably over, instead of leaving it to the Request's destructor.
++    //
++    // The fd is one half of the socketpair RequestServer::RequestPipe::create() made
++    // and handed over with request_started(). Today WebContent releases it only when
++    // the Request itself dies (~Request, or the ReadStream inside
++    // m_internal_stream_data), so ANY extra reference to the Request -- e.g. the
++    // GC-root/RefPtr cycle -- pins one fd per completed request. Peer=DEAD in the
++    // census is exactly that: RequestServer already closed its end.
++    //
++    // Deregister the notifier BEFORE closing, or the event loop polls a closed fd.
++    if (m_internal_stream_data) {
++        if (m_internal_stream_data->read_notifier)
++            m_internal_stream_data->read_notifier->close();
++        m_internal_stream_data->read_stream = nullptr;
++    }
++    if (m_fd != -1) {
++        if (!m_fd_is_owned_by_read_stream)
++            (void)Core::System::close(m_fd);
++        m_fd = -1;
++        m_fd_is_owned_by_read_stream = false;
++    }
++}
++
+ void Request::defer_teardown()
+ {
+     if (m_internal_stream_data && m_internal_stream_data->read_notifier)
+@@ -327,6 +357,11 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+         if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
+             m_internal_stream_data->user_finish_called = true;
+             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
++            // Only now: the guard above proves EOF or that every reported byte was
++            // delivered, so closing cannot truncate a body. Closing on
++            // request_finished alone DOES truncate (blank pages) -- RequestServer
++            // finishes writing long before WebContent drains the pipe.
++            release_response_fd();
+         }
+     };
+ 
+diff --git a/Libraries/LibRequests/Request.h b/Libraries/LibRequests/Request.h
+index b4046fa8..cad0251c 100644
+--- a/Libraries/LibRequests/Request.h
++++ b/Libraries/LibRequests/Request.h
+@@ -133,6 +133,7 @@ private:
+     void attach_read_stream();
+     void set_up_internal_stream_data(DataReceived on_data_available);
+     void defer_teardown();
++    void release_response_fd();
+ 
+     WeakPtr<RequestClient> m_client;
+     u64 m_request_id { 0 };

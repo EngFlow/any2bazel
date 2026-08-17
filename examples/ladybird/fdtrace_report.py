@@ -24,6 +24,34 @@ import sys
 
 MAP_RE = re.compile(
     r"^# map ([0-9a-f]+)-([0-9a-f]+) \S+ ([0-9a-f]+) \S+ \d+\s+(/.*\S)\s*$")
+PEER_RE = re.compile(
+    r"^# peer sock=(-?\d+) pid=(-?\d+) comm=(\S*) via=(\S+)\s*$")
+
+
+def resolve_pid(pid):
+    """Name a pid from OUTSIDE the sandboxed process, which can read /proc.
+
+    A renderer's landlock policy grants only /proc/self, so the tracer inside it
+    cannot read a sibling's /proc/<pid>/comm and logs `?`. The report does not run
+    under that policy, so it can finish the job -- as long as the process is still
+    alive, which it usually is: RequestServer outlives the WebContent it serves.
+    """
+    if pid is None or pid < 0:
+        return None
+    for name, transform in (("comm", lambda t: t.strip()),
+                            ("cmdline", lambda t: os.path.basename(
+                                t.split("\0")[0]) if t.strip("\0") else "")):
+        try:
+            with open("/proc/%d/%s" % (pid, name)) as f:
+                value = transform(f.read())
+        except OSError:
+            continue
+        if value:
+            return value
+    try:
+        return os.path.basename(os.readlink("/proc/%d/exe" % pid))
+    except OSError:
+        return None
 
 
 class Maps:
@@ -51,6 +79,50 @@ class Maps:
             return None
         # addr2line on a shared object wants the offset within the FILE
         return path, addr - start + offset
+
+
+SENDER_RE = re.compile(r"^(?P<name>.*)\(pid=(?P<pid>-?\d+)\)$")
+
+
+def parse_peers(path):
+    """{sock: (pid, comm, via)} from the `# peer` header lines, if present.
+
+    `via=snapshot` means the tracer could not read /proc at attachment time (the
+    renderer's sandbox) and fell back to its pre-sandbox snapshot; `via=unresolved`
+    means even that missed and only the pid is known.
+    """
+    peers = {}
+    with open(path) as f:
+        for line in f:
+            if not line.startswith("# peer "):
+                continue
+            m = PEER_RE.match(line.rstrip("\n"))
+            if m:
+                peers[int(m.group(1))] = (int(m.group(2)), m.group(3), m.group(4))
+    return peers
+
+
+def name_sender(sender, resolver=resolve_pid):
+    """Turn a logged `NAME(pid=N)` into the best name available NOW.
+
+    The tracer logs `?` when the sandbox denied /proc/<pid>/comm. That is a
+    permission failure, not an unknown process, and it is recoverable here because
+    the report is not sandboxed -- so an unnamed sender gets one more chance from
+    outside, and if the process is gone the reader is told the exact command that
+    would have answered it rather than being left with a bare `?`.
+    """
+    if not sender:
+        return sender
+    m = SENDER_RE.match(sender)
+    if not m:
+        return sender
+    name, pid = m.group("name"), int(m.group("pid"))
+    if name and name != "?":
+        return sender
+    resolved = resolver(pid)
+    if resolved:
+        return "%s(pid=%d)" % (resolved, pid)
+    return "?(pid=%d, gone -- was `ps -p %d -o comm=`)" % (pid, pid)
 
 
 def parse(path):
@@ -165,10 +237,15 @@ def main(argv=None):
 
     groups = collections.defaultdict(list)
     senders = collections.defaultdict(list)
+    # Cache per sender string: a `?` costs a /proc read, and there are thousands of
+    # leaked fds sharing a handful of connections.
+    named = {}
     for seq, (fd, how, addrs, sender) in live.items():
         groups[(how, tuple(addrs))].append((seq, fd))
         if sender:
-            senders[sender].append(fd)
+            if sender not in named:
+                named[sender] = name_sender(sender)
+            senders[named[sender]].append(fd)
 
     print("fdtrace: %d acquisitions, %d still open, %d distinct call sites"
           % (len(acquisitions), len(live), len(groups)))
@@ -185,6 +262,20 @@ def main(argv=None):
     # stacks cannot tell two subsystems apart. A response pipe from RequestServer is
     # the fd under investigation; one from Compositor or ImageDecoder is not.
     if senders:
+        # If the tracer could not name a peer itself, say so once and say why --
+        # otherwise a `?` reads as "unknown process" when it actually means "the
+        # renderer's landlock policy grants /proc/self only".
+        unresolved = [(sock, pid, via) for sock, (pid, _comm, via)
+                      in sorted(parse_peers(args.log).items())
+                      if via in ("snapshot", "unresolved")]
+        if unresolved:
+            print("note: %d connection(s) could not be named INSIDE the process "
+                  "(/proc is" % len(unresolved))
+            print("      landlocked to /proc/self in the renderer); resolved here "
+                  "from outside instead.")
+            for sock, pid, via in unresolved:
+                print("      sock=%d pid=%d (%s)" % (sock, pid, via))
+            print()
         print("still-open IPC attachments BY SENDER:")
         for name, fds in sorted(senders.items(), key=lambda kv: -len(kv[1])):
             print("  %6d from %s   e.g. fd %s" % (

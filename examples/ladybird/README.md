@@ -812,6 +812,18 @@ Honest inventory of what stops this from being a clone-and-build.
    with a live peer survives it. Both are written up with reproductions in
    [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md).
 
+   A **fifth** is the other half of the completed-request class, and it only showed
+   up on a tree that was not mine:
+   [`patches/0004-requests-release-response-fd-on-completion.patch`](patches/0004-requests-release-response-fd-on-completion.patch).
+   With `0003`'s teardown applied, Ulf still measured **97 leaked sockets/min**, all
+   `peer=DEAD` and all sent by RequestServer — because dropping the callbacks unpins
+   the GC cycle but does not *close the descriptor*: the response pipe is released
+   only by `~Request`, so any other reference to the request retains one fd per
+   completed request. `0004` closes it where the body is already proven complete.
+   Measured A/B on 200 completed requests: **208 sockets (203 dead) → 6 (0 dead)**,
+   with body delivery intact. "Collectable" and "closed" are different claims, and
+   for an fd received over IPC only the second one is the bug.
+
    Diagnose a running browser with [`fd_census.py`](fd_census.py), which needs no
    patch and no particular tree — `python3 fd_census.py --find WebContent`, then
    `python3 fd_census.py <pid> --watch 30`. Since upstream has landed its own fix,

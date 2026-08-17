@@ -1,0 +1,21 @@
+# The EFFECT this patch must have, as extended regexes over the file it touches
+# (Libraries/LibRequests/Request.cpp). Checked only when the patch's exact bytes are
+# NOT in the tree, so an equivalent fix -- upstream's or anyone's -- counts as
+# "already fixed" rather than "missing". Same reasoning as 0003's .effect-grep:
+# `git apply --check -R` proves my bytes, not the fix.
+#
+# The effect: the response fd received from RequestServer must be closed WHERE THE
+# BODY IS PROVEN COMPLETE, not merely when the Request object dies. 0003 dropped the
+# callbacks (which unpins the GC cycle); this closes the fd even while something else
+# still holds a reference to the Request -- the case that survived 0003 on Ulf's
+# tree at 97 fds/min.
+#
+# The window matters, for the same reason as 0003: a bare close/notifier call
+# appears elsewhere in this file (~Request, attach_read_stream), so a whole-file grep
+# would pass on an unpatched tree. Anchor on the completion branch and require the
+# release within the following few lines. NOTE: apply_overlay.sh honours only the
+# FIRST @window, so keep this to one window -- a second would be silently checked
+# against the first window's slice.
+@window 12 has_received_all_reported_bytes =
+user_finish_called = true
+release_response_fd\(\)|read_notifier->close\(\)|System::close\(m_fd\)

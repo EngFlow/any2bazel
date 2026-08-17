@@ -38,6 +38,7 @@
  */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -131,6 +132,77 @@ static struct {
     char comm[32];
 } g_peer_cache[MAX_PEER_CACHE];
 
+/* A snapshot of pid -> comm taken at LOAD TIME, which is the only moment a
+ * sandboxed process can take one.
+ *
+ * WHY THIS EXISTS -- the bug that produced `from=?(pid=2261433)`:
+ * WebContent installs a landlock policy that grants exactly `/proc/self` and no
+ * other path under /proc (Services/RendererSandboxLinux.cpp). So once the sandbox
+ * is up, reading /proc/<peer-pid>/comm fails with EACCES -- and so would
+ * /proc/<pid>/cmdline and /proc/<pid>/exe, because the barrier is per-path, not
+ * per-file. SO_PEERCRED still works, since it is a syscall on a socket rather than
+ * a path, which is why the log had a real pid and the name `?`.
+ *
+ * The constructor runs before main(), hence before the sandbox is installed, so a
+ * snapshot taken here can still name the siblings that already exist -- and the
+ * report resolves anything else from outside the sandbox. Every peer named `?`
+ * before this was a *permission* failure being read as an unknown process. */
+#define MAX_PROC_SNAPSHOT 8192
+static struct proc_name {
+    int pid;
+    char comm[32];
+} *g_proc_snapshot;
+static int g_proc_snapshot_count;
+
+static int read_comm(int pid, char *out, size_t out_size)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    int ok = fgets(out, (int)out_size, f) != NULL;
+    fclose(f);
+    if (!ok)
+        return 0;
+    char *nl = strchr(out, '\n');
+    if (nl)
+        *nl = 0;
+    return out[0] != 0;
+}
+
+static void snapshot_proc_names(void)
+{
+    /* Best-effort and allocation is fine here: this is load time, single
+     * threaded, long before the first IPC message. */
+    g_proc_snapshot = calloc(MAX_PROC_SNAPSHOT, sizeof(*g_proc_snapshot));
+    if (!g_proc_snapshot)
+        return;
+    DIR *d = opendir("/proc");
+    if (!d)
+        return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) && g_proc_snapshot_count < MAX_PROC_SNAPSHOT) {
+        if (ent->d_name[0] < '1' || ent->d_name[0] > '9')
+            continue;
+        int pid = atoi(ent->d_name);
+        struct proc_name *slot = &g_proc_snapshot[g_proc_snapshot_count];
+        if (read_comm(pid, slot->comm, sizeof(slot->comm))) {
+            slot->pid = pid;
+            g_proc_snapshot_count++;
+        }
+    }
+    closedir(d);
+}
+
+static const char *snapshot_lookup(int pid)
+{
+    for (int i = 0; i < g_proc_snapshot_count; i++)
+        if (g_proc_snapshot[i].pid == pid)
+            return g_proc_snapshot[i].comm;
+    return NULL;
+}
+
 static void peer_of(int sock, int *out_pid, const char **out_comm)
 {
     *out_pid = -1;
@@ -144,19 +216,31 @@ static void peer_of(int sock, int *out_pid, const char **out_comm)
         g_peer_cache[sock].pid = -1;
         strcpy(g_peer_cache[sock].comm, "?");
         if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
-            g_peer_cache[sock].pid = (int)cred.pid;
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/%d/comm", (int)cred.pid);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                if (fgets(g_peer_cache[sock].comm,
-                          (int)sizeof(g_peer_cache[sock].comm), f)) {
-                    char *nl = strchr(g_peer_cache[sock].comm, '\n');
-                    if (nl)
-                        *nl = 0;
+            int pid = (int)cred.pid;
+            const char *how = "comm";
+            g_peer_cache[sock].pid = pid;
+            if (!read_comm(pid, g_peer_cache[sock].comm,
+                           sizeof(g_peer_cache[sock].comm))) {
+                /* Denied by the sandbox (or the peer already exited): fall back to
+                 * the pre-sandbox snapshot. */
+                const char *name = snapshot_lookup(pid);
+                how = "snapshot";
+                if (name) {
+                    snprintf(g_peer_cache[sock].comm,
+                             sizeof(g_peer_cache[sock].comm), "%s", name);
+                } else {
+                    strcpy(g_peer_cache[sock].comm, "?");
+                    how = "unresolved";
                 }
-                fclose(f);
             }
+            /* One line per CONNECTION, so the report can resolve the pid itself --
+             * from outside the sandbox, where /proc is readable -- even when this
+             * process could not. */
+            if (g_out)
+                fprintf(g_out, "# peer sock=%d pid=%d comm=%s via=%s\n", sock, pid,
+                        g_peer_cache[sock].comm, how);
+        } else if (g_out) {
+            fprintf(g_out, "# peer sock=%d pid=-1 comm=? via=no-peercred\n", sock);
         }
     }
     *out_pid = g_peer_cache[sock].pid;
@@ -213,6 +297,9 @@ static void forget(int fd)
 __attribute__((constructor)) static void fdtrace_init(void)
 {
     trace_open();
+    /* Before main(), so before the renderer's landlock policy narrows /proc down to
+     * /proc/self. After that point no peer name can be read from inside. */
+    snapshot_proc_names();
 }
 
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)

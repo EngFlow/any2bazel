@@ -256,3 +256,45 @@ def test_the_documented_overlay_file_count_matches_the_overlay():
     assert claims == {str(actual)}, \
         "README claims %s overlay files, the overlay has %d" % (
             sorted(claims), actual)
+
+
+def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete():
+    """The second half of the fd leak: the fd outlives the callbacks.
+
+    0003 drops the callbacks on completion, which unpins the GC cycle -- and on my
+    machine that took 143 leaked sockets to 0. On Ulf's tree it did not: he measured
+    97 sockets/min STILL leaking with the upstream-equivalent teardown applied,
+    every one peer=DEAD (RequestServer had already closed its end) and every one
+    sent by RequestServer (SO_PEERCRED, once `ps` named pid 2261433).
+
+    The reason is ownership: the response fd is released only by ~Request (or by the
+    ReadStream inside m_internal_stream_data), so ANY surviving reference to the
+    Request keeps one fd per completed request alive -- dropping the callbacks is
+    not the same as closing the fd. 0004 closes it explicitly at the point the code
+    has already proven the body is complete.
+
+    Measured A/B, same binary, same 200-completed-request workload:
+      clean: 208 sockets, 203 peer=DEAD
+      fixed:   6 sockets,   0 peer=DEAD
+    """
+    patch = PATCHES / "0004-requests-release-response-fd-on-completion.patch"
+    assert patch.exists()
+    text = patch.read_text()
+    # the notifier must be deregistered before the fd is closed, or the event loop
+    # is left polling a closed descriptor
+    body = text[text.index("release_response_fd"):]
+    assert body.index("read_notifier->close()") < body.index("m_fd = -1"), \
+        "deregister the notifier BEFORE closing the fd"
+    # it must NOT close on request_finished alone: RequestServer finishes writing
+    # long before WebContent drains the pipe, and closing there truncates bodies
+    # (verified once as blank pages)
+    assert "has_received_all_reported_bytes" in text or "user_finish_called" in text
+    effect = patch.with_suffix(".effect-grep")
+    assert effect.exists(), "carried until upstream fixes it -> needs an effect check"
+    lines = [ln for ln in effect.read_text().splitlines()
+             if ln.strip() and not ln.startswith("#")]
+    assert any(ln.startswith("@window ") for ln in lines)
+    # apply_overlay.sh takes only the FIRST @window; a second would be checked
+    # against the wrong slice, so the file must not carry one.
+    assert len([ln for ln in lines if ln.startswith("@window ")]) == 1, \
+        "apply_overlay.sh honours one @window only"
