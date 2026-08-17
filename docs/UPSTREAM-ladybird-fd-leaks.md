@@ -323,6 +323,112 @@ evidently not the whole of what Ulf is seeing, and the next measurement has to c
 his machine with `--all`, because I have now falsified every workload I can construct
 locally — including the cache paths I had never tested.
 
+### Correction: it IS WebContent, and the instrument now reads its own build
+
+Ulf's next census settled the process question against me. His `--all` run (pid 19291,
+4880 s, 4386 samples, flags
+`--site-isolation=top-level --enable-http-memory-cache`):
+
+```
+fds: total=7514  socket:=7487
+sockets: 7487  peer DEAD=7479  peer ALIVE=6  unknown=2
+retained(>=30s)=7436, of retained: peer DEAD=7428
+growth over 4880s: sockets +7458 (+91.7/min), all peer DEAD
+```
+
+So the accumulation is in **WebContent**, it is **class A** (peer=DEAD = completed
+requests), and 7428 of 7436 retained fds are *not* in flight. The `--all` detour above
+was a wrong turn: censusing every process was the right instrument to build, and it
+answered "WebContent", which is where I had been looking all along.
+
+But the number I could not interpret was the rate: **91.7/min against 97/min measured
+before the fix**. That is equally consistent with two opposite conclusions —
+
+- `0004` does not address this leak, or
+- `0004` was not in that binary.
+
+and they demand opposite next steps. My instinct was to *ask*. That would have been
+another round trip, about a build that had already happened, answered from memory —
+and it is the fourth time in this investigation that a number arrived without the
+identity of the code that produced it. **A leak rate without its build provenance is
+not a measurement anyone can reproduce, including me.**
+
+The answer was never in anyone's memory: it is in the binary, and the binary is still
+mapped by the process being censused. `fd_census.py` now reads it:
+
+```
+$ python3 fd_census.py <pid> --build
+build: HAS 0004 (release the response fd on completion)
+build: HAS 0003 (tear down the request when the body is delivered)
+```
+
+and the same block is printed next to every verdict, because the verdict is only
+interpretable together with it. Implementation: a pure-Python ELF reader over the
+`.dynstr`/`.strtab` of the executable and every mapped `.so` (no binutils dependency
+on someone else's machine), looking for `Requests::Request::release_response_fd` and
+`::defer_teardown`. Statically linked builds — Ulf's is one — are covered by probing
+the executable when no `lagom-requests` library is mapped.
+
+The load-bearing part is the **negative control**. `set_up_internal_stream_data` exists
+in every build of that file, patched or not; if it is absent, the symbols were not
+readable at all (stripped, LTO'd, or the code is somewhere we did not look) and the
+probe reports *"cannot tell"* rather than *"fix absent"*. Without that control, a
+stripped binary would read as an unpatched one, which would aim the next round of work
+at exactly the wrong code — the same class of error as the two method mistakes above,
+so it gets a guard rather than a caveat.
+
+Verified end-to-end against two genuinely different builds of the same library: with
+`release_response_fd` renamed away and relinked, the probe reports `does NOT have 0004`
+while the control stays present; restored and relinked, `HAS 0004`. A non-Ladybird
+process reports "cannot tell". Both directions are tested, because a probe that can
+only confirm a fix is present is useless for the question that prompted it.
+
+One more thing the probe caught on the way. Running the full census against a
+*healthy* browser to check the new block, the verdict line read
+`mixed DEAD/ALIVE -> both classes present` for 0 dead and 5 live sockets: both
+classification branches required a 10x majority, so zero-of-a-class fell between them
+and got reported as a class that had no members — while also reading the ordinary IPC
+mesh as a leak. Fixed with explicit `dead == 0` / `alive == 0` cases. It only surfaced
+because the healthy case finally got looked at; a verdict that is wrong on healthy
+input will be believed when it is wrong on broken input too.
+
+### Still open: two retention paths `0004` does not cover
+
+Reading the ownership chain for the class-A case again, with "what else holds a
+`Requests::Request` after completion" as the question, turns up two paths that are
+consistent with completed requests (peer=DEAD) retaining an fd:
+
+1. **`Response::m_request_server_request` holds the request by `RefPtr`**
+   (`Fetch/Infrastructure/HTTP/Responses.h:68`), and `clone()` *copies that struct*
+   (`Responses.cpp:209-210`) — so every clone of a response is another owner of the
+   same `Requests::Request`. `0004` closes the fd from inside the completion branch, so
+   it should still win for any request that reaches that branch; what it cannot cover
+   is a request that never does.
+2. **Paused body delivery.** A document navigation starts with
+   `set_body_delivery_paused(true)` (`Fetching.cpp:2340`) and only
+   `resume_body_delivery()` re-enables the notifier. The completion branch in
+   `set_up_internal_stream_data` is driven by the read notifier and `request_done`; a
+   request whose delivery is paused and never resumed never reaches
+   `user_finish_called`, so `release_response_fd()` is never called on it — while
+   RequestServer, having finished writing, has already closed its end. **That produces
+   exactly the observed signature: peer=DEAD, retained, and unaffected by `0004`.**
+   `LocalNavigable` has ~8 separate resume/stop call sites for this
+   (`:488, :517, :564, :2271, :2299, :2310, :2328` plus
+   `stop_or_resume_response_body_delivery`), i.e. it is a
+   "every early return must remember to resume" contract — the shape that leaks on the
+   path nobody enumerated. Site isolation (`--site-isolation=top-level`, on in Ulf's
+   run and not in my earlier ones) adds cross-process navigation paths through exactly
+   this code.
+
+Neither is confirmed. What makes (2) the better lead is that it is the first mechanism
+found that explains the *combination* Ulf measured — completed-and-closed by the peer,
+retained, and indifferent to a fix that works locally — rather than only part of it.
+The memory cache, which I suspected next because `--enable-http-memory-cache` was on
+his command line and I had never tested it, is **ruled out** by reading
+`HTTP::MemoryCache::Entry` (`Libraries/LibHTTP/Cache/MemoryCache.h:23`): it stores
+status, headers and `Core::ImmutableBytes`, and never holds a `Requests::Request`, so
+it cannot retain a descriptor.
+
 ### Why it takes the whole browser down, not just a tab
 
 `EMFILE` in WebContent surfaces through `MUST()` on an encode

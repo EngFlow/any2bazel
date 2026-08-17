@@ -827,8 +827,15 @@ Honest inventory of what stops this from being a clone-and-build.
    for an fd received over IPC only the second one is the bug.
 
    Diagnose a running browser with [`fd_census.py`](fd_census.py), which needs no
-   patch and no particular tree — `python3 fd_census.py --find WebContent`, then
-   `python3 fd_census.py <pid> --watch 30`. Since upstream has landed its own fix,
+   patch and no particular tree — `python3 fd_census.py --all --watch 30` ranks every
+   browser process by fd *growth*, so the data names the leaking process instead of
+   your hypothesis naming it. Each report also states **which fd fixes the running
+   binary contains** (`--build` for that alone), read out of the process's own mapped
+   ELF symbols: a leak rate is uninterpretable without it, since "still leaking at
+   92/min" means "the fix does not work" or "the fix was not in this build" and those
+   need opposite next steps. It reports *"cannot tell"* rather than "fix absent" when
+   the symbols are unreadable — a stripped binary must not read as an unpatched one.
+   Since upstream has landed its own fix,
    `--verify` also accepts an equivalent fix in place of our exact bytes: a patch we
    carry only until upstream fixes it has an `.effect-grep` beside it, and verify
    falls back to asking whether the *effect* is present before reporting the patch

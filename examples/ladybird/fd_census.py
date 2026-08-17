@@ -11,6 +11,8 @@ outside, so this computes it from /proc and ss against a RUNNING process.
     python3 fd_census.py <pid>                  # one census
     python3 fd_census.py <pid> --watch 30       # every 30s until interrupted
     python3 fd_census.py --find WebContent      # locate the pid yourself-free
+    python3 fd_census.py --all --watch 30       # rank EVERY browser process by growth
+    python3 fd_census.py <pid> --build          # which fd fixes are IN this binary
 
 What it reports, and why each column exists:
 
@@ -38,12 +40,20 @@ What it reports, and why each column exists:
   peer process                   who holds the other end, when it is alive. Names
                                  the producer instead of guessing.
 
+  build                          WHICH FIX the running code contains, read out of the
+                                 process's own mapped binaries. A leak rate is
+                                 uninterpretable without it: "still leaking at
+                                 92/min" means "the fix does not work" or "the fix
+                                 was not in this build", and those need opposite next
+                                 steps. Reports "cannot tell" rather than guessing.
+
 Exit status is 0 for a census, 1 if it could not read the process.
 """
 
 import argparse
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -67,6 +77,153 @@ def read_fd_targets(pid):
         except (OSError, ValueError):
             continue  # closed under us, or not a number
     return targets
+
+
+# The symbols that say which fix a RUNNING browser was built with. Read out of the
+# binaries the process has mapped, so the census answers "was the patch in it?"
+# instead of asking the person running it.
+#
+# WHY THIS EXISTS. Ulf reported ~92 leaked fds/min from a WebContent I could not tell
+# had my patch in it, and the rate was close enough to the pre-patch 97/min to be
+# consistent with EITHER "the patch is not in that binary" or "the patch is
+# irrelevant to this leak". Those two demand opposite next moves, and I could not
+# separate them, so the next step was going to be a question -- another round trip,
+# answered from memory, about a build that had already happened. But the answer is
+# not in anyone's memory: it is in the binary, and the binary is still mapped by the
+# process being censused. A measurement that reports a leak rate without reporting
+# WHICH CODE was running is not reproducible by anyone, including me.
+#
+# Each entry: symbol -> (what its presence means, what its absence means).
+FIX_SYMBOLS = (
+    # 0004: closes the response fd where the body is proven complete.
+    ("release_response_fd", "0004 (release the response fd on completion)"),
+    # 0003 / upstream's equivalent: drops the callbacks so the Request is collectable.
+    ("defer_teardown", "0003 (tear down the request when the body is delivered)"),
+)
+
+# Present in EVERY build of this library, patched or not. Without it, a "symbol not
+# found" result means the symbols were not readable at all (stripped, LTO-inlined,
+# statically linked into a binary we did not look at) -- NOT that the fix is missing.
+# Reporting "fix absent" for an unreadable binary would be a false negative that
+# sends the next round of work in exactly the wrong direction, which is the error
+# this whole probe exists to prevent.
+CONTROL_SYMBOL = "set_up_internal_stream_data"
+
+# The Request code lives here; when Ladybird is built statically it is in the
+# executable instead, so the executable is always probed too.
+FIX_LIBRARY_HINT = "lagom-requests"
+
+
+def elf_symbol_names(path):
+    """Every symbol name in an ELF file's string tables, or None if unreadable.
+
+    Pure Python on purpose: this runs on someone else's machine, where `nm` and
+    `readelf` are a binutils install I should not require to answer a question the
+    file already contains. Reads .dynstr/.strtab wholesale rather than walking symbol
+    tables -- the question is only ever "does this name appear", and substring
+    matching a string table cannot report a name that is not in the file.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(64)
+            if len(header) < 64 or header[:4] != b"\x7fELF":
+                return None
+            if header[4] != 2:  # not ELF64; nothing here is 32-bit
+                return None
+            shoff, = struct.unpack_from("<Q", header, 0x28)
+            shentsize, shnum, shstrndx = struct.unpack_from("<HHH", header, 0x3A)
+            if not shnum or shstrndx >= shnum:
+                return None
+            f.seek(shoff)
+            table = f.read(shentsize * shnum)
+            if len(table) < shentsize * shnum:
+                return None
+
+            def entry(i):
+                off = i * shentsize
+                name_off, = struct.unpack_from("<I", table, off)
+                sec_off, sec_size = struct.unpack_from("<QQ", table, off + 0x18)
+                return name_off, sec_off, sec_size
+
+            _, str_off, str_size = entry(shstrndx)
+            f.seek(str_off)
+            shstrtab = f.read(str_size)
+
+            blob = b""
+            for i in range(shnum):
+                name_off, sec_off, sec_size = entry(i)
+                end = shstrtab.find(b"\0", name_off)
+                name = shstrtab[name_off:end if end >= 0 else None]
+                if name in (b".dynstr", b".strtab") and sec_size < 64 * 1024 * 1024:
+                    f.seek(sec_off)
+                    blob += f.read(sec_size)
+            return blob or None
+    except (OSError, struct.error, ValueError):
+        return None
+
+
+def mapped_binaries(pid):
+    """The executable plus every mapped .so, as real paths we can open."""
+    paths = []
+    exe = "/proc/%d/exe" % pid
+    try:
+        paths.append(os.path.realpath(exe))
+    except OSError:
+        pass
+    try:
+        with open("/proc/%d/maps" % pid) as f:
+            for line in f:
+                parts = line.split(None, 5)
+                if len(parts) < 6:
+                    continue
+                path = parts[5].strip()
+                if path.startswith("/") and path not in paths:
+                    paths.append(path)
+    except OSError:
+        pass
+    return paths
+
+
+def probe_fixes(pid):
+    """Which fd fixes are compiled into the code this pid is RUNNING.
+
+    Returns (findings, note). findings maps a description to True/False; note is set
+    when the answer is "cannot tell", so a caller never prints a missing fix it did
+    not actually establish is missing.
+    """
+    candidates = [p for p in mapped_binaries(pid) if FIX_LIBRARY_HINT in p]
+    # Statically linked builds (Ulf's is one) have no such library: the code is in
+    # the executable. Probe it rather than reporting nothing.
+    if not candidates:
+        candidates = mapped_binaries(pid)[:1]
+
+    blob = b""
+    for path in candidates:
+        names = elf_symbol_names(path)
+        if names:
+            blob += names
+    if not blob:
+        return {}, ("could not read symbols from this process's binaries "
+                    "(no readable ELF among %d mapped paths)" % len(candidates))
+    if CONTROL_SYMBOL.encode() not in blob:
+        return {}, ("symbols unreadable: the control symbol %s is absent too, so a "
+                    "missing fix here would prove nothing (stripped binary, LTO, or "
+                    "the code is in a binary not probed)" % CONTROL_SYMBOL)
+    return ({desc: (sym.encode() in blob) for sym, desc in FIX_SYMBOLS}, None)
+
+
+def fix_lines(pid):
+    """The build-provenance block: what code is actually running."""
+    findings, note = probe_fixes(pid)
+    if note:
+        return ["build: %s" % note]
+    lines = []
+    for desc, present in findings.items():
+        lines.append("build: %s %s" % ("HAS" if present else "does NOT have", desc))
+    if not all(findings.values()):
+        lines.append("  -> a leak measured on this binary does not test the missing "
+                     "fix. Rebuild with it before concluding the fix does not work.")
+    return lines
 
 
 def categorize(target):
@@ -289,6 +446,11 @@ class Census:
                                      sorted(plumbing.items(), key=lambda kv: -kv[1])))
 
         out.append(verdict(len(dead), len(alive)))
+        # LAST, next to the verdict, because the verdict is only interpretable
+        # together with which code produced it: "still leaking at 92/min" means
+        # "the fix does not work" or "the fix was not in the binary" depending on
+        # this line alone, and the two need opposite next steps.
+        out.extend(fix_lines(self.pid))
         return "\n".join(out)
 
 
@@ -340,6 +502,24 @@ def verdict(dead, alive):
     """Say what the counts MEAN, so the reply is a diagnosis and not a table."""
     if dead + alive == 0:
         return "verdict: no unix sockets to classify."
+    # A class with ZERO members is not "present". The ratio tests below both need a
+    # 10x majority, so a healthy process (0 dead, ~5 live IPC sockets) fell through
+    # to "mixed DEAD/ALIVE -> both classes present" -- naming a class with no members
+    # and reading the ordinary IPC mesh as a leak. Observed on a working browser
+    # while testing something else, which is the only reason it was caught: a verdict
+    # that is wrong on healthy input will be believed when it is wrong on broken
+    # input too.
+    if dead == 0:
+        if alive <= IPC_MESH_MAX + 1:
+            return ("verdict: no retained corpses (0 peer=DEAD) and only %d live "
+                    "socket(s) -- that is the normal IPC mesh, not a leak. Load "
+                    "pages and watch the RATE before concluding anything." % alive)
+        return ("verdict: 0 peer=DEAD, %d peer=ALIVE -> nothing completed is being "
+                "retained; any leak here is class B (the producer still holds its "
+                "end, so on_finish never ran)." % alive)
+    if alive == 0:
+        return ("verdict: all %d socket(s) peer=DEAD -> completed requests retained "
+                "(class A), with no in-flight class B component." % dead)
     if dead > 10 * max(alive, 1):
         return ("verdict: overwhelmingly peer=DEAD -> completed requests retained "
                 "(class A). The teardown fix addresses exactly this; if it is "
@@ -406,6 +586,12 @@ def watch_all(interval, retained_after):
                   "is accumulating THERE, whatever my hypothesis said."
                   % ", ".join("%s(pid=%d) %+.1f/min" % (r[3], r[2], r[0])
                               for r in leakers))
+            # Report the provenance of the growing process only: a rate without the
+            # code that produced it cannot distinguish "the fix failed" from "the
+            # fix was not in this build".
+            for r in leakers:
+                for line in fix_lines(r[2]):
+                    print("     %s" % line)
         sys.stdout.flush()
         time.sleep(interval)
 
@@ -423,7 +609,17 @@ def main(argv=None):
                         "leaks (i.e. always, at first)")
     p.add_argument("--retained-after", type=float, default=30.0,
                    help="an fd older than this is retained, not in flight")
+    p.add_argument("--build", action="store_true",
+                   help="report only which fd fixes are compiled into the running "
+                        "process, and exit -- no leak measurement needed")
     args = p.parse_args(argv)
+
+    if args.build:
+        if args.pid is None:
+            p.error("--build needs a pid")
+        for line in fix_lines(args.pid):
+            print(line)
+        return 0
 
     if args.find:
         for count, pid, comm in find_pids(args.find):

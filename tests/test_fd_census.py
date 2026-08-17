@@ -471,3 +471,157 @@ def test_find_browser_pids_sees_this_process_when_it_matches():
     for pid, comm in pids.items():
         assert os.path.isdir("/proc/%d" % pid)
         assert comm
+
+
+# ---------------------------------------------------------------------------
+# Build provenance: which fix is actually IN the process being measured.
+#
+# These exist because of the round trip that made them necessary. Ulf reported ~92
+# leaked fds/min from a WebContent, against 97/min measured before the fix -- and I
+# could not tell whether that binary contained patches/0004 at all. "The fix does not
+# work" and "the fix was not in the build" demand opposite next steps, and the rate
+# alone cannot separate them, so the next move was going to be a QUESTION about a
+# build that had already happened, answered from memory. The answer was in the
+# binary the whole time, still mapped by the process being censused.
+#
+# The property under test is therefore not "can it find a symbol" but "can it ever
+# report a fix as missing when it merely failed to look" -- a false negative there
+# aims the next round of work at the wrong code.
+# ---------------------------------------------------------------------------
+
+
+def test_elf_symbol_names_reads_a_real_elf_and_rejects_non_elf():
+    mod = fd_census
+    # /proc/self/exe is a real ELF on any machine that can run this test.
+    blob = mod.elf_symbol_names(os.path.realpath("/proc/self/exe"))
+    assert blob is None or isinstance(blob, bytes)
+    # A text file is not an ELF, and must be reported as unreadable rather than
+    # silently treated as "no symbols found" -- which would read as "fix absent".
+    assert mod.elf_symbol_names(str(SCRIPT)) is None
+    assert mod.elf_symbol_names("/nonexistent/definitely/not/here") is None
+
+
+def test_probe_reports_cannot_tell_rather_than_fix_absent(tmp_path=None):
+    """The load-bearing case: no control symbol => no claim about the fix.
+
+    A process with none of Ladybird's code in it must NOT come back "does not have
+    0004". Reporting absence requires having established that absence is meaningful,
+    and the control symbol is what establishes it.
+    """
+    mod = fd_census
+    findings, note = mod.probe_fixes(os.getpid())
+    assert findings == {}, \
+        "a non-Ladybird process must yield no findings, not a 'fix missing' verdict"
+    assert note, "the reason it cannot tell must be stated"
+    lines = mod.fix_lines(os.getpid())
+    assert len(lines) == 1
+    assert "does NOT have" not in lines[0], \
+        "must never claim a fix is missing when the symbols were unreadable"
+
+
+def test_control_symbol_is_present_in_both_patched_and_unpatched_builds():
+    """The control must be code neither patch adds, or it proves nothing.
+
+    Both patches touch Request.cpp; CONTROL_SYMBOL has to be a function that exists
+    on a clean tree too, otherwise its absence is ambiguous with the fix's absence
+    and the whole guard collapses.
+    """
+    mod = fd_census
+    assert mod.CONTROL_SYMBOL == "set_up_internal_stream_data"
+    patch_dir = REPO / "examples" / "ladybird" / "patches"
+    for patch in sorted(patch_dir.glob("000[34]*.patch")):
+        body = patch.read_text()
+        added = [l for l in body.splitlines() if l.startswith("+")]
+        assert not any("void Request::%s" % mod.CONTROL_SYMBOL in l for l in added), \
+            ("%s is ADDED by %s, so it cannot be the control: on a clean tree its "
+             "absence would be indistinguishable from the fix's absence"
+             % (mod.CONTROL_SYMBOL, patch.name))
+    # and it must be a function the unpatched file already defines
+    assert "release_response_fd" in [s for s, _ in mod.FIX_SYMBOLS]
+
+
+def test_fix_lines_names_both_patches_and_warns_when_one_is_missing():
+    mod = fd_census
+    descs = dict(mod.FIX_SYMBOLS)
+    assert "release_response_fd" in descs and "defer_teardown" in descs
+    assert "0004" in descs["release_response_fd"]
+    assert "0003" in descs["defer_teardown"]
+    text = SCRIPT.read_text()
+    # the warning is the point: a rate measured without the fix does not test it
+    assert "does not test the missing" in text
+    assert "--build" in text
+
+
+def test_probe_flips_when_the_symbol_is_absent():
+    """Presence AND absence must both be readable, using a real symbol table.
+
+    Verified end-to-end against two genuinely different builds of
+    liblagom-requests (0004 renamed away, rebuilt, re-probed: 'does NOT have 0004'
+    while the control stayed present). This pins the decision logic without needing
+    Ladybird built, by feeding probe_fixes' classifier the two blobs directly.
+    """
+    mod = fd_census
+    control = mod.CONTROL_SYMBOL.encode()
+    patched = control + b"\0release_response_fd\0defer_teardown\0"
+    unpatched = control + b"\0defer_teardown\0"
+
+    def classify(blob):
+        if control not in blob:
+            return None
+        return {d: (s.encode() in blob) for s, d in mod.FIX_SYMBOLS}
+
+    assert all(classify(patched).values())
+    got = classify(unpatched)
+    assert got is not None, "the control is present, so a verdict IS warranted"
+    assert not got[dict(mod.FIX_SYMBOLS)["release_response_fd"]]
+    assert got[dict(mod.FIX_SYMBOLS)["defer_teardown"]]
+    # no control => no verdict at all
+    assert classify(b"nothing useful here") is None
+
+
+def test_statically_linked_builds_are_probed_via_the_executable():
+    """Ulf's LibIPC is statically linked; the fd code may be in the exe, not a .so.
+
+    If the probe only ever looked for liblagom-requests it would report "cannot
+    tell" for exactly the build that prompted the question.
+    """
+    mod = fd_census
+    assert mod.FIX_LIBRARY_HINT == "lagom-requests"
+    text = SCRIPT.read_text()
+    assert "statically" in text.lower() or "Statically" in text
+    paths = mod.mapped_binaries(os.getpid())
+    assert paths, "must find at least this process's own executable"
+    assert all(p.startswith("/") for p in paths)
+
+
+def test_verdict_never_claims_a_class_with_zero_members():
+    """A healthy browser must not read as "both classes present".
+
+    Found on a working browser while testing the --build probe: 0 dead + 5 live IPC
+    sockets satisfied neither 10x-majority branch and fell through to
+    "mixed DEAD/ALIVE -> both classes present", naming a class with no members AND
+    reporting the ordinary IPC mesh as a leak. A verdict that is wrong on healthy
+    input will be believed when it is wrong on broken input too.
+    """
+    mod = fd_census
+    healthy = mod.verdict(0, 5)
+    assert "mixed" not in healthy
+    assert "both classes" not in healthy
+    assert "not a leak" in healthy
+
+    # zero dead, but far more live sockets than the IPC mesh: class B, not "mixed"
+    many_alive = mod.verdict(0, 50)
+    assert "class B" in many_alive
+    assert "both classes" not in many_alive
+
+    # all dead, none alive: class A with no class B component
+    all_dead = mod.verdict(203, 0)
+    assert "class A" in all_dead
+    assert "both classes" not in all_dead
+
+    # genuinely mixed still says so
+    assert "both classes" in mod.verdict(50, 40)
+    # and the ratio branches are untouched
+    assert "class A" in mod.verdict(203, 1)
+    assert "class B" in mod.verdict(1, 203)
+    assert "no unix sockets" in mod.verdict(0, 0)
