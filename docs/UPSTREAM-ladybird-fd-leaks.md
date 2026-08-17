@@ -294,6 +294,35 @@ The generalisable lesson: **"the object is collectable" and "the fd is closed" a
 claims**, and for a descriptor received over IPC only the second one is the bug. A fix
 verified through the object graph can pass while the resource still leaks.
 
+### Open: the leak persists on Ulf's machine after 0004, and my blind spot
+
+`0004` takes my measurements to 0 and his tree is still leaking. Two things I got wrong
+about how I was measuring, both worth recording because they are the reason the loop
+keeps failing:
+
+1. **Every census I requested was of WebContent.** That was my hypothesis, not a finding.
+   RequestServer creates the response pipes *and* the cache body files, and the UI
+   process and Compositor hold fds too — a leak in any of them is invisible to every
+   number I have collected so far. `fd_census.py --all` now censuses every
+   Ladybird-family process and ranks by growth rate, so the data names the process
+   instead of me naming it.
+2. **My server never exercised the disk cache.** Ulf runs
+   `--http-disk-cache-mode enabled` against real sites; my test server sent no cache
+   headers at all, so `handle_read_cache_state` never ran in any A/B I did. That matters
+   because the large-cache-hit branch (`body_size >= PAGE_SIZE`) takes
+   `take_body_file()` → `send_transferred_body_file_to_client()`: it sends a **body
+   file** and never creates a response pipe, so it is a completed-request path that
+   `release_response_fd()` cannot reach. I built that workload (300 cache hits over
+   small/large/revalidated entries, disk cache on by default) and it stays flat at 5
+   sockets here — so it is not sufficient on its own, but it is the first path found
+   that my fix structurally does not cover.
+
+What that means for the diagnosis: `0004` is verified to fix the response-pipe class
+(208 → 5 sockets, 203 → 0 dead peers, bodies intact), and that class is real. It is
+evidently not the whole of what Ulf is seeing, and the next measurement has to come from
+his machine with `--all`, because I have now falsified every workload I can construct
+locally — including the cache paths I had never tested.
+
 ### Why it takes the whole browser down, not just a tab
 
 `EMFILE` in WebContent surfaces through `MUST()` on an encode

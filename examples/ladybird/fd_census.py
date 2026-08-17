@@ -131,6 +131,33 @@ def peer_state(inode, sockets):
     return "ALIVE", holders
 
 
+BROWSER_PROCESS_NAMES = ("Ladybird", "ladybird", "WebContent", "RequestServer",
+                         "ImageDecoder", "Compositor", "WebWorker")
+
+
+def find_browser_pids():
+    """Every Ladybird-family process, whatever it is called.
+
+    Deliberately NOT just WebContent. Every census I asked Ulf for was of WebContent,
+    because that is where I had already decided the leak was -- so a leak in
+    RequestServer, the Compositor or the UI process would have been invisible to all
+    of them, and "still leaking" is consistent with that. An instrument should not
+    inherit my hypothesis: watch every process and let the growth say which one.
+    """
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % entry) as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if any(n in comm for n in BROWSER_PROCESS_NAMES):
+            out.append((int(entry), comm))
+    return sorted(out)
+
+
 def find_pids(name):
     out = []
     for entry in os.listdir("/proc"):
@@ -327,6 +354,62 @@ def verdict(dead, alive):
             "separately and re-census between.")
 
 
+def watch_all(interval, retained_after):
+    """Watch every browser process at once and rank them by fd GROWTH.
+
+    This exists because of a mistake worth naming: I spent the whole investigation
+    censusing WebContent, since that is where I believed the leak was. If the fds
+    accumulate in RequestServer -- which is the process that CREATES the response
+    pipes and the cache body files -- then every measurement I requested was blind to
+    it, and the leak would keep being reported as "still leaking" while my numbers
+    said fixed. Rank by growth, not by level: a process can hold many fds legitimately
+    (the IPC mesh) and the slope is what distinguishes a leak.
+    """
+    censuses = {}
+    names = {}
+    first = True
+    while True:
+        for pid, comm in find_browser_pids():
+            if pid not in censuses:
+                censuses[pid] = Census(pid, retained_after=retained_after)
+                names[pid] = comm
+            try:
+                censuses[pid].sample()
+            except OSError:
+                continue  # exited under us; its history stays for the report
+
+        print("=== %s (interval %gs) ===" % (time.strftime("%H:%M:%S"), interval))
+        rows = []
+        for pid, census in censuses.items():
+            if not census.history:
+                continue
+            t0, s0, d0 = census.history[0]
+            t1, s1, d1 = census.history[-1]
+            total = len(read_fd_targets(pid)) if os.path.isdir("/proc/%d/fd" % pid) else 0
+            span = t1 - t0
+            rate = (s1 - s0) * 60.0 / span if span > 0 else 0.0
+            dead_rate = (d1 - d0) * 60.0 / span if span > 0 else 0.0
+            rows.append((rate, dead_rate, pid, names.get(pid, "?"), total, s1, d1,
+                         len(census.history)))
+        rows.sort(reverse=True)
+        for rate, dead_rate, pid, comm, total, socks, dead, n in rows:
+            alive = "" if os.path.isdir("/proc/%d/fd" % pid) else "  (EXITED)"
+            print("  %-14s pid=%-7d fds=%-5d sockets=%-5d dead=%-5d "
+                  "%+.1f/min (dead %+.1f/min, %d samples)%s"
+                  % (comm, pid, total, socks, dead, rate, dead_rate, n, alive))
+        if first and len(rows):
+            print("  (first sample: rates are 0 until the second one)")
+        first = False
+        leakers = [r for r in rows if r[0] > 0.5]
+        if leakers:
+            print("  -> GROWING: %s. That process is the one to investigate; the fd "
+                  "is accumulating THERE, whatever my hypothesis said."
+                  % ", ".join("%s(pid=%d) %+.1f/min" % (r[3], r[2], r[0])
+                              for r in leakers))
+        sys.stdout.flush()
+        time.sleep(interval)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("pid", nargs="?", type=int)
@@ -334,6 +417,10 @@ def main(argv=None):
                    help="list pids whose comm contains NAME, fd-heaviest first")
     p.add_argument("--watch", type=float, metavar="SECONDS",
                    help="re-census every SECONDS (ages need >= 2 samples)")
+    p.add_argument("--all", action="store_true",
+                   help="census EVERY Ladybird-family process and rank by growth "
+                        "-- use this when you do not already know which process "
+                        "leaks (i.e. always, at first)")
     p.add_argument("--retained-after", type=float, default=30.0,
                    help="an fd older than this is retained, not in flight")
     args = p.parse_args(argv)
@@ -343,8 +430,11 @@ def main(argv=None):
             print("pid=%-8d fds=%-6d %s" % (pid, count, comm))
         return 0
 
+    if args.all:
+        return watch_all(args.watch or 30.0, args.retained_after)
+
     if args.pid is None:
-        p.error("give a pid, or --find NAME")
+        p.error("give a pid, --find NAME, or --all")
 
     census = Census(args.pid, retained_after=args.retained_after)
     while True:

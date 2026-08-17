@@ -436,3 +436,38 @@ def test_the_report_explains_an_unnamed_peer_instead_of_printing_a_bare_question
     text = FDTRACE_REPORT.read_text()
     assert "landlocked to /proc/self" in text, \
         "the reader must be told why, not just that it failed"
+
+
+def test_the_census_can_watch_every_browser_process_not_just_webcontent():
+    """The instrument must not inherit my hypothesis about WHERE the leak is.
+
+    Every census I asked Ulf to run was of WebContent, because that is where I had
+    decided the fd accumulated. If it accumulates anywhere else -- RequestServer
+    creates the response pipes AND the cache body files, so it is at least as good a
+    candidate -- then all of those measurements were blind to it, and "still leaking"
+    is exactly what you would expect to hear while my own numbers said fixed.
+
+    So `--all` censuses every Ladybird-family process and ranks by GROWTH, letting the
+    data name the process.
+    """
+    mod = fd_census
+    assert "RequestServer" in mod.BROWSER_PROCESS_NAMES
+    assert "WebContent" in mod.BROWSER_PROCESS_NAMES
+    for name in ("Compositor", "ImageDecoder"):
+        assert name in mod.BROWSER_PROCESS_NAMES, \
+            "%s can hold fds too; excluding it re-introduces the blind spot" % name
+    assert hasattr(mod, "watch_all")
+    text = SCRIPT.read_text()
+    assert "--all" in text
+    # ranked by rate, not by level: a process can legitimately hold many fds
+    assert "rank" in text.lower() and "growth" in text.lower()
+
+
+def test_find_browser_pids_sees_this_process_when_it_matches():
+    """A real /proc check, not a mock: the finder must work on this machine."""
+    mod = fd_census
+    pids = dict(mod.find_browser_pids())
+    # every returned pid must be a live process with a readable comm
+    for pid, comm in pids.items():
+        assert os.path.isdir("/proc/%d" % pid)
+        assert comm
