@@ -25,6 +25,49 @@ VCPKG = "//Meta/vcpkg"
 # all, and grouping them makes the linker pull one crate's objects into a target
 # that never asked for them.
 RUST_LIB_FMT = "//:%s_lib"
+# Crates whose FFI header the OWNING library includes with no directory prefix
+# (`#include <RustFFI.h>`). Those libraries additionally depend on
+# //:<crate>_bare_include, which carries ONLY that crate's ffi/<prefix> dir.
+# It is a separate label from //:<crate>_lib on purpose: CcInfo include dirs
+# propagate transitively, and 8 of the 10 crates emit a header named RustFFI.h,
+# so a shared unprefixed dir let one crate's header satisfy another library's
+# bare include (LibGfx compiled against LibRegex's).
+RUST_BARE_INCLUDE_FMT = "//:%s_bare_include"
+
+
+def _cargo():
+    sys.path.insert(0, os.path.join(ROOT, "Meta"))
+    import emit_cargo_bazel
+    return emit_cargo_bazel
+
+
+def rust_bare_include_crates():
+    """The crates whose header is included bare -- IMPORTED, not mirrored.
+
+    This used to be a hand-kept tuple beside the cargo emitter's derived set,
+    with a comment saying the two were "kept in sync". They were not: the cargo
+    emitter DERIVES the set by scanning the tree for a directory-less
+    `#include <X>`, and a hand-kept copy of a derived set is the finding-23 bug in
+    miniature. So it is read from the one place that computes it, and adding a
+    bare include anywhere in Ladybird needs no edit in either file.
+    """
+    cargo = _cargo()
+    return {c for c, on in
+            cargo.crates_included_bare(cargo._bare_scan_specs()).items() if on}
+
+
+def rust_binary_crates():
+    """{CMake target name -> crate} for the build_rust_binary() crates.
+
+    CMake's dependency edge on a binary crate is a custom target named
+    `<BINARY_NAME>-build` (rust_crate.cmake), and that name is what turns up in
+    the model as a dep -- `cranelift-compiler-build` on LibWasm. Mapping it back
+    to the crate is what lets the emitter translate that edge instead of dropping
+    it, which is precisely what it was doing: LibWasm's dep on the Cranelift
+    crate was silently discarded, and the build failed 1,600 actions later on
+    `CraneliftFFI.h: No such file or directory`.
+    """
+    return {b["bin"] + "-build": b for b in _cargo().binary_specs()}
 
 # Global defines already set in .bazelrc; do not re-emit per target.
 GLOBAL_DEFINES = {
@@ -60,12 +103,50 @@ def global_flags():
 
 GLOBAL_FLAGS = global_flags()
 
+# Flags CMake puts on a target that must NOT be copied into a Bazel copt.
+#
+# -fPIE is the one that matters, and it is a crash, not a nit. CMake adds it to
+# every executable target (CMAKE_POSITION_INDEPENDENT_CODE + an exe => -fPIE),
+# and the capture faithfully recorded it -- so the generated cc_binary carried
+# `copts = ['-fPIE']`. Bazel appends per-target copts AFTER the .bazelrc's
+# --copt=-fPIC, and for GCC the LAST of -fPIC/-fPIE wins. So the UI/Qt objects
+# were compiled -fPIE while every library around them was -fPIC.
+#
+# Under -fPIE, GCC may reference extern data DIRECTLY (PC-relative) instead of
+# through the GOT, and the linker then materialises the definition in the
+# executable with an R_X86_64_COPY relocation. For libraries built with Qt's
+# `reduce_relocations` (every official/aqt Qt SDK; Debian's is built without it)
+# that is fatal: QtCore accesses its own `QCoreApplication::self` PC-relative --
+# its own BSS copy -- while QtGui reads the same symbol through the GOT, which
+# the copy relocation has repointed at the EXECUTABLE's BSS. QApplication's
+# constructor then sets qApp in one place and QtGui reads the other, still null.
+# The first emit through a null sender segfaults: QGuiApplication::screenAdded
+# from QWindowSystemInterface::handleScreenAdded, inside doActivate, on
+# `mov 0x8(%rdi),%rbx` with rdi = 0.
+#
+# Qt's own headers say so and are right: qcompilerdetection.h #errors with
+# "-fPIE is not sufficient ... Compile your code with -fPIC and without -fPIE"
+# -- but only when __PIC__ is unset, and Bazel passes BOTH flags, so __PIC__ is
+# defined at preprocess time and the guard never fires. The build was clean and
+# the binary was broken.
+#
+# Dropping -fPIE is not a divergence from CMake's semantics: Bazel's own
+# toolchain compiles the objects of a cc_binary PIC and links -pie, which is
+# what CMake was asking for. Verified by removal: with -fPIE gone the binary has
+# ZERO R_X86_64_COPY relocations (39 before, incl. qApp) and the GUI starts
+# against an aqt 6.9.2 SDK, where before it segfaulted for both the xcb and the
+# offscreen QPA plugin. -Wl,-z,nocopyreloc is NOT an alternative: it turns the
+# same defect into a link error ("causes overflow in R_X86_64_PC32").
+DROPPED_TARGET_FLAGS = {"-fPIE"}
+
 def target_flags(t):
     """Per-target compile flags (feature/warning) not covered by .bazelrc."""
     flags = set()
     for a in t["actions"]:
         if a["mnemonic"] != "CppCompile": continue
         for x in a["arguments"]:
+            if x in DROPPED_TARGET_FLAGS:
+                continue
             if x.startswith(("-f", "-m", "-p")) and x not in GLOBAL_FLAGS:
                 flags.add(x)
     return sorted(flags)
@@ -104,13 +185,48 @@ def target_srcs(t):
         srcs += [i for i in a["inputs"] if i.endswith((".cpp", ".c", ".cc", ".S"))]
     return sorted(s for s in set(srcs) if AUTOGEN_MARKER not in s)
 
+def rewrite_host_path_define(d):
+    """Rewrite a define whose VALUE is an absolute path to a Bazel-built binary.
+
+    There is exactly one, and it was the last hardcoded
+    /home/ubuntu/... in the emitted build:
+
+        -DWASM_CRANELIFT_COMPILER_PATH="<builddir>/bin/cranelift-compiler"
+
+    CMake bakes the reference build's absolute output path in, which is fine for
+    CMake (the build tree does not move) and fatal for a checkout on any other
+    machine -- the define alone made `git clone && bazel build` unusable even once
+    the crate itself built.
+
+    The fix is not "point it at bazel-bin" (that is the same escape with a
+    different prefix). Ladybird already resolves the compiler through a lookup
+    CHAIN (resolve_cranelift_compiler_path in CraneliftBridge.cpp):
+    $LADYBIRD_CRANELIFT_COMPILER, then the compile-time path, then
+    SIBLING-OF-SELF. Bazel puts every root-package output in ONE bin directory,
+    so cranelift-compiler is already a sibling of WebContent, ladybird and the
+    rest -- the third link in Ladybird's own chain finds it with no path baked in
+    at all. So the define becomes the bare file name (link 2 is then a
+    cwd-relative probe that harmlessly misses), and the binary is attached as
+    `data` on LibWasm so it is really THERE, in the runfiles of everything that
+    links LibWasm. The dependency is declared; the path is not asserted.
+    """
+    key, _, value = d.partition("=")
+    literal = value.strip('"')
+    if not literal.startswith("/"):
+        return d
+    for b in rust_binary_crates().values():
+        if os.path.basename(literal) == b["output_name"]:
+            return '%s="%s"' % (key, b["output_name"])
+    return d
+
+
 def target_defines(t, name):
     defs = set()
     for a in t["actions"]:
         if a["mnemonic"] != "CppCompile": continue
         for x in a["arguments"]:
             if x.startswith("-D"):
-                d = x[2:]
+                d = rewrite_host_path_define(x[2:])
                 if d not in GLOBAL_DEFINES:
                     # Bazel needs embedded quotes escaped in (local_)defines.
                     defs.add(d.replace('"', '\\"'))
@@ -118,7 +234,17 @@ def target_defines(t, name):
 
 def target_private_includes(t):
     """Per-target -isystem/-I under Build/full (the target's own gendir) not in
-    the 6 global roots."""
+    the 6 global roots.
+
+    Paths are NORMALIZED before the comparison, which is not cosmetic. CMake emits
+    a target's own binary dir relative to itself, so the five service targets get
+    `-IBuild/full/Services/WebContent/../..` -- the same directory as the global
+    `-IBuild/full`, spelled differently. Compared as strings it is not in
+    globalroots, so it came out as a per-target `-IBuild/full` copt on five
+    targets plus WebContent: six copts pointing into CMake's build tree that
+    supplied nothing any global root did not already supply, and which made the
+    emitted build look like it needed Build/full when it did not.
+    """
     globalroots = {ROOT, ROOT+"/Libraries", ROOT+"/Services",
                    ROOT+"/Build/full", ROOT+"/Build/full/Libraries",
                    ROOT+"/Build/full/Services",
@@ -129,7 +255,7 @@ def target_private_includes(t):
         args = a["arguments"]; i = 0
         while i < len(args):
             if args[i] in ("-I", "-isystem"):
-                p = args[i+1]
+                p = os.path.normpath(args[i+1])
                 if p in globalroots:
                     pass
                 elif p.startswith(ROOT):
@@ -160,29 +286,100 @@ def target_embed_inputs(t):
                     embeds.add(rel)
     return sorted(embeds)
 
+def rust_dep_labels(crate):
+    """(deps, implementation_deps) for one Rust crate dep.
+
+    `deps` is always //:<crate>_lib -- the archive plus the crate's PREFIXED
+    headers, exactly CMake's target_link_libraries edge, and safe to propagate
+    because the spelling <LibUnicode/RustFFI.h> is unique per crate.
+
+    `implementation_deps` is //:<crate>_bare_include when the owning library
+    spells the header with NO directory, and the distinction is the whole point.
+    Eight of the ten crates emit a header literally named `RustFFI.h`, so an
+    unprefixed include dir that reaches a second library makes a bare
+    `#include <RustFFI.h>` bind to whichever dir sorted first on the command line
+    -- silently, since both files exist.
+
+    Splitting it into its own TARGET (cargo_bare_include) was necessary but NOT
+    sufficient, and this is the second half of that lesson. Include dirs
+    propagate along the C++ dep graph, not just out of one rule: LibGfx depends on
+    LibTextCodec, which owns libtextcodec_rust's bare dir, so LibGfx's compiles
+    received /libtextcodec_rust/ffi/LibTextCodec BEFORE its own
+    /libgfx_rust/ffi/LibGfx and YUVData.cpp compiled against LibTextCodec's
+    header ("'FFI' does not name a type"). A separate target only stops the dir
+    leaking out of cargo_lib; it does not stop it leaking out of LibTextCodec.
+
+    `implementation_deps` is Bazel's name for exactly the scope CMake's
+    `target_include_directories(... PRIVATE)` has: the dep is used to COMPILE this
+    library and is not part of its interface, so its include dirs stop here. That
+    is a one-for-one translation of the CMake this build is a port of -- CMake's
+    FFI_OUTPUT_DIR is added PRIVATE, to the owning library's own binary dir -- and
+    it is the reason a bare include is unambiguous there and had to be made
+    unambiguous here.
+    """
+    impl = []
+    if crate in rust_bare_include_crates():
+        impl.append(RUST_BARE_INCLUDE_FMT % crate)
+    return [RUST_LIB_FMT % crate], impl
+
+
+# How one CMake dep is translated. Four kinds, kept as named fields rather than
+# as "a string, or a list, or a 2-tuple whose first element is a magic word" --
+# which is what this was, and it stopped being safe the moment a translation
+# needed to produce BOTH deps and implementation_deps (a 2-tuple, i.e. exactly
+# the shape the ("SYS", name) sentinel already used).
+class Dep:
+    def __init__(self, deps=(), impl=(), sys=(), unknown=()):
+        self.deps, self.impl = list(deps), list(impl)
+        self.sys, self.unknown = list(sys), list(unknown)
+
+
 def dep_label(d, targets, so, ar):
     nm = d["name"]
     if nm.startswith("lagom-"):
         tgt = lagom_to_target(nm, targets)
-        if tgt == "LibWeb": return "//Libraries/LibWeb:LibWeb"
-        return "//:%s" % tgt if tgt else None
+        if tgt == "LibWeb": return Dep(deps=["//Libraries/LibWeb:LibWeb"])
+        return Dep(deps=["//:%s" % tgt]) if tgt else None
     if nm.endswith("_rust"):
-        return RUST_LIB_FMT % nm
+        deps, impl = rust_dep_labels(nm)
+        return Dep(deps=deps, impl=impl)
+    # A build_rust_binary() crate. CMake's edge is on the custom target
+    # `<bin>-build`, and it means two separate things that Bazel splits:
+    # the generated FFI HEADER (a dep, via //:<crate>_lib) and the BINARY itself,
+    # which is not linked at all -- LibWasm spawns it -- so it becomes runfiles
+    # (see the `data` handling in emit_target).
+    binaries = rust_binary_crates()
+    if nm in binaries:
+        b = binaries[nm]
+        if not b["ffi_headers"]:
+            return None
+        deps, impl = rust_dep_labels(b["crate"])
+        return Dep(deps=deps, impl=impl)
+    # A staticlib crate's redundant `<crate>-build` custom target (CMake emits
+    # both it and the imported-library dep); the library dep carries everything.
+    if nm.endswith("-build"):
+        return None
     if nm in so or nm in ar:
-        return VCPKG + ":" + nm
+        return Dep(deps=[VCPKG + ":" + nm])
     if nm in SYSTEM_LIBS:
-        return ("SYS", nm)  # linkopt on final binary
+        return Dep(sys=[nm])  # linkopt on final binary
     # Qt6 + GL: system .so under /usr/lib; CMake finds them via find_package.
     # Map the CMake target name to the -l library name; the /usr/lib search
     # path is a global -L in .bazelrc.
     # Qt6 is a real Bazel dep via rules_qt: its qt.local_repo discovers the host
     # SDK through qmake, so moc/rcc and the Qt cc_librarys all come from one SDK.
     if nm in QT_MAP:
-        return QT_MAP[nm]
+        # Plus @qt_plugins//:runtime_libs -- the PRIVATE libraries an SDK ships
+        # beside Qt (aqt bundles ICU 73) which rules_qt does not stage, and which
+        # libQt6Core cannot find on its own because its RUNPATH $ORIGIN expands to
+        # Bazel's solib dir. Making them link inputs is what removed the need for
+        # LD_LIBRARY_PATH=<sdk>/lib. Empty for a distro Qt. See qt_runtime.bzl /
+        # finding 40.
+        return Dep(deps=[QT_MAP[nm], "@qt_plugins//:runtime_libs"])
     SYS_MAP = {"GLX": "GLX", "OpenGL": "OpenGL"}
     if nm in SYS_MAP:
-        return ("SYS", SYS_MAP[nm])
-    return ("UNKNOWN", nm)
+        return Dep(sys=[SYS_MAP[nm]])
+    return Dep(unknown=[nm])
 
 # Generated sources that BAZEL now produces itself (a genrule output in the root
 # package, listed in codegen_root.bzl). A model src under Build/full naming one
@@ -276,13 +473,24 @@ VCPKG_TAIL = """
 vcpkg_tree(
     name = "vcpkg_installed",
     distfiles = VCPKG_DISTFILE_INDEX,
+    # The wheels for the Python packages a portfile pip-installs (angle asks for
+    # `ply`). Pinned separately from the 76 distfiles because pip bypasses vcpkg's
+    # asset cache entirely, so the capture cannot see them and x-block-origin
+    # cannot block them -- see vcpkg_python_packages.bzl and finding 36.
+    python_wheels = ['@vcpkg_pywheel_ply//file'],
     source_dir = ".",
     source_root = ":vcpkg_source_inputs",
     triplet = "x64-linux-dynamic",
-    # Resume cache: makes a killed 45-minute build cheap to restart. Absolute by
-    # necessity (the action's cwd is the execroot) and therefore a host escape --
-    # it is a build-speed affordance, not part of the dependency graph.
-    cache_dir = "/home/ubuntu/.cache/vcpkg-bazel",
+    # Resume cache: OPT-IN, and empty here on purpose. Setting it makes a killed
+    # 45-minute vcpkg build cheap to restart, but the path must be absolute (the
+    # action's cwd is the execroot), so any value here is one developer's home
+    # directory in a file everyone checks out -- it was
+    # /home/ubuntu/.cache/vcpkg-bazel, the last absolute host path left in the
+    # emitted build. Empty is also the honest default: it is the genuine
+    # from-source build. Set this one attribute locally if you want resumability.
+    # It is a build-speed affordance and no part of the dependency graph, which is
+    # precisely why it must not be a checked-in constant.
+    cache_dir = "",
     vcpkg_root = "Build/vcpkg",
     vcpkg_tree = "//Build/vcpkg:tree",
 )
@@ -323,6 +531,8 @@ ALL_LOADS = '''load("@rules_qt//qt:defs.bzl", "qt_cc_moc", "qt_cc_rcc", "qt_qrc"
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":cargo_ring.bzl", "cargo_ring")
 load(":codegen_root.bzl", "root_codegen")
+load(":export_headers.bzl", "export_headers")
+load(":qt_runtime.bzl", "qt_conf", "qt_plugin_tree")
 load(":vcpkg.bzl", "vcpkg_tree", "vcpkg_tree_for_exec")
 load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
@@ -334,6 +544,11 @@ package(default_visibility = ["//visibility:public"])
 # GENERATES all of them instead of consuming CMake's prebuilt copies from
 # Build/full.
 root_codegen()
+
+# CMake's generate_export_header() output (15 Export.h) and the two AK
+# configure_file headers, generated by Bazel instead of read out of Build/full --
+# generated by Meta/emit_export_headers_bazel.py, byte-verified with --check.
+export_headers()
 
 # The Rust ring: 10 cargo staticlib crates + flapc, built by Bazel from crates
 # Bazel fetched, offline. This is what retired the prebuilt 260 MB
@@ -359,15 +574,29 @@ cc_library(
         "UI/**/*.h",
     ], allow_empty = True),
     deps = [
-        # Bazel-generated headers (the genrules above) come FIRST so they win
-        # over the CMake copies; the Build/full roots below now only supply what
-        # Bazel does not yet generate (Rust FFI headers, CMake's
-        # generate_export_header Export.h).
+        # EVERY generated header is Bazel's own now. The two
+        # //Build/full/{Libraries,Services} header roots that used to be listed
+        # here are gone, and with them the last thing the BUILD read out of
+        # CMake's build tree.
+        #
+        # They were not supplying anything by the end, and that is the part worth
+        # recording, because it is why they survived so long: a `glob(["**/*.h"])`
+        # over a foreign tree cannot fail. The 709 headers under those roots were
+        # 21 that Bazel generates and 688 LibWeb bindings headers that Bazel ALSO
+        # generates -- so the roots were SHADOWING Bazel's own outputs, silently
+        # winning or losing on include order, and the only reason a fresh clone
+        # did not fail here was that it got no error either: allow_empty=True
+        # turns "the tree is not there" into an empty glob and the build dies
+        # ~1,600 actions later on a missing Export.h. Verified by removal:
+        # Build/full/{Libraries,Services,UI} moved off the machine, all six
+        # binaries rebuilt from scratch, --headless=text and
+        # --headless=layout-tree byte-identical to the CMake reference.
         ":generated_libraries_headers",
         ":generated_services_headers",
         ":generated_shader_headers",
-        "//Build/full/Libraries:generated_lib_headers",
-        "//Build/full/Services:generated_service_headers",
+        ":generated_export_headers",
+        ":generated_ak_headers",
+        "//Libraries/LibWeb:generated_export_header",
     ],
 )
 
@@ -375,21 +604,18 @@ VCPKG = "//Meta/vcpkg"
 '''
 
 AK_BLOCK_HEAD = '''
-# Configure-generated headers live in Build/full/AK; expose as AK/*.h via a copy.
-genrule(
-    name = "ak_gen_headers",
-    srcs = ["Build/full/AK/Debug.h", "Build/full/AK/Backtrace.h"],
-    outs = ["genroot/AK/Debug.h", "genroot/AK/Backtrace.h"],
-    cmd = "mkdir -p $(RULEDIR)/genroot/AK && " +
-          "cp $(location Build/full/AK/Debug.h) $(RULEDIR)/genroot/AK/Debug.h && " +
-          "cp $(location Build/full/AK/Backtrace.h) $(RULEDIR)/genroot/AK/Backtrace.h",
-)
+# NOTE: the ak_gen_headers genrule that COPIED AK/Debug.h and AK/Backtrace.h out
+# of Build/full is gone. Bazel now generates both from their checked-in .in
+# templates (export_headers.bzl): Debug.h by applying CMake's configure_file
+# substitution, Backtrace.h by ASKING the host the same question
+# find_package(Backtrace) asks. That removed the last AK dependency on a CMake
+# build tree.
 
 cc_library(
     name = "AK",
 '''
 
-AK_BLOCK_TAIL = '''    hdrs = glob(["AK/*.h"]) + [":ak_gen_headers"],
+AK_BLOCK_TAIL = '''    hdrs = glob(["AK/*.h"]),
     # AK-private defines (CMake PRIVATE) — local_defines so they don't leak to
     # consumers. FMT_SHARED/AK_HAS_CPPTRACE only affect AK's own TUs.
     local_defines = [
@@ -397,8 +623,13 @@ AK_BLOCK_TAIL = '''    hdrs = glob(["AK/*.h"]) + [":ak_gen_headers"],
         "AK_HAS_CPPTRACE=1",
         "FMT_SHARED",
     ],
-    includes = ["genroot"],
     deps = [
+        # AK/Debug.h + AK/Backtrace.h, generated from their .in templates
+        # (export_headers.bzl). A cc_library belongs on a deps edge, not in hdrs:
+        # in hdrs it contributes no include path, which is why every consumer
+        # failed with "AK/Debug.h: No such file or directory" until this moved.
+        # The include root travels with the dep, so dependents get it too.
+        ":generated_ak_headers",
         VCPKG + ":fmt",
         VCPKG + ":simdutf",
         VCPKG + ":mimalloc",
@@ -432,6 +663,31 @@ def emit_qt_autogen(moc_hdrs):
     print()
 
 
+QT_RUNTIME_BLOCK = '''
+# === Qt6 RUNTIME: the plugins Qt dlopens, and the qt.conf that finds them ===
+# Not a CMake target -- CMake does not need one, because its binary links a Qt
+# whose baked-in prefix already points at the plugins of that same Qt. Bazel's
+# does not: it links @qt's libraries and then Qt looks for plugins next to the
+# executable, finds none, and falls back to the HOST's plugin directory. Loading
+# another Qt build's QPA plugin into this one is the Ubuntu 24.04 SIGSEGV in
+# QXcbConnection::initializeScreens; on a box where the versions agree it "works".
+# qt_runtime.bzl has the full account (finding 40); both targets below are data of
+# //:ladybird, so they are staged in bazel-bin AND in the runfiles tree.
+qt_plugin_tree(
+    name = "qt_plugins",
+    plugins = ["@qt_plugins//:plugins"],
+)
+
+qt_conf(
+    name = "qt_conf",
+)
+'''
+
+
+def emit_qt_runtime():
+    print(QT_RUNTIME_BLOCK, end="")
+
+
 def moc_headers():
     """UI/Qt headers with Q_OBJECT, i.e. the ones CMake's AUTOMOC would moc.
 
@@ -452,7 +708,7 @@ def moc_headers():
 
 
 def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
-                extra_srcs=()):
+                extra_srcs=(), extra_data=()):
     """Emit one cc_library/cc_binary from the model.
 
     body_only: emit only `name =` + `srcs =` (AK's hand-written block supplies
@@ -468,26 +724,50 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
         defs = target_defines(t, name)
         incs = target_private_includes(t)
         flags = target_flags(t)
-        deps, rustdeps, sysdeps, unknown = [], [], [], []
+        deps, impl_deps, data, sysdeps, unknown = [], [], [], [], []
+        binaries = rust_binary_crates()
         for d in t.get("deps", []):
             if not d.get("external"):
                 if d["name"] == "LibWeb": deps.append("//Libraries/LibWeb:LibWeb")
                 elif d["name"] in libs: deps.append("//:%s" % d["name"])
                 # exe deps on service static libs / other production libs
                 elif d["name"] in exes: pass  # exe->exe (spawn at runtime, not a link dep)
+                elif d["name"] in binaries:
+                    # A build_rust_binary() crate. For the STATICLIB crates CMake
+                    # emits both this `<crate>-build` custom target AND an
+                    # external dep on the imported library, so the -build edge is
+                    # redundant and dropping it is right. For a BINARY crate it is
+                    # the only edge there is -- and dropping it is what left
+                    # Cranelift out of the Bazel graph entirely, so every browser
+                    # binary died on `CraneliftFFI.h: No such file or directory`
+                    # some 1,600 actions in.
+                    #
+                    # It carries two things Bazel keeps apart:
+                    #   deps -- the generated FFI header, via //:<crate>_lib
+                    #           (headers-only: there is no archive to link).
+                    #   data -- the EXECUTABLE, which is not a link input at all.
+                    #           LibWasm spawns it at run time, so it belongs in
+                    #           the runfiles of everything that links LibWasm.
+                    #           That, plus rewrite_host_path_define turning the
+                    #           baked-in absolute path into a bare file name, is
+                    #           what makes Ladybird's own sibling-of-self lookup
+                    #           find it in any checkout instead of only in mine.
+                    b = binaries[d["name"]]
+                    if b["ffi_headers"]:
+                        rdeps, rimpl = rust_dep_labels(b["crate"])
+                        deps.extend(rdeps)
+                        impl_deps.extend(rimpl)
+                    data.append("//:" + b["bin"])
                 continue
             lab = dep_label(d, targets, so, ar)
             if lab is None: continue
-            if isinstance(lab, list):
-                deps.extend(lab)
-            elif isinstance(lab, tuple):
-                (sysdeps if lab[0]=="SYS" else unknown).append(lab[1])
-            else:
-                deps.append(lab)
+            deps.extend(lab.deps)
+            impl_deps.extend(lab.impl)
+            sysdeps.extend(lab.sys)
+            unknown.extend(lab.unknown)
         rule = "cc_binary" if is_exe else "cc_library"
         if header:
             print(f"# === {name} ({t['kind']}, {len(srcs)} TU) ===")
-        if rustdeps: print(f"#   RUST deps (deferred): {rustdeps}")
         if unknown: print(f"#   UNKNOWN deps: {unknown}")
         if not body_only:
             print(f"{rule}(")
@@ -511,13 +791,33 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
                 # with -isystem. They live as global -isystem in .bazelrc
                 # (mirroring CMake's find_package include dirs).
                 continue
-            if "vcpkg_installed" in i:
+            if i.startswith("Build/full/Libraries/"):
+                # CMake's per-library FFI dir (FFI_OUTPUT_DIR defaults to the
+                # library's own binary dir), which is where its crate's
+                # RustFFI.h lands. Pointing this at the CMake tree is what kept
+                # the build dependent on Build/full -- and it also MASKED a real
+                # bug: it shadowed the ambiguous ffi/ roots, so a bare
+                # <RustFFI.h> silently resolved here instead of to another
+                # crate's header. Bazel's equivalent dir travels with the
+                # //:<crate>_lib dep (cargo.bzl), so this copt is simply dropped.
+                pass
+            elif "vcpkg_installed" in i:
                 # Not a copt any more. The vcpkg include dirs (include/,
                 # include/skia, include/harfbuzz, include/libxml2) are carried by
                 # the //Meta/vcpkg:<port> dep as system_includes, so the include
                 # path arrives WITH the dep edge -- a target that includes
                 # <skia/...> without depending on skia now fails to compile,
                 # which is the whole point of declaring inputs.
+                pass
+            elif i in ("Build/full/UI", "Build/full/UI/Qt"):
+                # CMake's UI gendir, whose only non-autogen contents are the two
+                # SPIR-V shader headers (WebContentViewLinux{Frag,Vert}Shader.h).
+                # Bazel generates both itself and carries them on
+                # :generated_shader_headers with includes=["UI/Qt"], so the
+                # include path arrives through the dep graph. Dropped, not
+                # relocated -- and checked by removal: with Build/full/UI moved
+                # off the machine, //:ladybird still builds and renders
+                # byte-identically.
                 pass
             else:
                 copt_toks.append("-I" + i)
@@ -528,6 +828,24 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
         # where the lib's INTERFACE/PRIVATE system deps flow to the executable).
         if sysdeps:
             print("    linkopts = [%s]," % ", ".join("%r" % ("-l"+l) for l in sorted(set(sysdeps))))
+        # Runtime tools this target SPAWNS: not link inputs, but real inputs.
+        # On a cc_library `data` propagates into the runfiles of every binary
+        # that links it, which is exactly the reach cranelift-compiler needs
+        # (LibWasm is linked by WebContent, WebWorker and ladybird).
+        data = list(data) + list(extra_data)
+        if data:
+            print("    data = [%s]," % ", ".join("%r" % x for x in sorted(set(data))))
+        # PRIVATE deps: used to compile this library, not part of its interface,
+        # so their include dirs stop here. Bazel's name for CMake's PRIVATE, and
+        # the only thing that keeps a crate's unprefixed FFI dir from reaching a
+        # library that has its OWN crate's RustFFI.h to find -- see
+        # rust_dep_labels(). Not valid on a cc_binary (nothing depends on it, so
+        # everything it has is already private).
+        if impl_deps and not is_exe:
+            print("    implementation_deps = [%s]," %
+                  ", ".join("%r" % x for x in sorted(set(impl_deps))))
+        elif impl_deps:
+            deps.extend(impl_deps)
         deps.append("//:all_source_headers")
         alldeps = sorted(set(deps))
         if alldeps:
@@ -563,9 +881,13 @@ def main():
     for name in ROOT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar)
     emit_qt_autogen(moc_headers())
+    emit_qt_runtime()
     for name in QT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar,
-                    extra_srcs=[":qt_moc", ":qt_rcc"])
+                    extra_srcs=[":qt_moc", ":qt_rcc"],
+                    # The Qt plugins + qt.conf: runtime inputs of the GUI, in the
+                    # same sense as the cranelift-compiler binary LibWasm spawns.
+                    extra_data=[":qt_conf", ":qt_plugins"])
     print(VCPKG_TAIL, end="")
 
 

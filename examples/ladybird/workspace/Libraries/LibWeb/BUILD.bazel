@@ -1,8 +1,17 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load(":codegen.bzl", "libweb_codegen", "libweb_bindings_codegen")
 load(":generated_srcs.bzl", "LIBWEB_GENERATED_SRCS", "LIBWEB_GENERATED_HDRS")
+load(":export_header.bzl", "libweb_export_header")
 
 package(default_visibility = ["//visibility:public"])
+
+# LibWeb's generate_export_header output. It is generated HERE rather than in the
+# root package because Bazel include dirs cannot escape a package: LibWeb is its
+# own package, so its Export.h has to be an output of this package (at
+# genroot/LibWeb/Export.h, with includes=["genroot"] -- includes=["../.."] is
+# rejected by Bazel, and rightly so). Emitted by
+# Meta/emit_export_headers_bazel.py --libweb.
+libweb_export_header()
 
 libweb_codegen()
 libweb_bindings_codegen()

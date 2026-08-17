@@ -59,14 +59,29 @@ Ranges, not recommendations. "Declared" is what a `MODULE.bazel` asked for;
 
 | ruleset | declared range | resolved | migrations | how far it was exercised |
 |---|---|---|---|---|
-| `rules_cc` | 0.0.16 – 0.2.22 | 0.2.14 – 0.2.22 | Dolphin; fmt, spdlog, TinyXML2, zlib; BoringSSL, Abseil, RE2 | Dolphin: `//...` green in 3 configurations, 1350 tests pass, action-graph parity 0 errors. Build re-verified green at declared 0.0.16 / 0.1.1 / 0.2.22; `compatibility_level = 1` and both `//cc:defs.bzl` and the per-rule `.bzl` files exist across that whole span |
+| `rules_cc` | 0.0.16 – 0.2.22 | 0.2.14 – 0.2.22 | Dolphin; **Ladybird**; fmt, spdlog, TinyXML2, zlib; BoringSSL, Abseil, RE2 | Dolphin: `//...` green in 3 configurations, 1350 tests pass, action-graph parity 0 errors. Build re-verified green at declared 0.0.16 / 0.1.1 / 0.2.22; `compatibility_level = 1` and both `//cc:defs.bzl` and the per-rule `.bzl` files exist across that whole span. Ladybird: 34 libraries + 6 executables, ~3.7k C++23 TUs, renders pages byte-identically to the CMake reference |
 | `platforms` | 0.0.10 – 1.1.0 | 1.0.0 – 1.1.0 | same | as above; only ever a transitive/constraint dep |
+| `rules_shell` | 0.6.1 | 0.6.1 | Ladybird | one point. Only because Bazel 9 removed the native `sh_binary`, which the vcpkg/cargo build wrappers are |
+| `rules_qt` (**kklochkov**, not the BCR module) | 2.0.1 | 2.0.1 (`archive_override`) | Ladybird | `qt.local_repo` (qmake-discovered host Qt 6.10.2) + `qt_cc_moc` over 11 `Q_OBJECT` headers + `qt_qrc`/`qt_cc_rcc`; all 11 moc bodies byte-identical to CMake's, GUI runs. See [the section below](#dolphin-qt-handled-by-hand-and-a-ruleset-that-was-missed) |
 | `rules_jvm_external` | 6.7 | — | Guava (Maven frontend) | one point, coordinate deps only; the Maven frontend is argv-floor, so this is not a parity claim |
 | `rules_license`, `googletest`, `google_benchmark`, `rules_python` | see note | — | BoringSSL, Abseil, RE2 | **not our choices** — these are what those projects' *own* Bazel builds declare (`rules_license` 1.0.0, `googletest` 1.17.0.bcr.2, `google_benchmark` 1.9.4/1.9.5, `rules_python` 1.7.0). We diffed against them; we did not select them |
 
 Bazel itself: **7.5.0** (VSCode, pinned in `.bazelversion`) and **9.2.0**
-(Dolphin). No migration here has needed a Bazel-version-specific workaround.
+(Dolphin, Ladybird). One Bazel-version-specific consequence, not a workaround:
+on 9.2.0 the native `sh_binary` is gone, so Ladybird has to declare
+`rules_shell` for wrappers that needed no dep on 7.x.
 Every "resolved" column above is a fact about 9.2.0, not about the declared file.
+
+Ladybird declares **4** modules and resolves **27** — the same transitive blow-up
+as Dolphin (`rules_cc → protobuf → …` brings in `rules_kotlin`, `rules_android`,
+`rules_swift`, `rules_jvm_external`), and worth restating because Ladybird's Qt
+and Rust rings deliberately avoid rulesets: the transitive cost arrives through
+`rules_cc` regardless of how little else you adopt.
+
+Ladybird has `common --check_direct_dependencies=error` in its `.bazelrc`, per the
+rule above — and turning it on immediately failed: it declared `rules_cc 0.2.17`
+while 0.2.19 resolved. The declared version was inert, exactly as this section
+predicts. Corrected to what resolves, with the build re-verified green after.
 
 ## Written by hand instead of adopting a ruleset
 
@@ -160,8 +175,31 @@ is in the ruleset that is **not** in the BCR under `rules_qt`. Querying the
 registry for `rules_qt` returns the prebuilt-single-version one, which would have
 pinned Qt 6.8.3 and turned the migration into a different build.
 
-Neither has been used here, so this is a pointer for whoever hits Qt next, not a
-recommendation. The transferable parts:
+**Since written, `kklochkov/rules_qt` 2.0.1 has been used** — Ladybird's Qt UI
+runs on it (`qt.local_repo` + `qt_cc_moc`/`qt_qrc`), so the paragraph above is
+now a result rather than a prediction, and it held: `qmake -query` found the same
+6.10.2 SDK `find_package` does. Two things only the use showed, both in
+[CASE-ladybird-migration](CASE-ladybird-migration.md) §Qt (findings 19–21):
+
+* **The moc rule must own the include paths, and this one does.** moc emits
+  metatype includes only for types whose definition it has *seen*, so a
+  hand-rolled genrule needs a `moc_input_headers` filegroup plus matching `-I`
+  flags kept in sync by hand — and getting it wrong yields *wrong output that
+  still compiles* (four outputs silently lost an include), caught only by
+  byte-diffing against CMake. `qt_cc_moc` reads the dirs off the Qt toolchain's
+  `CcInfo` compilation context and stages the headers itself: byte-identical moc
+  bodies with **zero** include flags in the BUILD file. This is the concrete form
+  of "the rule knows what moc needs better than its callers do", and it is the
+  strongest argument for the ruleset over a genrule.
+* **A good ruleset withholds the knob you would have misused.** Splitting CMake's
+  unity `mocs_compilation.cpp` into per-header TUs exposed a latent Ladybird bug
+  (an inline `dynamic_cast` on a forward-declared type, compiling only because of
+  include *order* inside the unity file). moc's `-b` flag would have papered over
+  it in the build system; `qt_cc_moc` offers no such knob, which forced the
+  one-line upstreamable header fix instead. Unity builds hide incomplete-type
+  bugs, so a migration off one should expect to find them.
+
+The transferable parts of the comparison:
 
 * **BCR presence is not fitness, and BCR absence is not nonexistence.** The
   registry is a distribution channel, not a curated index. Search wider, and
@@ -186,6 +224,32 @@ prebuilt artifact you never claimed parity on is a different thing — VSCode's
 `nodegyp_module` shells out to `node-gyp rebuild` for native `.node` modules, and
 nothing is lost, because those binaries were never part of the parity claim.
 
+Ladybird walks that line at scale, and how it does so is the reusable part.
+Its 77 vcpkg ports and 10 Rust crates are third-party leaves, so running their
+native builders (`vcpkg install`, `cargo build`) costs nothing a parity claim
+needed. But rather than reach for `rules_foreign_cc`, both are **ordinary Bazel
+actions** — `vcpkg_tree` and `cargo_crate` — and the reason is what the wrapper
+would have taken away:
+
+* **Fetching is the part Bazel must own; building is the part it need not.** The
+  dependency's *identity* (URL + hash) is exactly what a build has to pin, and
+  what `rules_foreign_cc` leaves to the foreign tool's own downloader. So the
+  fetch is hoisted out into `http_file`/`http_archive` repos generated from a
+  captured pin, and the recipe runs offline against them — `vcpkg` under
+  `x-block-origin`, `cargo` under a network-blocked action with a vendored
+  registry. The invariant is verifiable and was verified by removal: **zero
+  network access in any action**.
+* **A `repository_rule` was the tempting wrong answer.** `vcpkg_tree` is
+  deliberately a rule, not a repo rule: repository fetches escape the action
+  graph, the sandbox and remote execution, so a 45-minute dependency build would
+  have been invisible to `aquery` and uncacheable in the normal way. As a rule its
+  inputs and outputs are declared like anything else.
+
+Which sharpens the section title: the question is not "is this code I am
+migrating?" but "**which properties do I need to remain checkable?**" For
+Ladybird's deps that is hermeticity and pinning, not compile parity — and
+`rules_foreign_cc` happens to give up precisely those.
+
 ## Checklist for the Bazel side of a migration
 
 1. Resolve every version at migration time; do not write one from memory.
@@ -197,6 +261,10 @@ nothing is lost, because those binaries were never part of the parity claim.
 5. Decide what equivalence you need — byte-identical or content-equivalent —
    before choosing. Ecosystem rules target the latter.
 6. Weigh the transitive graph (`bazel mod graph`), not just the direct dep.
-7. Keep `rules_foreign_cc` away from the code under migration.
+7. Keep `rules_foreign_cc` away from the code under migration. For third-party
+   leaves, run the foreign builder as a plain Bazel *action* (not a
+   `repository_rule`) over separately-pinned fetched inputs, so hermeticity stays
+   checkable even where compile parity is not claimed.
 8. When the migration converges, run `bazel mod graph` and record the **resolved**
-   versions. That is the only version list worth keeping.
+   versions, and put `common --check_direct_dependencies=error` in `.bazelrc` so
+   the two cannot drift apart again. That is the only version list worth keeping.

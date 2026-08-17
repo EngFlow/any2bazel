@@ -184,11 +184,20 @@ rust_sysroot = rule(
 # one crate's .rs files rebuilds one crate.
 # ---------------------------------------------------------------------------
 CargoCrateInfo = provider(
-    doc = "One built Rust staticlib plus the FFI headers its build script wrote.",
+    doc = "One built Rust crate plus the FFI headers its build script wrote.",
     fields = {
-        "archive": "The lib<crate>.a File.",
+        "archive": "The lib<crate>.a File, or None for a --bin crate, which " +
+                   "has no archive to link: what its C++ consumer uses is the " +
+                   "EXECUTABLE, spawned at run time (libwasm_cranelift).",
         "headers": "The generated FFI header Files.",
-        "include_dirs": "Dirs to put on the include path for those headers.",
+        "include_dirs": "Dirs to put on the include path for those headers. " +
+                        "Exported through CcInfo, so TRANSITIVE -- only ever the " +
+                        "ffi/ root, whose spellings are unique per crate.",
+        "bare_include_dir": "The ffi/<prefix> dir, for crates whose header is " +
+                            "#included with no directory. Deliberately NOT in " +
+                            "CcInfo: 8 crates ship a RustFFI.h, so this must stay " +
+                            "LOCAL to the owning library (its own copts), the way " +
+                            "CMake's per-library FFI_OUTPUT_DIR is. Empty otherwise.",
     },
 )
 
@@ -280,17 +289,64 @@ def _cargo_crate_impl(ctx):
         },
         use_default_shell_env = True,
     )
-    include_dirs = [
-        "%s/%s/%s" % (archive.root.path, ctx.label.package, ffi_root),
-    ]
-    if ctx.attr.ffi_prefix:
-        include_dirs.append(include_dirs[0] + "/" + ctx.attr.ffi_prefix)
+    # The include root is the directory that makes each header resolve at the
+    # spelling its consumers use, and NOTHING more.
+    #
+    # 8 of the 10 crates emit a header literally named RustFFI.h (CMake:
+    # `FFI_HEADER RustFFI.h`), so a shared, unprefixed root is AMBIGUOUS: with
+    # both <crate>/ffi dirs on one command line, a bare `#include <RustFFI.h>`
+    # binds to whichever -isystem came first. That is not hypothetical -- it was
+    # happening: LibRegex's compile received libunicode_rust/ffi BEFORE
+    # libregex_rust/ffi, so `<RustFFI.h>` in RustRegex.h resolved to LibUnicode's
+    # header, and the build only worked because a leftover
+    # -IBuild/full/Libraries/LibRegex shadowed both. Removing the CMake tree
+    # exposed it as "'RustRegexFlags' has not been declared".
+    #
+    # CMake has no such ambiguity: FFI_OUTPUT_DIR defaults to
+    # CMAKE_CURRENT_BINARY_DIR, so a library sees ONLY its own crate's dir. The
+    # faithful translation is therefore the PREFIXED root only (ffi/LibRegex), so
+    # <LibRegex/RustFFI.h> resolves and a bare <RustFFI.h> does not resolve to
+    # someone else's header. The 4 TUs that spell it bare get the unprefixed dir
+    # too -- but only from their OWN crate, via ffi_bare_include below.
+    # BOTH roots are needed, and they are not interchangeable:
+    #   ffi/            -> makes the PREFIXED spelling <LibUnicode/RustFFI.h> work
+    #                      (32 TUs; the header sits at ffi/LibUnicode/RustFFI.h)
+    #   ffi/<prefix>/    -> makes the BARE spelling <RustFFI.h> work (4 TUs)
+    # Dropping ffi/ broke LibUnicode ("LibUnicode/RustFFI.h: No such file"), and
+    # exposing ffi/ for EVERY crate is what made the bare spelling ambiguous in
+    # the first place (8 crates all ship a RustFFI.h, so first -isystem wins).
+    #
+    # The resolution: every crate gets ffi/ (needed for its own prefixed spelling,
+    # and harmless because that spelling is unique per crate), but only the crates
+    # whose header is included bare ALSO get ffi/<prefix>/. That keeps exactly one
+    # unprefixed candidate per compile for a bare include -- the consuming
+    # library's own -- which is precisely the guarantee CMake gets from
+    # FFI_OUTPUT_DIR defaulting to the library's own binary dir.
+    # Only the PREFIXED-capable root goes in the provider, because CcInfo's
+    # system_includes propagate TRANSITIVELY: every dir here lands on every
+    # downstream library's command line. That is correct for ffi/ (the spelling
+    # <LibUnicode/RustFFI.h> is unique per crate) and wrong for ffi/<prefix>/ (8
+    # crates ship a RustFFI.h, so a bare <RustFFI.h> would bind to whichever
+    # crate's dir sorted first). LibGfx proved it: it inherited LibRegex's and
+    # LibTextCodec's bare dirs through the dep graph and compiled against
+    # LibRegex's header ("'FFI' does not name a type").
+    #
+    # So the bare-include dir is NOT exported here. It is published separately as
+    # `bare_include_dir` for the OWNING library to put on its own copts, where it
+    # is local and cannot leak downstream -- which is exactly the scope CMake's
+    # FFI_OUTPUT_DIR (the library's own binary dir) has.
+    ffi_base = "%s/%s/%s" % (archive.root.path, ctx.label.package, ffi_root)
+    include_dirs = [ffi_base]
+    bare_dir = ""
+    if ctx.attr.ffi_prefix and ctx.attr.ffi_bare_include:
+        bare_dir = ffi_base + "/" + ctx.attr.ffi_prefix
     return [
         DefaultInfo(files = depset([archive] + headers)),
         CargoCrateInfo(
             archive = archive,
             headers = headers,
             include_dirs = include_dirs,
+            bare_include_dir = bare_dir,
         ),
     ]
 
@@ -303,6 +359,13 @@ cargo_crate = rule(
     undeclared output is deleted by Bazel, which is how a header CMake never
     declared (HTMLTokenizerRustFFI.h) turned up.""",
     attrs = {
+        "ffi_bare_include": attr.bool(
+            default = False,
+            doc = "Deprecated-by-construction escape hatch: also expose this " +
+                  "crate's unprefixed ffi dir, for the TUs that spell the " +
+                  "header <RustFFI.h> with no directory. Per-crate so it can " +
+                  "never make two crates' headers collide.",
+        ),
         "crate": attr.string(mandatory = True, doc = "The cargo package name."),
         "manifest": attr.string(
             mandatory = True,
@@ -363,19 +426,38 @@ cargo_crate = rule(
 )
 
 def _cargo_binary_impl(ctx):
-    """A cargo `--bin` crate, e.g. flapc.
+    """A cargo `--bin` crate: flapc, and cranelift-compiler.
 
     Same action, different cargo subcommand, and the output is executable so a
     genrule can name it in `tools`. flapc's own 3-package workspace gets the
     identical treatment: its lock file has exactly one registry crate (smallvec,
     pinned `=1.15.1`, the same version and checksum as the big workspace's), so
     it needs no separate machinery at all.
+
+    A binary crate can ALSO emit an FFI header, and the second one does:
+    libwasm_cranelift's build.rs runs cbindgen exactly as the staticlib crates'
+    do, and LibWasm's CraneliftBridge.cpp includes the result. So `ffi_headers`
+    is the same declared-output contract cargo_crate has, for the same reason (an
+    undeclared output is deleted by Bazel) -- what differs is only that there is
+    no archive: what C++ consumes from this crate is the *executable*, spawned at
+    run time via WASM_CRANELIFT_COMPILER_PATH.
     """
     out = ctx.actions.declare_file(ctx.label.name)
+    ffi_root = "%s.ffi" % ctx.label.name
+    headers = [
+        ctx.actions.declare_file("%s/%s/%s" % (ffi_root, ctx.attr.ffi_prefix, h))
+        for h in ctx.attr.ffi_headers
+    ]
+    ffi_out = ""
+    if headers:
+        ffi_out = "%s/%s/%s" % (out.root.path, ctx.label.package, ffi_root)
+        if ctx.attr.ffi_prefix:
+            ffi_out += "/" + ctx.attr.ffi_prefix
+
     index, crate_inputs = _crate_index(ctx)
     sysroot = ctx.file.sysroot
     ctx.actions.run(
-        outputs = [out],
+        outputs = [out] + headers,
         inputs = depset([index, sysroot, ctx.file._vendor] + ctx.files.srcs +
                         crate_inputs),
         executable = ctx.executable._build,
@@ -387,7 +469,8 @@ def _cargo_binary_impl(ctx):
             index.path,
             out.path,
             ctx.attr.bin,
-        ],
+            ffi_out,
+        ] + ctx.attr.ffi_headers,
         mnemonic = "CargoBinary",
         progress_message = "Building Rust binary %s (offline)" % ctx.attr.bin,
         execution_requirements = {"block-network": "1"},
@@ -399,21 +482,52 @@ def _cargo_binary_impl(ctx):
         },
         use_default_shell_env = True,
     )
-    return [DefaultInfo(
-        files = depset([out]),
-        executable = out,
-        runfiles = ctx.runfiles(files = [out]),
-    )]
+    ffi_base = "%s/%s/%s" % (out.root.path, ctx.label.package, ffi_root)
+    bare_dir = ""
+    if ctx.attr.ffi_prefix and ctx.attr.ffi_bare_include:
+        bare_dir = ffi_base + "/" + ctx.attr.ffi_prefix
+    return [
+        DefaultInfo(
+            files = depset([out]),
+            executable = out,
+            runfiles = ctx.runfiles(files = [out]),
+        ),
+        # Carried even with no headers (flapc), so a consumer asking for this
+        # crate's headers gets an empty set rather than a missing provider.
+        CargoCrateInfo(
+            archive = None,
+            headers = headers,
+            include_dirs = [ffi_base] if headers else [],
+            bare_include_dir = bare_dir,
+        ),
+    ]
 
 cargo_binary = rule(
     implementation = _cargo_binary_impl,
     executable = True,
-    doc = "Build a cargo binary crate offline (flapc), runnable as a genrule tool.",
+    doc = """Build a cargo binary crate offline, runnable as a genrule tool.
+
+    Two of them: flapc (a pure tool) and cranelift-compiler (a tool Ladybird
+    SPAWNS at run time, which additionally emits the FFI header LibWasm
+    includes).""",
     attrs = {
         "crate": attr.string(mandatory = True),
         "bin": attr.string(mandatory = True, doc = "The --bin name."),
         "manifest": attr.string(mandatory = True),
         "crate_features": attr.string_list(),
+        "ffi_headers": attr.string_list(
+            doc = "Headers this crate's build script writes, relative to " +
+                  "ffi_prefix. Declared so Bazel keeps them.",
+        ),
+        "ffi_prefix": attr.string(
+            doc = "Directory the headers are staged under, so the include " +
+                  "spelling <LibWasm/CraneliftFFI.h> resolves.",
+        ),
+        "ffi_bare_include": attr.bool(
+            doc = "Whether the owning library includes the header with no " +
+                  "directory. Derived by scanning the source, see " +
+                  "emit_cargo_bazel.crates_included_bare().",
+        ),
         "srcs": attr.label_list(allow_files = True),
         "crates": attr.string_keyed_label_dict(allow_files = True),
         "sysroot": attr.label(allow_single_file = True, mandatory = True),
@@ -478,16 +592,29 @@ cargo_binary = rule(
 def _cargo_lib_impl(ctx):
     info = ctx.attr.crate[CargoCrateInfo]
     archive = info.archive
+    compilation = cc_common.create_compilation_context(
+        headers = depset(info.headers),
+        # -isystem, not -I: these are cbindgen output, and Ladybird's
+        # -Werror should not fire inside generated code (the same reason
+        # the vcpkg headers are -isystem).
+        system_includes = depset(info.include_dirs),
+    )
+    if archive == None:
+        # A --bin crate (libwasm_cranelift): headers to include, NOTHING to link.
+        # The binary itself is not a link input at all -- LibWasm SPAWNS it, so it
+        # belongs in the consumer's data/runfiles, not in its linking context.
+        # Handled here rather than with a second rule so a binary crate that emits
+        # a header is consumed with exactly the same two labels a staticlib crate
+        # is (//:<crate>_lib and //:<crate>_bare_include), and the ring emitter
+        # needs no special case.
+        return [
+            DefaultInfo(files = depset(info.headers)),
+            CcInfo(compilation_context = compilation),
+        ]
     return [
         DefaultInfo(files = depset([archive] + info.headers)),
         CcInfo(
-            compilation_context = cc_common.create_compilation_context(
-                headers = depset(info.headers),
-                # -isystem, not -I: these are cbindgen output, and Ladybird's
-                # -Werror should not fire inside generated code (the same reason
-                # the vcpkg headers are -isystem).
-                system_includes = depset(info.include_dirs),
-            ),
+            compilation_context = compilation,
             linking_context = cc_common.create_linking_context(
                 linker_inputs = depset([cc_common.create_linker_input(
                     owner = ctx.label,
@@ -505,6 +632,44 @@ def _cargo_lib_impl(ctx):
             ),
         ),
     ]
+
+def _cargo_bare_include_impl(ctx):
+    """A CcInfo carrying ONLY the crate's ffi/<prefix> dir.
+
+    Depended on by the ONE library that owns the crate, so its TUs can spell the
+    header `<RustFFI.h>` with no directory -- the spelling CMake allows because
+    FFI_OUTPUT_DIR is the library's own binary dir.
+
+    This is a separate target rather than part of cargo_lib because CcInfo's
+    system_includes propagate transitively: folded into cargo_lib, the dir would
+    reach every downstream library and a bare <RustFFI.h> would bind to whichever
+    of the 8 crates' dirs came first on the command line. As its own target it is
+    added by exactly one library and travels no further, because nothing depends
+    on that library's copts. Verified by removal: with this folded into cargo_lib,
+    LibGfx compiled against LibRegex's header ('FFI' does not name a type).
+    """
+    info = ctx.attr.crate[CargoCrateInfo]
+    if not info.bare_include_dir:
+        fail("cargo_bare_include on a crate with no bare_include_dir: %s" %
+             ctx.attr.crate.label)
+    return [
+        DefaultInfo(files = depset(info.headers)),
+        CcInfo(
+            compilation_context = cc_common.create_compilation_context(
+                headers = depset(info.headers),
+                system_includes = depset([info.bare_include_dir]),
+            ),
+        ),
+    ]
+
+cargo_bare_include = rule(
+    implementation = _cargo_bare_include_impl,
+    doc = "The unprefixed FFI include dir for the crate's OWNING library only.",
+    attrs = {
+        "crate": attr.label(providers = [CargoCrateInfo], mandatory = True,
+                            cfg = "exec"),
+    },
+)
 
 cargo_lib = rule(
     implementation = _cargo_lib_impl,

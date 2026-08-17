@@ -135,6 +135,34 @@ import_rust_crate(
 )
 '''
 
+# The OTHER kind of Rust target CMake has, and the one this migration missed
+# entirely for a long time (finding 35): build_rust_binary(). Two shapes, both
+# real -- a pure build tool with no header at all, and a runtime tool whose build
+# script ALSO runs cbindgen (FFI_OUTPUT_DIR present at the call site).
+CMAKE_JS = '''
+build_rust_binary(
+    MANIFEST_PATH Flap/Cargo.toml
+    CRATE_NAME flapc
+    BINARY_NAME flapc
+    OUTPUT_PATH_VAR FLAPC_BIN
+)
+'''
+
+CMAKE_WASM = '''
+build_rust_binary(
+    MANIFEST_PATH Rust/Cargo.toml
+    CRATE_NAME libwasm_cranelift
+    BINARY_NAME cranelift-compiler
+    OUTPUT_PATH_VAR WASM_CRANELIFT_COMPILER_BINARY
+    FFI_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}"
+)
+'''
+
+# The bare include that makes libwasm_cranelift's header dir opt-in: LibWasm
+# spells it with no directory, because CMake's FFI_OUTPUT_DIR is LibWasm's own
+# binary dir. The scan must find this rather than a list saying so.
+WASM_TU = "#include <CraneliftFFI.h>\n"
+
 
 def _fixture():
     d = tempfile.mkdtemp()
@@ -145,10 +173,16 @@ def _fixture():
     os.makedirs(os.path.join(d, "Libraries/LibJS/Flap"))
     with open(os.path.join(d, "Libraries/LibJS/Flap/Cargo.lock"), "w") as f:
         f.write(FLAP_LOCK)
-    for lib, text in (("LibGfx", CMAKE_GFX), ("LibWeb", CMAKE_WEB)):
+    with open(os.path.join(d, "Cargo.toml"), "w") as f:
+        f.write('[workspace]\nmembers = ["Libraries/LibWasm/Rust"]\n'
+                'exclude = ["Libraries/LibJS/Flap"]\n')
+    for lib, text in (("LibGfx", CMAKE_GFX), ("LibWeb", CMAKE_WEB),
+                      ("LibJS", CMAKE_JS), ("LibWasm", CMAKE_WASM)):
         os.makedirs(os.path.join(d, "Libraries", lib), exist_ok=True)
         with open(os.path.join(d, "Libraries", lib, "CMakeLists.txt"), "w") as f:
             f.write(text)
+    with open(os.path.join(d, "Libraries/LibWasm/CraneliftBridge.cpp"), "w") as f:
+        f.write(WASM_TU)
     return d
 
 
@@ -330,9 +364,17 @@ def test_colliding_header_names_are_real():
                            index))
     owners = [k for k, v in hdrs.items() if "'RustFFI.h'" in v]
     assert len(owners) >= 6, owners
-    driver = _read("Meta/cargo_build.sh")
-    assert "root-output" in driver, "the header lookup no longer prefers OUT_DIR"
-    assert "FFI_SCRATCH" in driver, "FFI_OUTPUT_DIR is no longer a scratch dir"
+    # The lookup lives in cargo_vendor.sh, SHARED by both cargo drivers -- the
+    # staticlib one and the --bin one -- because a binary crate's build script
+    # runs cbindgen into the same shared dir and would collide the same way
+    # (libwasm_cranelift emits CraneliftFFI.h). One copy, so the two cannot drift.
+    lib = _read("Meta/cargo_vendor.sh")
+    assert "root-output" in lib, "the header lookup no longer prefers OUT_DIR"
+    assert "FFI_SCRATCH" in lib, "FFI_OUTPUT_DIR is no longer a scratch dir"
+    for driver in ("Meta/cargo_build.sh", "Meta/cargo_binary_build.sh"):
+        txt = _read(driver)
+        assert "sync_ffi_headers " in txt, driver
+        assert "root-output" not in txt, "%s has its own copy of the lookup" % driver
 
 
 def test_headers_are_prefixed_so_both_include_spellings_resolve():
@@ -405,7 +447,7 @@ def test_the_emitter_is_idempotent_and_needs_no_cargo_or_network():
             mod.emit_crates(crates)
             mod.emit_index(crates, specs)
             mod.emit_extension(crates)
-            mod.emit_ring(crates, specs)
+            mod.emit_ring(crates, specs, mod.binary_specs())
         outs.append(buf.getvalue())
     assert outs[0] == outs[1]
     assert "http_archive(" in outs[0]
@@ -434,7 +476,8 @@ def test_check_flag_detects_drift_in_a_generated_file():
             {"--crates": lambda: mod.emit_crates(crates),
              "--index": lambda: mod.emit_index(crates, specs),
              "--extension": lambda: mod.emit_extension(crates),
-             "--ring": lambda: mod.emit_ring(crates, specs)}[fl]()
+             "--ring": lambda: mod.emit_ring(crates, specs,
+                                             mod.binary_specs())}[fl]()
         with open(os.path.join(d, "out", fn), "w") as f:
             f.write(b.getvalue())
     buf = io.StringIO()
@@ -475,13 +518,20 @@ def test_nothing_generated_still_reads_the_cmake_cargo_tree():
     """
     offenders = []
     for rel in ("BUILD.bazel", "Libraries/LibWeb/BUILD.bazel", "codegen_root.bzl",
-                "cargo_ring.bzl", "cargo_index.bzl", "bazelrc.txt",
-                "Build/full/Libraries/BUILD.bazel"):
+                "cargo_ring.bzl", "cargo_index.bzl", "bazelrc.txt"):
         txt = _read(rel)
         if re.search(r"//Build/full/cargo|Build/full/cargo/build|rust_ffi_headers\b",
                      txt.replace("no rust_ffi_headers", "")):
             offenders.append(rel)
     assert not offenders, "still reference CMake's cargo tree: %s" % offenders
+    # And the stronger statement, which is what finding 35 cost a week to learn:
+    # the overlay must not contain a Build/full PACKAGE at all. It used to ship
+    # three (Libraries/, Services/, UI/), globbing CMake's build tree with
+    # allow_empty = True -- so on a fresh clone they matched nothing, reported
+    # nothing, and the build died 1,600 actions later on a missing header. A file
+    # list that CAN be empty proves nothing; a directory that must not exist does.
+    assert not os.path.exists(os.path.join(_WS, "Build", "full")), \
+        "the Build/full shim packages are back"
 
 
 def test_each_crate_links_its_own_archive_and_no_others():
@@ -510,8 +560,16 @@ def test_each_crate_links_its_own_archive_and_no_others():
     assert "additional_inputs" in impl, "the archive would not be in the sandbox"
     ring = _read("cargo_ring.bzl")
     assert ring.count("cargo_crate(") == 10
-    assert ring.count("cargo_lib(") == 10, "one consumable target per crate"
+    # One consumable target per crate that has something to consume: the 10
+    # staticlib crates, plus libwasm_cranelift -- a `--bin` crate, so it has NO
+    # archive at all and cargo_lib yields a headers-only CcInfo for it (the
+    # executable is spawned at run time, and travels as `data`). That "archive
+    # may be None" branch is the shape a binary crate needs, and it is why the
+    # count is 11 rather than 10.
+    assert ring.count("cargo_lib(") == 11, "one consumable target per crate"
+    assert ring.count("cargo_binary(") == 2
     assert "cargo_libs(" not in ring, "the shared link group is gone"
+    assert "if archive == None:" in impl, "a --bin crate has no archive to link"
 
 
 def test_a_library_depends_on_the_crates_it_uses_and_no_others():
@@ -573,10 +631,87 @@ def test_flapc_is_built_by_bazel_and_used_as_the_genrule_tool():
     """The last artifact this migration took from CMake."""
     ring = _read("cargo_ring.bzl")
     assert "cargo_binary(" in ring
-    assert 'bin = "flapc"' in ring
+    assert re.search(r"bin = ['\"]flapc['\"]", ring)
     codegen = _read("codegen_root.bzl")
     assert "tools = ['//:flapc']" in codegen
     assert "Build/full/bin/flapc" not in codegen
+
+
+def test_every_build_rust_binary_crate_is_in_the_ring_with_its_header():
+    """Finding 35's second bug: a whole crate missing because CMake was not read.
+
+    `Libraries/LibWasm/CMakeLists.txt` was absent from CMAKELISTS and
+    `build_rust_binary()` was not parsed at all, so libwasm_cranelift -- a crate
+    that emits a header LibWasm's CraneliftBridge.cpp includes -- was ENTIRELY
+    ABSENT from the Bazel graph. Nothing said so: the header sat in
+    `Build/full/Libraries/LibWasm` where a global `-I` reached it, and the binary
+    was named by an absolute path baked into
+    `-DWASM_CRANELIFT_COMPILER_PATH=/home/ubuntu/...` -- two host escapes covering
+    for one missing target, which is why removing the shims was the only thing
+    that could find it.
+
+    Two halves, both asserted: the CALL SITE is parsed (a `--bin` crate has no
+    archive, but it can still emit a header, and whether it does is
+    `FFI_OUTPUT_DIR` at the call site -- not a list written down here), and every
+    binary crate reaches the checked-in ring with the same two consumable labels
+    a staticlib crate gets.
+    """
+    mod = _load(_fixture())
+    bins = {b["crate"]: b for b in mod.binary_specs()}
+    assert set(bins) == {"flapc", "libwasm_cranelift"}, sorted(bins)
+    # flapc's call site has no FFI_OUTPUT_DIR, so it declares no header at all;
+    # asking for one would fail the action (cargo never writes it).
+    assert bins["flapc"]["ffi_headers"] == []
+    assert bins["flapc"]["manifest"] == "Libraries/LibJS/Flap/Cargo.toml"
+    # libwasm_cranelift's does, so the header is a DECLARED output -- Bazel
+    # deletes what nothing declares -- and the bare-include flag comes from
+    # SCANNING the tree for the directory-less spelling, not from a list.
+    assert bins["libwasm_cranelift"]["ffi_headers"] == ["CraneliftFFI.h"]
+    assert bins["libwasm_cranelift"]["ffi_bare_include"] is True
+
+    # And the same two, present in the checked-in ring and consumed by the root
+    # package. Pinned by count so a third call site cannot appear unnoticed.
+    ring = _read("cargo_ring.bzl")
+    root = _read("BUILD.bazel")
+    assert ring.count("cargo_binary(") == 2, ring.count("cargo_binary(")
+    for b in bins.values():
+        assert re.search(r"bin = ['\"]%s['\"]" % re.escape(b["bin"]), ring), b
+        if not b["ffi_headers"]:
+            continue
+        assert "'%s_lib'" % b["crate"] in ring
+        assert "//:%s_lib" % b["crate"] in root
+        assert "implementation_deps = ['//:%s_bare_include']" % b["crate"] in root
+    # The binary itself is data, not a link input: LibWasm SPAWNS it.
+    assert "data = ['//:cranelift-compiler']" in root
+
+
+def test_a_bare_include_dir_arrives_only_through_implementation_deps():
+    """Finding 35's include-collision bug, in the one form that actually fixed it.
+
+    8 of the 10 crates emit a header literally named `RustFFI.h`, and 4 TUs
+    include it bare (`#include <RustFFI.h>`), which CMake allows because
+    FFI_OUTPUT_DIR is PRIVATE to the owning library. Splitting the unprefixed dir
+    into its own `cargo_bare_include` target was necessary but NOT sufficient:
+    CcInfo include dirs also propagate along the C++ dep graph, so LibGfx
+    inherited LibTextCodec's dir through `LibGfx -> LibTextCodec` and
+    `YUVData.cpp` failed with `'FFI' does not name a type` -- compiling against
+    the WRONG crate's header. `implementation_deps` is Bazel's name for exactly
+    CMake's PRIVATE, and only it stops the propagation.
+
+    Hence: every bare-include target in the tree must be reached through
+    implementation_deps, never `deps`. One `deps = [...bare_include]` anywhere
+    silently re-creates the bug for everything downstream of that library.
+    """
+    root = _read("BUILD.bazel")
+    targets = sorted(set(re.findall(r"//:(\w+_bare_include)", root)))
+    assert targets, "no crate exposes an unprefixed FFI include dir any more"
+    for t in targets:
+        assert "implementation_deps = ['//:%s']" % t in root, t
+    # ... and nothing anywhere else in the overlay pulls one in publicly.
+    for rel in ("BUILD.bazel", "Libraries/LibWeb/BUILD.bazel", "cargo_ring.bzl"):
+        txt = _read(rel)
+        for m in re.finditer(r"\n    deps = \[([^\]]*)\]", txt):
+            assert "bare_include" not in m.group(1), (rel, m.group(1))
 
 
 def test_the_libweb_package_exports_its_crate_sources():
@@ -612,3 +747,11 @@ def test_every_extension_created_repo_is_named_in_module_bazel():
     # Plus the three toolchain components.
     assert {"rust_rustc_1_96_1", "rust_cargo_1_96_1",
             "rust_rust_std_1_96_1"} <= named
+
+# No `if __name__ == "__main__"` runner here on purpose. There used to be one in
+# every test file, and in this file it sat MID-FILE -- so four tests appended after
+# it were defined, never called, and the file still printed "6/6 passed". The third
+# instance of this session's recurring bug: a report that cannot count what it does
+# not reach. `python3 tests/run_all.py` enumerates the module instead, so a test's
+# POSITION in the file cannot decide whether it runs; it also fails if a file
+# defines no tests at all. Run a single file with `run_all.py <name-substring>`.

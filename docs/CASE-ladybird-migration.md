@@ -8,6 +8,21 @@ generated BUILD files — is in [`examples/ladybird/`](../examples/ladybird/),
 along with an honest inventory of what still stops it from being a
 clone-and-build.
 
+Bazel now builds the browser with **nothing** read out of CMake's build tree
+(`Build/full`) — 0 targets in the closure of all six binaries, down from 741. That
+was claimed prematurely and was false for most of this migration;
+[finding 35](#finding-35-the-claim-was-false-and-a-glob-is-why-nobody-noticed) is
+the autopsy, and it is the finding to read first if you are migrating a project of
+your own — the bug was in the *shape of the verification*, not in the Bazel rules.
+
+**`git clone && bazel build` on a fresh clone still fails, though, and finding 36
+is the second autopsy.** Removing `Build/full` was the goal, so `Build/full` is
+what I verified; the clone needs four *other* things nobody had asked for — a
+vcpkg checkout (globbed with `allow_empty = True`, the same pattern one tree over),
+its `.git`, an unpinned HSTS table, and `pip install ply` inside a vcpkg port that
+`x-block-origin` never sees. **The only check that finds all of them is doing the
+clone**, which is finding 36's one-line summary and took two goes to learn.
+
 ## Why Ladybird
 
 A real, recognizable, from-scratch browser engine — a strong headline for the
@@ -47,7 +62,12 @@ AK is the foundation library (38 sources, external deps fmt/simdutf/mimalloc/
 cpptrace, two configure-generated headers). Standing it up end-to-end proved the
 whole loop works on real Ladybird and surfaced the reusable scaffolding:
 
-- **`MODULE.bazel`**: bzlmod, `rules_cc` 0.2.17, `platforms` 1.0.0.
+- **`MODULE.bazel`**: bzlmod, `rules_cc` 0.2.19, `platforms` 1.0.0. (Declared
+  0.2.17 for most of this migration, which was inert: MVS resolved 0.2.19 via
+  `bazel_tools` on Bazel 9.2.0. Caught only on adding
+  `common --check_direct_dependencies=error`, which is now in the `.bazelrc` so
+  the declared and resolved versions cannot drift apart again — see
+  [BAZEL-RULES](BAZEL-RULES.md).)
 - **vcpkg shim**: a `BUILD.bazel` dropped into
   `Build/full/vcpkg_installed/x64-linux-dynamic/` — one `cc_library(:headers)`
   over the whole `include/` tree + `cc_import` per prebuilt `.so`. Consumes
@@ -1423,10 +1443,1196 @@ Both remaining debts are over-declaration, and they are honest:
 - Each `vcpkg_lib` still declares the whole vcpkg tree as its header input
   (finding 33's leftover). Same shape: paths are per-port, the input *set* is not.
 
-`git clone && bazel build //:ladybird` is now true for the browser. `Build/full`
-is still needed to *regenerate* the BUILD files and to run the parity harness —
-that is a converter-development dependency, not a build dependency, and it is a
-different claim from the one this ring closed.
+Nothing in the emitted build reads `Build/full` any more. It is still needed to
+*regenerate* the BUILD files and to run the parity harness — a converter-development
+dependency, not a build dependency, and a different claim from the one this ring
+closed. (It is also a different claim from "a fresh clone builds", which is still
+false for unrelated reasons — finding 36.)
+
+**That claim was still false when I wrote it, and finding 35 is the autopsy.** I
+had closed the two *binary* dependencies (vcpkg, Rust) and concluded the tree was
+free; it was not. Every binary still depended on **741 targets under `Build/full`**
+for *generated headers*, and I had not checked, because the thing that would have
+told me — a build failure — could not happen: the shims globbed a foreign tree
+with `allow_empty = True`. Read finding 35 before believing any "verified by
+removal" in this document, including the ones above: removal is only a test of
+what you actually remove.
+
+## Finding 35: the claim was false, and a glob is why nobody noticed
+
+Ulf asked where things stood on checking out Ladybird and building it with Bazel.
+I said it worked — findings 33 and 34 had closed vcpkg and Rust, the two *binary*
+dependencies on CMake's tree, and the README said so in bold. Then I checked,
+which I should have done before saying it.
+
+It did not work. Every one of the six binaries depended on **741 targets under
+`Build/full`**, CMake's build tree, and the overlay in `examples/ladybird/`
+shipped four `BUILD.bazel` files and **zero headers**. A fresh clone got no error
+from that — it built for roughly 1,600 actions and then died on `fatal error:
+LibXML/Export.h: No such file or directory`, a message that names neither the shim
+nor the missing tree.
+
+**The mechanism is the finding.** The shims were
+
+```python
+cc_library(
+    name = "generated_lib_headers",
+    hdrs = glob(["**/*.h"], allow_empty = True),
+    includes = ["."],
+)
+```
+
+over a directory that only exists after a CMake build. `allow_empty = True` turns
+"the tree you depend on is absent" into an empty list and no diagnostic. A glob
+over a foreign tree **cannot fail**, so a shim that is broken and a shim that is
+unnecessary are indistinguishable — and I had been reading a green build as
+evidence for the second.
+
+That generalizes past this migration, and it is the transferable lesson: **if the
+emptiness of a glob means "a thing I depend on is missing", `allow_empty = True`
+converts a build error into a mystery.** Either let it fail, or don't pretend the
+input is optional.
+
+### 741 → 31: most of them were not gaps, they were shadows
+
+Counting the true gaps needed care, and my first count was nonsense — "741
+targets, 76 covered", which is impossible. The bug was **matching headers by
+basename**: every `Export.h` matched every other `Export.h`, so coverage looked
+enormous. Comparing exact logical paths gave the real picture:
+
+| | count | what it was |
+|---|---|---|
+| LibWeb bindings headers | 666 | **Bazel already generates all 692.** The shim was *shadowing* Bazel's own outputs, silently winning or losing on include order |
+| `generate_export_header` `Export.h` | 15 | real gap |
+| Rust FFI headers (`RustFFI.h`, `CraneliftFFI.h`) | 15 | real gap |
+| Qt `moc_predefs.h` | 1 | not a gap at all — Bazel runs moc itself via `rules_qt`; nothing referenced it |
+| AK `configure_file` headers | 2 | already closed earlier in the session |
+
+So 666 of the 741 were pure duplication, which I proved by deleting them: the
+build stayed green and recompiled 2,635 actions from Bazel's own headers. The
+honest gap was **31 files**, and the reason a 90%-redundant shim survived is the
+same `allow_empty` — nothing ever compared the two sets.
+
+### The 15 `Export.h`: derive the template, don't copy the output
+
+`Meta/emit_export_headers_bazel.py` emits them, and two decisions in it matter.
+
+All 15 normalize to **one** template; the per-library tokens are derived the way
+`Meta/CMake/targets.cmake` derives them (api = `upper(lib - "Lib") + "_API"`,
+prefix = `upper(lib)`, exports = `lib + "_EXPORTS"`), so adding a library needs no
+edit. All 17 emitted artifacts (15 + AK's two) are **byte-identical to CMake's**,
+checked by `--check Build/full`, and that check earned its keep twice: once on a
+`#cmakedefine` regex (the templates put the `#` at column 0 with the indent
+*after* it — `#    cmakedefine01 FOO`, which two regex attempts got wrong), and
+once on a **1-byte** difference a `render()`-level check could never see — a
+heredoc adds a trailing newline, so the emitted shell needed one stripped from the
+body. Only byte-comparing the *built artifact* catches that.
+
+`AK/Backtrace.h` is deliberately **not** in the parity check, and that is the
+interesting one. It is not a template — CMake writes it from
+`find_package(Backtrace)`, i.e. from a *question about the host*. So the genrule
+**compiles a probe** rather than baking my machine's answer. Comparing the result
+against my own tree would only re-confirm my own tree, which is why it is
+excluded: test the variable, not the value.
+
+`Libraries/LibWeb` needed its own emitter mode, for a reason worth stating because
+Bazel is right and I was wrong: include dirs cannot escape a package, so LibWeb's
+`Export.h` must be an output *of the LibWeb package*. `includes = ["../.."]` is
+rejected ("resolves to the workspace root"). It lands at `genroot/LibWeb/Export.h`
+with `includes = ["genroot"]`.
+
+### Bug 1: eight crates ship a `RustFFI.h`, and LibRegex had the wrong one
+
+Removing the shim exposed a **real, pre-existing correctness bug**. Eight of the
+ten Rust crates emit a header named literally `RustFFI.h`, and four TUs include it
+with no directory (`#include <RustFFI.h>`). CMake is unambiguous because
+`FFI_OUTPUT_DIR` defaults to the consuming library's *own* binary dir. Bazel puts
+every dep's include dirs on one command line, and my rules published every
+crate's unprefixed `ffi/` dir to every consumer — so **LibRegex was compiling
+against LibUnicode's header**, and the only thing hiding it was a leftover
+`-IBuild/full/Libraries/LibRegex` that shadowed both. Delete the tree and it
+becomes `'RustRegexFlags' has not been declared`.
+
+The fix needed **two** steps, and the first one alone looked sufficient — which is
+the part I would otherwise have shipped:
+
+1. **Publish the unprefixed dir on its own target** (`cargo_bare_include`), not on
+   `cargo_lib`. Necessary because `CcInfo`'s `system_includes` propagate
+   transitively: folded into `cargo_lib`, LibGfx inherited LibRegex's *and*
+   LibTextCodec's bare dirs and failed with `'FFI' does not name a type`.
+   (`cc_common.create_compilation_context` has no settable "local includes";
+   I tried.)
+2. **Depend on it through `implementation_deps`.** Step 1 stops the dir leaking out
+   of `cargo_lib`; it does *not* stop it leaking out of **LibTextCodec**. Include
+   dirs propagate along the C++ dep graph too, so `LibGfx → LibTextCodec` handed
+   LibGfx someone else's `RustFFI.h` anyway, and `YUVData.cpp` failed identically.
+
+`implementation_deps` is Bazel's name for exactly the scope CMake's
+`target_include_directories(... PRIVATE)` has — which is *why* a bare include is
+unambiguous in CMake, and what had to be reproduced rather than approximated. The
+three crates that need it are **derived by scanning the source** for a
+directory-less include, not hardcoded, and the build emitter now **imports** that
+derived set instead of keeping its own copy beside it (it had one; a hand-kept copy
+of a derived set is finding 23 in miniature).
+
+### Bug 2: an entire Rust target was missing, behind two host escapes
+
+`//:WebContent` and four others then failed with one error:
+`CraneliftBridge.cpp:13:10: fatal error: CraneliftFFI.h: No such file or directory`.
+
+Cranelift — Ladybird's AOT WebAssembly compiler, `ENABLE_CRANELIFT_JIT=ON` — was
+absent from the Bazel graph **entirely**. `Libraries/LibWasm/CMakeLists.txt` was
+not in the emitter's `CMAKELISTS`, and it declares its crate with
+`build_rust_binary()`, which the parser did not handle at all. Two host escapes had
+been covering for it:
+
+- the FFI header sat in `Build/full/Libraries/LibWasm`, which a global `-I` reached;
+- the compiler binary was named by **an absolute path to my machine**, baked into
+  `-DWASM_CRANELIFT_COMPILER_PATH="/home/ubuntu/ladybird-work/Build/full/bin/cranelift-compiler"`.
+
+The second one alone would have broken every other checkout on earth, and it was
+in a checked-in generated file. Nothing was going to tell me: it is a *define*, so
+it compiles fine and the lookup only fails at run time, on a code path that needs a
+WebAssembly page big enough to trigger AOT compilation.
+
+A `build_rust_binary` crate is a genuinely different shape, not a variant spelling,
+and the rules now say so: there is **no archive to link** (`cargo rustc --bin` is
+the whole build, and what C++ consumes is the *executable*, spawned at run time),
+but it **still emits a cbindgen header** its caller includes. So `cargo_binary`
+declares FFI headers like `cargo_crate` does, `cargo_lib` yields a headers-only
+`CcInfo` when the archive is absent, and the crate is consumed through the same two
+labels a staticlib crate is.
+
+For the binary itself, the fix is *not* to point the define at `bazel-bin` — that
+is the same escape with a nicer prefix. Ladybird already resolves the compiler
+through a chain (`resolve_cranelift_compiler_path`: `$LADYBIRD_CRANELIFT_COMPILER`
+→ compile-time path → **sibling-of-self**), and Bazel puts every root-package
+output in one bin directory, so link 3 finds it with no path baked in at all. The
+define becomes the bare filename and the binary is attached as `data`, so it is
+genuinely *there* in the runfiles of everything that links LibWasm. **The
+dependency is declared; the path is not asserted.**
+
+### What actually verified it
+
+Not "the build is green" — that was the state I started from. The header is
+byte-identical to CMake's; then `Build/full/{Libraries,Services,UI,bin,cargo}` was
+moved off the machine and the three shim packages **deleted**, leaving zero
+Ladybird-generated headers under `Build/full`; all six binaries rebuilt from
+scratch (2,704 actions); and both `--headless=text` and `--headless=layout-tree`
+came out byte-identical to the CMake reference on three pages, two of which execute
+WebAssembly. `cquery` over the closure of all six binaries now returns **0** targets
+under `Build/full`.
+
+One control worth recording, because it is the kind of check that keeps an
+enthusiastic conclusion honest: I instrumented `cranelift-compiler` with a wrapper
+to prove the browser was invoking it, and **it never was** — even on a
+300-function module. Before concluding the wiring was broken I ran the same probe
+against the *CMake reference build*, which also never invoked it. Compilation is
+submitted to a thread pool and the page finishes first; the Bazel build matches the
+reference exactly. Without the reference-side control I would have "fixed" a
+non-bug.
+
+Two smaller repairs fell out of the same pass, both drift the emitter rule exists
+to prevent: `emit_libweb_bazel.py` did not emit LibWeb's export-header block, so
+regenerating would have silently truncated it; and six of the seven per-target
+`-IBuild/full` copts existed only because CMake spells a target's own binary dir
+relative to itself (`Build/full/Services/WebContent/../..`) and the emitter
+compared paths as **strings** against its global-roots set. `os.path.normpath`
+before the comparison removed all six.
+
+### The same bug, a third time, in this repo's own tests
+
+Having learned that a check which cannot fail is indistinguishable from one that
+is not needed, I applied it to the test suite itself — by counting, not by reading
+the exit code. `for f in tests/test_*.py; do python3 "$f"; done` exited 0 for all
+ten files, but three of them (`test_emit_cargo.py`, `test_emit_vcpkg.py`,
+`test_vcpkg_plumbing.py`) had **no `if __name__ == "__main__"` runner at all**:
+Python imported the module, defined 46 `def test_` functions, called none of them,
+and exited 0. There is no pytest in this sandbox, so nothing else was calling them
+either. Exactly the shape of `allow_empty = True` — a green result carrying no
+information.
+
+With runners added, 6 of those 46 failed, and every one was a *true* report about
+the finding-35 changes rather than a stale assertion: the ring emitter had grown a
+third parameter (the binary crates), `cargo_lib` had gained an
+`archive == None` branch for a `--bin` crate that has no archive, the shared
+FFI-header lookup had moved into `cargo_vendor.sh` so both drivers use one copy,
+and one test read `Build/full/Libraries/BUILD.bazel` — a file whose *deletion* was
+the fix. That last one is the pleasing part: the test failed because the thing it
+asserted about no longer exists, so it became the stronger assertion that the path
+**must not** exist.
+
+The repair is not "add a runner to each file", though that is what was missing: a
+per-file runner is precisely the thing nobody notices the absence of, so doing only
+that leaves the next silent file undetected. What was missing was **one entry point
+that knows how many test files exist and how many tests each contributed**, so a
+file going quiet is a failure and not just a smaller number nobody was counting.
+`tests/run_all.py` discovers `tests/test_*.py`, and fails the run if any file
+defines no tests or will not import — the `allow_empty = False` of test discovery.
+Its guards are tested by triggering them, because a guard never seen to fire is
+back where this started. The suite is 135 tests over 11 files, 0.3s, one exit code.
+
+The general lesson, which outlives this repo's test layout: **the unit that has to
+be accounted for is the CONTAINER, not the item.** Counting passing tests cannot
+detect a missing file; counting matched files cannot detect an empty glob;
+counting green actions cannot detect a header supplied by a shim. Each time, the
+fix was to make the enclosing thing declare how many children it should have.
+
+## Finding 36: I removed the dependency I was looking for, so that is the one I found
+
+Ulf asked, again: *can I clone and build with Bazel?* Finding 35 had just closed the
+741 `Build/full` header dependencies, `cquery` returned 0, and the README said yes.
+This time I did not answer from the README. I ran `git clone` into an empty
+directory, dropped the overlay in, and typed the command.
+
+**It failed. Six times, for six different reasons, and five of them have nothing to
+do with `Build/full`.**
+
+| What was missing | The error a cloner gets | Why my machine hid it |
+|---|---|---|
+| `Build/vcpkg` — a microsoft/vcpkg checkout at `vcpkg.json`'s `builtin-baseline` | `/tmp/.../root/vcpkg: No such file or directory` | `Meta/ladybird.py vcpkg` had been run months earlier |
+| its `.git` (120 MB), which vcpkg needs for `git read-tree` to resolve versioned ports — and which the filegroup **excludes** | `fatal: not a git repository: '.git'` … `while checking out port sqlite3` | the action is `no-sandbox`, so it read the real checkout regardless of what was declared |
+| `Build/caches/HSTSPreload/transport_security_state_static.json`, an **unversioned** download CMake does at configure time from Chromium's `main` | `missing input file '//:Build/caches/...'` | CMake's configure had already fetched it. **Now fixed**: pinned downstream to a commit + sha256 (`hsts_preload.bzl`) and fetched by Bazel |
+| two path bugs in `Meta/vcpkg_build.sh`: the distfile index *and its entries* were execroot-relative, and vcpkg runs the asset script from its own cwd | `awk: cannot open ...`, then `cp: cannot stat ...`, surfacing as `no asset cache hits` and `x-block-origin blocks trying the authoritative source` | the checkout already had `downloads/tools/cmake-4.4.0-linux`, so vcpkg never *asked* the script for a tool |
+| `ply`, which the `angle` port installs with **`pip install ply`** | `No matching distribution found for ply` | this sandbox exports `HTTP_PROXY`, and the action inherits it |
+| the four `vcpkg_from_git` archives, staged from a directory I had made **by hand** — `vcpkg_git_archives.bzl` is generated, committed, documented, and **loaded by nothing** | 20 minutes in: `git fetch https://android.googlesource.com/.../piex.git … Error code: 128` | the directory existed on my disk from when I built the pin |
+
+### Three of them are the same bug as finding 35, in three different syntaxes
+
+`//Build/vcpkg:tree` is `glob(["**"], allow_empty = True)` over a directory a fresh
+clone does not have. It matches exactly one file — *its own `BUILD.bazel`* — reports
+nothing, and the build dies later somewhere else. That is the finding-35 pattern
+verbatim; I had deleted the three `Build/full` shims and left a fourth shim, over a
+different tree, in place. **I had been looking for `Build/full`, so `Build/full` is
+what I removed.**
+
+The git-archive staging is the same idea written in bash, and it is worth quoting
+because it packs three independent ways to succeed while doing nothing into four
+lines:
+
+```bash
+if [ -d "$SRC/Meta/CMake/vcpkg/git-archives" ]; then                     # skips
+    cp "$SRC/Meta/CMake/vcpkg/git-archives/"*.tar.gz "$ROOT/downloads/" \
+        2>/dev/null || true                                              # hides, forgives
+fi
+```
+
+A directory test that skips silently, a redirect that swallows the error, and a
+`|| true` that forgives the exit code. The four tarballs it was supposed to place
+only ever existed because *I* had made that directory while capturing the pin.
+`vcpkg_git_archives.bzl` — generated, checked in, listed in the README's file table
+— is loaded by **nothing**; it is documentation wearing a `.bzl` extension. Without
+those files skia gets 20 minutes in and dies fetching `piex.git` from
+android.googlesource.com, naming neither the directory nor the tarball nor the port
+that pinned it. It now fails in four seconds saying exactly what is missing and
+where it comes from.
+
+The `.git` case is worse than a missing input, because it is a *lie in the
+declaration*: the filegroup explicitly excludes `.git/**`, the port resolution
+genuinely requires it, and the build works anyway because `no-sandbox: "1"` lets the
+action read the real path instead of the declared inputs. An excluded input that the
+action reads is strictly worse than an undeclared one — the exclusion looks like a
+decision.
+
+### The fifth is a hole in a claim I had "verified"
+
+"The 77 vcpkg ports are built with **zero network access**" was measured with
+`x-block-origin`, and that measurement is sound as far as it goes: remove a distfile
+from the index and the build hard-fails instead of fetching. But `x-block-origin`
+governs **vcpkg's own downloader** and nothing else. The `angle` overlay-port calls
+`x_vcpkg_get_python_packages`, which runs `pip install ply` — not a distfile, not an
+asset, never seen by the pin.
+
+And nothing stopped it, because I had written the enforcement as a *label*:
+
+```python
+execution_requirements = {"local": "1", "no-sandbox": "1", "requires-network": "0"}
+```
+
+`requires-network: "0"` is a scheduling hint. It does not build a network namespace,
+and `no-sandbox: "1"` guarantees there is none to build. With
+`use_default_shell_env = True` the action inherits this sandbox's `HTTP_PROXY`, so
+pip quietly succeeded for months. **A control that is not enforced is
+indistinguishable from a control that is not there** — the same sentence as finding
+35's glob, applied to an `execution_requirements` key instead of a `glob()`
+argument.
+
+The fix needs no patch to the portfile, because pip has supported offline switches:
+the wheel is pinned by URL and sha256 (`vcpkg_python_packages.bzl` → `http_file`),
+declared as an input of the vcpkg action, staged into a find-links directory, and pip
+runs with `PIP_NO_INDEX=1` and the proxy variables unset. An unpinned package is then
+`No matching distribution found` — an error, not a download, which is precisely the
+property `x-block-origin` gives the other 76. Two details are worth keeping: the URL
+is `files.pythonhosted.org`'s content-addressed path (immutable for a version, unlike
+`pip install ply`, which resolves against whatever PyPI serves today), and the wheel
+had to be added to `use_repo` *and* to the emitter's `--use-repo` output — it is the
+one vcpkg input no instrument can capture, so it is also the one a regeneration can
+silently drop.
+
+The other half of the fix is not code: **verify in an environment with no route to
+the network.** A flag asserting there is no network is exactly the kind of evidence
+this migration keeps getting wrong.
+
+### What generalizes
+
+Three times now the same shape: a `glob` that cannot fail, test files that ran no
+tests, and an `execution_requirements` key that enforces nothing. Each one was
+*green*, and green was the problem. What is worth taking from finding 36 specifically
+is narrower and more uncomfortable:
+
+**Verification finds what it is aimed at.** "Verified by removal" is the strongest
+check in this document, and it is still only a test of *what you remove*. I removed
+`Build/full` because `Build/full` was the thing I had been arguing about; a clone
+needs `Build/vcpkg`, a `.git`, an HSTS table and a Python package, and no amount of
+rigor about `Build/full` was ever going to mention them. The check that finds all
+five is not a better `cquery` or a wider removal — it is **the actual user's first
+command, run the way the user runs it, in a directory that has never seen this
+project.** That is one line of shell, it costs ten minutes, and I should have run it
+before the first time I said yes.
+
+### Then the seventh: the recipe for running it pointed at CMake's build tree
+
+With all six fixed, the clone builds — `//:vcpkg_installed` offline (76 ports,
+`pip is offline; 1 pinned wheel(s)`), then all six binaries, 2,842 actions, RC=0 —
+and then the *documented run command* fails with `Runtime error: mkdir: Permission
+denied (errno=13)`, which is what Ladybird says when it cannot find its resource
+root. The README's staging block ended with:
+
+```sh
+ln -sfn "$PWD/Build/full/share/Lagom" "$ER/bazel-out/k8-fastbuild/share"
+```
+
+**`Build/full`.** Six findings about a fresh clone not having CMake's build tree,
+and the last line of the recipe symlinks CMake's build tree. It had never been read
+as an instruction, only as something that already worked on my machine — the same
+mechanism as all six, one layer further out, in prose rather than in a `glob`. The
+resource tree needs no CMake at all: it is `Base/res` (in the clone) plus pdf.js from
+`//:vcpkg_installed` (`share/pdfjs/{build,web}`, with
+`pdfjs-ladybird-transport.mjs` moved into `web/`, which is where
+`UI/cmake/ResourceFiles.cmake` puts it). Assembled that way it is `diff -rq`-identical
+to `Build/full/share/Lagom`, and the fresh clone's binaries then render
+`--headless=text` and `--headless=layout-tree` **byte-identically to the CMake
+reference on all three test pages**. Two smaller notes worth keeping: Bazel's outputs
+are read-only, so `cp -r` propagates that and the second staging run fails with
+`Permission denied` (`cp --no-preserve=mode`); and the six render RCs were 1 for a
+*single* reason — a missing resource root — which is a reminder that a nonzero exit
+from a browser is one bit and says nothing about which of six pages failed.
+
+So the honest state is: **a fresh clone builds and renders, with three inputs staged
+by hand** (`Build/vcpkg` + its `.git`, the unpinned HSTS table, the four
+`git archive` tarballs). That is a different sentence from "clone and build", and the
+difference is exactly what rows 1–3 of the README table say.
+
+### What closing the last three actually takes — and why my first answer was wrong
+
+Ulf's follow-up was the right one: *so what's needed to make it work?* My first
+answer was "a custom `repository_rule` that clones vcpkg at the baseline — it closes
+two of the three blockers." I had done real work to support it: I confirmed
+`git_repository`/`new_git_repository` **strip `.git`** (so the built-in rule cannot
+deliver the one property this dependency needs), that a custom rule shelling out to
+`git clone` keeps it, and that `glob(["**"])` then carries the `.git` files as
+declared inputs. All true, and all beside the point.
+
+**Ladybird already ships the thing I was proposing to write.** `Meta/ladybird.py
+vcpkg` — 45 lines in `Meta/Utils/build_vcpkg.py` — clones microsoft/vcpkg, checks out
+`vcpkg.json`'s `builtin-baseline`, and bootstraps the tool at a tag+SHA512 the
+checkout itself pins. I ran it from an empty directory: **75 seconds, RC=0, `.git`
+present at the right commit, `vcpkg` binary built.** The README's step 1a has been
+telling cloners to run it the whole time. So blockers 1 and 2 are not missing
+machinery; they are a **prefetch step that the recipe must run in the right order**,
+and the honest fix is a `MODULE.bazel`-adjacent note plus a check that fails clearly
+when it has not been run — not a repo rule reimplementing a script the project
+maintains.
+
+Two lessons, and the second is the uncomfortable one. First: **a repo rule that
+re-implements the foreign project's own bootstrap script is a fork of it.** It would
+drift the moment Ladybird bumps its baseline or its tool metadata, and the drift
+would look like a Bazel bug. Second: **I answered a "what's needed" question by
+designing, not by reading the project.** Nothing in the environment stopped me from
+opening `Meta/Utils/build_vcpkg.py` before proposing to duplicate it — the same
+failure mode as answering from the README instead of doing the clone, one level up:
+the fix I imagine is more available to me than the fix that exists.
+
+**The four `git archive` tarballs (row 6) collapse the same way.** No repo rule
+needed: clone the pinned URL, `git archive <ref>`. I reproduced `libyuv`'s tarball
+that way and its SHA512 matched `vcpkg_git_archives.bzl`'s committed value **exactly**
+— which is the useful part, because it means the committed hashes are *checkable* and
+the reproduction is verifiable in one line rather than trusted. Eight lines of shell,
+against a `repository_rule` I would have had to design, test and maintain.
+
+**Then Ulf asked the question that dissolved even the eight lines: "how does a
+Ladybird developer get the correct stuff on disk?"** The answer is that they do
+nothing, because **one ordinary `./Meta/ladybird.py build` produces all three
+inputs.** `build` calls `build_vcpkg()` itself (not just the `vcpkg` subcommand), so
+the checkout and its `.git` appear; the CMake *configure* downloads the HSTS table via
+`hsts_preload.cmake`, gated on `ENABLE_NETWORK_DOWNLOADS`, **default ON**; and vcpkg
+writes the four `git archive` tarballs into `Build/vcpkg/downloads/` while building
+skia and angle. I checked that last one against my own tree: the SHA512s of
+`Build/vcpkg/downloads/{angle,libyuv,skia}-*.tar.gz` **equal the committed values** in
+`vcpkg_git_archives.bzl`. So "the directory I made by hand months ago" was a copy of
+vcpkg's own download cache — I had not built a pin, I had copied one, and then
+forgotten which.
+
+That reframes the finding-36 table — but it also let me answer the wrong question.
+"Run the normal build first" is fine for a Ladybird developer and **useless for the
+case the whole exercise is about**: Bazel without CMake. Ulf had to ask a third time
+before I built it.
+
+**Without CMake, two of the three are now closed, and the third is a one-line
+upstream fix.**
+
+`Meta/ladybird.py vcpkg` is a standalone subcommand — no configure, no CMake — so the
+checkout and its `.git` cost ~70 s. The four `vcpkg_from_git` tarballs are what
+needed building, and the shape of the solution is the interesting part, because I got
+it wrong twice on the way:
+
+1. **A static parse of the portfiles is unsound, and wrong in both directions at
+   once.** My first script scanned skia's and angle's portfiles for
+   `declare_external_from_git` / `checkout_in_path` and produced **8** archives for
+   skia where 4 are real, while **missing libyuv entirely**. Both errors have one
+   cause: `declare_external_from_git` only *declares*, and
+   `get_externals(${required_externals})` picks from that under feature and platform
+   `if()`s — the set is decided by CMake evaluation, not by the text — while libyuv's
+   archive comes from the libyuv *port* calling `vcpkg_from_git` directly, which a
+   scan of skia+angle cannot see. This is finding 30's lesson recurring: **portfiles
+   are programs, so do not re-derive what they compute.**
+2. **So take the list from the pin and use vcpkg as the instrument for regenerating
+   it.** `vcpkg install --only-downloads` runs the portfiles' fetch phase and stops:
+   ~6 minutes, no compilation, no CMake, and vcpkg_from_git produces its tarballs at
+   the refs the real resolution picks. Same tactic as the 76-distfile asset capture
+   — instrument the foreign build system rather than predicting it.
+3. **`Meta/fetch_vcpkg_git_archives.py` then reproduces each pinned tarball with
+   `git clone` + `git -c core.autocrlf=false archive <ref>`** (byte-for-byte what
+   `vcpkg_from_git.cmake` runs internally) **and verifies it against the committed
+   SHA512.** Result: **4/4 reproduced from scratch, byte-identical to the pin.** The
+   hashes came from vcpkg; git reproducing them is the proof the two agree, so the
+   pin is checked rather than trusted. Static resolution survives only where it is
+   sound: mapping an already-known archive *name* to a clone URL.
+
+One asymmetry is recorded rather than smoothed over: `--only-downloads` yields **3 of
+the 4**, because angle's zlib is fetched from angle's *build* phase via
+`checkout_in_path`, not its fetch phase. The script says so; "--only-downloads gets
+them all" would have been the comfortable, false version.
+
+That left **exactly one** genuine hermeticity defect: the HSTS table, fetched from
+Chromium's unversioned `main`. It is now closed too — pinned *downstream*, to the
+commit `main` is serving rather than to a release tag, which is the part I got wrong
+first; see below. A useful detail found while checking how invasive the upstream fix
+would be, and which also makes the downstream pin shareable: CMake's `download_file`
+is a no-op when the file already exists (verified with `ENABLE_NETWORK_DOWNLOADS=OFF`),
+so the Bazel-fetched pinned file, copied into `Build/caches/HSTSPreload/` before
+configuring, is consumed by CMake unchanged.
+
+My four successive answers to "what is needed" were: a `repository_rule`, a prefetch
+script, a `cp`, and finally a script plus a capture instrument. The middle two were
+smaller because I kept reading further into what the project already does — but the
+last one is *bigger* than the `cp`, and that is the actual lesson. **"It falls out of
+the existing build" was a true sentence that dissolved the question instead of
+answering it.** For the audience that has CMake it is the right answer; for the
+audience this migration exists to serve it is a non-answer, and I gave it because it
+let me stop working.
+
+**The HSTS table (row 3) is the one whose unpinned fetch is not ours to fix — which
+turns out not to mean we cannot pin it.** `Meta/CMake/hsts_preload.cmake` fetches
+`raw.githubusercontent.com/chromium/chromium/**main**/net/http/transport_security_state_static.json`
+— an unversioned ref, at CMake *configure* time. My first answer was "pin it
+upstream, until then stage it", and it was wrong in the way that matters: **it made
+someone else's repo a prerequisite for our hermeticity.** A converter usually cannot
+change the project it converts, so an answer that requires an upstream patch is an
+answer that never ships.
+
+The correction, and it is a general shape worth stating: **a converter cannot pin an
+input on the foreign build system's behalf, but it can pin it for itself — provided
+it pins the revision the foreign system is currently *serving*, and proves that with
+a byte comparison rather than a hash it invented.** What made me think otherwise was
+picking the wrong revision. I tested a Chromium *release tag* (`139.0.7258.5`): 18.7
+MB against `main`'s 10.5 MB, **168,593** generated entries against **94,626** — so
+pinning *that* really would have traded a hermeticity gap for a parity gap. But the
+commit `main` pointed at when this machine configured serves bytes identical to what
+CMake downloaded (`cmp`, 10,521,748 bytes), and pinning **that** costs no parity at
+all. A tag is a pin to a *different table*; a commit is a pin to *this* one. The
+distinction is the whole finding, and I had generalized "pinning breaks parity" from a
+single badly chosen pin.
+
+So the overlay now pins downstream: `hsts_preload.bzl` (an `http_file` at that commit
++ sha256, consumed by `gen_HSTSPreloadData` as `@hsts_preload_json//file`) and
+`Meta/pin_hsts_preload.py`, which re-pins by *measuring* — it downloads the file and
+writes the hash it computed, and `--expect-same-as` refuses to write a pin whose bytes
+differ from the file the other build system already has. Verified on the fresh clone
+with the CMake-downloaded file **deleted** — so the pin is the only possible source:
+`HSTSPreloadData.h`/`.cpp` byte-identical to the CMake reference, and `//:LibHTTP`
+compiles and links them (RC=0). The residual cost is stated rather than hidden: CMake still
+tracks `main`, so a configure newer than the pin disagrees with Bazel — one pinned
+input against one unpinned one, a dated disagreement with a sha to look at, instead of
+two unpinned fetches that happened to agree. The upstream one-liner is filed as a bug,
+not depended upon.
+
+### Can we just `http_file` the HSTS table? Measured, all four combinations
+
+Asked directly, so I ran it rather than reasoned about it. `http_file` has two knobs
+that matter — pinned ref or `main`, `sha256` or none — and Bazel behaves differently
+in all four:
+
+| URL ref | `sha256` | what Bazel does | what you get |
+|---|---|---|---|
+| `main` | none | **fetches, builds, and prints** `DEBUG: … a canonical reproducible form can be obtained by modifying arguments integrity = "sha256-ObT9…"` | works; unpinned |
+| `main` | given | fails the moment upstream moves: `Checksum was 5d5df26… but wanted 000…` | a build that breaks on Chromium's commit rate |
+| pinned tag | given | fetches; 18.7 MB | hermetic, **and not what CMake built** |
+| any | none + plain `http://` | refuses outright: `No URLs left after removing plain http URLs due to missing checksum` | — |
+
+So the answer to "can we?" is **yes, mechanically** — row 1 builds today. Two measured
+facts decide whether we should.
+
+**First: unpinned means Bazel caches whatever it saw first, forever.** With a local
+HTTP server as the origin I fetched `VERSION-ONE`, changed the file upstream to
+`VERSION-TWO`, rebuilt: `-> VERSION-ONE`, in 0.3 s, no refetch, no warning. Same with
+a `file://` origin. That is the right behaviour for a *pinned* input and the worst
+possible behaviour for an unpinned one: **two developers who first built on different
+days build different browsers and neither can tell.** The output is a
+94,000-entry `constexpr Array` of domains that get forced to HTTPS — a silent
+difference in security behaviour, not in a log line.
+
+**Second, and this is the number that settles it:** the table moved *while I was
+working on this*. The file this machine's CMake configure fetched from `main` and the
+one `http_file` fetched from `main` today differ by one entry:
+
+```
+< static constexpr Array<HSTSPreloadEntry, 94627> s_hsts_preload_entries { {
+> static constexpr Array<HSTSPreloadEntry, 94626> s_hsts_preload_entries { {
+-     HSTSPreloadEntry { "service.gov.scot"sv, true },
+```
+
+One domain left Chromium's preload list, so `HSTSPreloadData.cpp` is 53 bytes shorter,
+and the byte-parity claim this whole document rests on would have failed for a reason
+that has nothing to do with the migration. And the *pinned* tag is not a way out
+either: `139.0.7258.5` yields **168,593** entries against today's **94,626** — the
+list was pruned hard in between, so pinning unilaterally on the Bazel side doesn't
+drift, it just diverges by 74,000 entries.
+
+So row 1 is out (an unpinned `http_file` is the only input in the overlay whose
+staleness would be invisible), row 3's *tag* is out (it diverges by 74,000 entries),
+and what is left is row 3 with a **commit**: `3d75766` — the newest commit touching
+the path, i.e. what `main` serves — whose bytes are identical to CMake's download.
+That is the pin that shipped. The rule I was reaching for and got backwards on the
+first pass: **pin what the other build system is serving today, and prove it with
+`cmp`; do not pin what looks canonical.** A release tag looks like the responsible
+choice and is the one that breaks parity.
+
+Two shortcuts I tested and rejected, both of which look like simplifications and one
+of which I would have shipped:
+
+- **`--depth 1` on the vcpkg clone.** 8.7 MB instead of 121 MB, and `read-tree` even
+  succeeds for some ports — then resolution fails on ffmpeg and harfbuzz with
+  `failed to unpack tree object` and vcpkg's own advice, `Try again with a full vcpkg
+  clone`. The pinned versions' port trees live in **history**, not at the baseline
+  commit; that is what a version database is.
+- **Dropping `builtin-baseline`** so `.git` is not needed at all. vcpkg then resolves
+  against the checked-out `ports/` and needs no `read-tree` — it "works". It also
+  **silently moves 10 dependencies**: ffmpeg 7.1.1#5 → 8.1.2#3, harfbuzz 10.2.0 →
+  14.2.1#2, mimalloc 2.2.7 → 3.4.3, plus zlib, freetype, dbus, fontconfig, libedit,
+  libwebp and cpptrace. A "fix" for a hermeticity blocker that changes ten dependency
+  versions is the same class of error as everything else in this document, dressed as
+  simplification.
+
+The positive control for all of it: a **fresh** full clone at the baseline, driven by
+the same manifest, resolves all **78 ports to exactly the versions this dev checkout
+resolves** (`diff`, 0 differences). The checkout carries no local state beyond the
+ref — which is precisely why a prefetch step is sufficient and a rule is not needed.
+
+### Why not a git submodule?
+
+The obvious question, since a submodule is git's own answer to "vendor another repo at
+a pinned commit" and it would give the cloner `Build/vcpkg` with a working `.git` from
+`git clone --recurse-submodules`. It **does** work mechanically — I checked, because
+the `.git` here is load-bearing and a submodule's `.git` is not a directory but a
+*gitfile* (`gitdir: ../../.git/modules/Build/vcpkg`). vcpkg's
+`git --git-dir .git read-tree <tree>` follows that indirection fine: `READ-TREE OK`.
+So "submodules break vcpkg" is not the reason.
+
+The reason is that **a submodule pins the wrong thing.** A submodule pins one commit
+and gives you its *checkout*; vcpkg's manifest pins a baseline commit and then reads
+**history behind it**. Ladybird's `vcpkg.json` carries 45 `overrides`, and **14 of
+them name a version that is not what `ports/` contains at the baseline**:
+
+| pinned in `vcpkg.json` | what `ports/` holds at the baseline |
+|---|---|
+| ffmpeg 7.1.1#5 | 8.1.2#3 |
+| harfbuzz 10.2.0 | 14.2.1#2 |
+| mimalloc 2.2.7 | 3.4.3 |
+| qtbase 6.10.0#1 | 6.11.1#1 |
+| freetype 2.13.3 | 2.14.3 |
+| simdutf 9.0.0 | 8.2.0 *(older than the pin)* |
+| …plus zlib, dbus, fontconfig, libedit, libwebp, libtommath, cpptrace, angle | |
+
+Concretely: ffmpeg 7.1.1#5's port is git-tree `0988005f…`, while
+`HEAD:ports/ffmpeg` at the baseline is `c40aaa40…`. The bytes vcpkg builds are
+**not in the working tree at any single commit** — they are extracted from the object
+database by `read-tree`, per port, per pinned version. That is what the version
+database *is*, and it is why `--depth 1` fails with vcpkg's own `Try again with a full
+vcpkg clone`: shallow gives you the tree, and the tree is not the pin.
+
+So a submodule would deliver exactly the state that is *insufficient* — the baseline
+checkout — while still requiring the full history behind it to be present, and it
+would add costs of its own: the same 119 MB in `.git/modules` (no saving), plus
+`Build/vcpkg` is inside a `Build*/`-ignored path that vcpkg fills with ~3 GB of
+`downloads/`, `installed/`, `buildtrees/` scratch, so every cloner's `git status`
+would show the submodule dirty forever (needing `ignore = dirty` in `.gitmodules` to
+paper over it), and `git submodule update` would fight vcpkg for who owns the
+directory. And a submodule still would not produce the `vcpkg` **binary** — that is
+not tracked in the repo; it is bootstrapped from a tag+SHA512 pinned in
+`scripts/vcpkg-tool-metadata.txt`. `Meta/ladybird.py vcpkg` does that too.
+
+The generalizable point, and the reason this is worth a section rather than a
+footnote: **`Build/vcpkg` is not a vendored dependency, it is a package manager's
+cache directory that happens to be a git checkout.** Every instinct that treats it as
+"a pinned copy of another repo" — submodule, `git_repository`, `http_archive` of a
+tarball, `--depth 1` — pins the checkout and loses the history, and the history is the
+dependency. Getting this right is what `builtin-baseline` + `overrides` means, and it
+is why the answer to "how do we get it" keeps coming back to *run the project's own
+bootstrap*.
+
+## Finding 37: the overlay was not reproducible, and the thing that proved it was a `cp`
+
+Asked to get the tree onto another machine, I reached for the obvious answer — publish
+the branch, `cp -r workspace/. ladybird/` — and then ran it on an empty directory
+instead of describing it. Four things were wrong, and only the first was one I could
+have found by reading.
+
+**Nothing recorded which Ladybird commit the overlay describes.** The generated BUILD
+files name ~1,961 LibWeb compile inputs and 665 IDL bindings *by path*; they were
+generated from exactly one upstream tree. That tree's sha appeared nowhere — not in
+the README, not in `cmake2bazel.json`, not in a comment. Every parity claim in this
+document is relative to a commit the document never named. This is the same class as
+the `--depth 1` and release-tag mistakes: **a pin that is not written down is not a
+pin**, and the reason it survived so long is that my working copy *was* the pin.
+
+**The interesting one: the overlay and upstream's bootstrap fight over `Build/vcpkg`.**
+`Build/vcpkg/BUILD.bazel` is an overlay file, so a `cp -r` creates the *directory*
+`Build/vcpkg`. Upstream's `Meta/Utils/build_vcpkg.py` then does:
+
+```python
+if not vcpkg_checkout.is_dir():
+    git clone …
+else:
+    bootstrapped = git -C Build/vcpkg rev-parse HEAD
+```
+
+The directory exists, so it takes the `else`, and `git -C Build/vcpkg rev-parse HEAD`
+— with no `.git` inside — **walks up to Ladybird's own repository** and cheerfully
+returns *Ladybird's* HEAD. It then tries to check vcpkg's baseline out of the Ladybird
+repo: `fatal: unable to read tree (40f3c709…)`. Two correct programs, one wrong
+composition: upstream infers "cloned" from `is_dir()`, and the overlay's job is to put
+a file in that directory. **`git`'s upward search for `.git` is what turns a missing
+directory into a wrong answer instead of an error** — the same property that makes
+`git -C` convenient makes it unsafe as an existence check. The fix is ordering
+(prefetch, *then* stage that one file), and `apply_overlay.sh` defers it and explains
+why at the point of deferral.
+
+The other two were mundane and would have cost someone an afternoon: `bazelrc.txt`
+must be renamed to `.bazelrc` (stored under a different name precisely so a `cp -r`
+cannot be mistaken for a working build — and then the recipe relies on a human
+remembering the rename), and the two upstream patches must be *applied*, not merely
+shipped.
+
+So the deliverable is a script, and the part worth keeping is `--verify`, which checks
+what a file copy cannot: HEAD is the pinned commit, all 44 files are byte-identical,
+the patches are applied (`git apply --check -R` succeeding is the proof — a patch that
+reverse-applies cleanly is already in the tree), and the `.sh` files still have their
+executable bit. That last check exists because of an earlier bug of exactly this shape:
+scripts committed `100644` while my dev tree had them `+x` by hand, so only a fresh
+clone failed, and only at action time. **The general rule this migration keeps
+rediscovering: my working tree carries state git does not, and the only way to find it
+is to reconstruct the tree somewhere else and diff.** `apply_overlay.sh /tmp/lbfresh2`
+now produces a tree byte-identical to the one that renders, which is the first time
+that sentence has been checked rather than assumed.
+
+## Finding 38: the pin recorded what my machine lacked, not what the build needs
+
+Ulf's clone failed where mine never could:
+
+```
+vcpkg_build: distfile MISSING FROM INDEX:
+    .../ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip
+error: there were no asset cache hits, and x-block-origin blocks trying the
+       authoritative source
+```
+
+The 76-distfile pin came from *instrumenting vcpkg's own downloader* (finding 28) —
+the strongest evidence available, and the thing I have leaned on hardest in this
+document, because the capture cannot invent a URL and cannot miss one vcpkg asked
+for. It has one blind spot, and it is not in the instrument, it is in the
+**subject**: `vcpkg_find_acquire_program` probes the host *before* downloading. My
+machine has `/usr/bin/ninja` at exactly 1.13.2 — the version vcpkg wants — so vcpkg
+never asked for ninja, so the capture never saw it, so the pin never had it. Nothing
+was broken. The observation was faithful; it was an observation *of my machine*.
+
+The reason this went unnoticed is the reason it is worth a finding: **cmake is in the
+pin, and only by luck.** The host cmake is 4.2.3 against the required 4.4.0, so vcpkg
+*did* download that one — and its presence made the whole class look covered. One
+member of a category being present by accident is what a partial pin looks like from
+the inside.
+
+Two general shapes, both of which I had already written down in weaker forms:
+
+- **An instrument that records what a program *did* cannot pin what the program
+  *would do elsewhere*, when the program's behaviour depends on the machine.** The
+  capture is exact about vcpkg's requests and silent about vcpkg's *decisions*.
+  Finding 36 said "a green check has to be compared against something it did not
+  produce"; the comparand here is vcpkg's own tool metadata,
+  `scripts/vcpkg-tools.json`, versioned inside the checkout at the baseline, carrying
+  url + sha512 + archive name for every tool on every platform. That is a **pin**
+  rather than an observation, so it is complete regardless of what is installed
+  anywhere.
+- **Host-tool discovery is a hermeticity boundary that looks like a convenience.**
+  Every `find_program`/`find_package` is a place where the build's inputs depend on
+  the machine, and a capture-based pin will silently record the *complement* of
+  whatever is installed. The pin's contents should not be a function of one
+  machine's `/usr/bin`.
+
+The fix that first suggested itself — derive the tools from `vcpkg-tools.json` at emit
+time — was wrong, and **two existing tests caught it before Ulf could**: the emitter's
+central promise is that *the committed pin alone regenerates every Bazel file with no
+vcpkg checkout, no CMake and no network*, and reading vcpkg's metadata during emit
+quietly made a vcpkg checkout a requirement again. So the derivation is a separate,
+deliberate step (`--capture-tools`) whose output is committed as
+`Meta/vcpkg_tool_assets.tsv`, exactly like the asset capture; emitting unions it in
+and, *when* a checkout happens to be present, cross-checks it and warns if the
+committed pin has gone stale. That is the same division as everywhere else here:
+regenerating a pin may use the world, consuming one may not.
+
+Scoping, stated because a reviewer should not have to infer it:
+`vcpkg-tools.json` also pins dotnet, node, powershell-core, azcopy, gsutil, coscli and
+nuget — ~400 MB for tools no port in this closure invokes (only the unrelated
+`vbs-enclave-tooling-codegen` does). `BUILD_TOOLS` is `("cmake", "ninja")`, the two
+`scripts/detect_compiler` needs before any port builds at all, and the emitter
+*reports* the ones it skipped rather than hiding the decision.
+
+Verified: the ninja `http_file` fetches and integrity-checks (sha512 confirmed against
+upstream independently of Ulf's error text), `bazel query 'deps(//:vcpkg_installed, 1)'`
+now lists **78** distfiles including ninja, and the index the asset script reads
+resolves that hash to the Bazel-fetched file — the exact lookup that failed on his
+machine. Suite 182/182, six new tests, one of which is the regression test for the
+bug report itself.
+
+## Finding 39: the pin fixed one class; the next two failures were a different class
+
+Finding 38's fix was correct and did not survive contact. Ulf pulled it, rebuilt, and
+got — twenty minutes in, from inside `libvpx`:
+
+```
+CMake Error at scripts/cmake/vcpkg_find_acquire_program.cmake:201 (message):
+  Could not find nasm.  Please install it via your package manager:
+```
+
+Installed nasm, rebuilt, twenty more minutes, from `gperf`:
+
+```
+CMake Error at .../share/vcpkg-make/vcpkg_make.cmake:108 (message):
+  gperf currently requires the following programs from the system package
+  manager:
+
+      autoconf autoconf-archive automake libtoolize
+```
+
+Same blind spot as finding 38 — *the capturing machine had the tool* — but a
+different **class**, and I had assumed the class was closed. Finding 38's fix reads
+vcpkg's `scripts/vcpkg-tools.json` and pins url+sha512 for the tools vcpkg fetches
+for itself. That works only for tools vcpkg *can* fetch. On Linux:
+
+```cmake
+set(program_name nasm)
+set(apt_package_name "nasm")
+if(CMAKE_HOST_WIN32)
+    set(download_urls "https://www.nasm.us/.../nasm-3.01-win64.zip" ...)
+endif()
+```
+
+Three URLs and a sha512 — **all inside the Windows branch**. On Linux there is
+nothing to pin. vcpkg probes the host, does not find it, and stops. Six ports in
+this closure need it (`dav1d`, `ffmpeg`, `libjpeg-turbo`, `libvpx`, `openh264`,
+`openssl`). So the honest statement is not "the pin is incomplete" but **"this is
+the boundary of the port"** — and the thing that was actually broken was not the
+hermeticity, it was *how you find out*.
+
+**Three classes of input, not two.** Ring 2 had a two-box model — distfiles Bazel
+fetches, and vcpkg's own tools (finding 38's pin). The third box is tools that can
+only come from the host, and it needs different treatment because there is no URL
+to put in it. Naming a gap is not fixing it; but an unnamed gap costs 20 minutes
+per member to discover, one at a time, in an error that points at the wrong place.
+
+**And it has two mechanisms, which is why my first attempt missed half of it.**
+I generalised from `nasm`, shipped a scan of `vcpkg_find_acquire_program` call
+sites, and that would not have caught the autotools failure at all: `vcpkg-make`
+never calls `vcpkg_find_acquire_program`. It calls bare
+`find_program(AUTORECONF NAMES autoreconf)` and raises `FATAL_ERROR` with an apt
+line. Worse, it does so from a **helper port**, so the error names `gperf` while
+the requirement lives in a file `gperf` does not mention. A scan built from one
+example is a scan calibrated to one example.
+
+So the derivation covers both, and the list is *derived* from vcpkg's own scripts
+(`emit_vcpkg_bazel.py --host-tools` -> committed `Meta/vcpkg_host_tools.tsv`),
+never hand-written: a baseline bump that adds a requirement is a
+regenerate-and-review, not a rediscovery.
+
+**Most of the work was suppressing false positives, and that is the finding.** A
+preflight that demands packages you do not need is one the third person deletes.
+Four separate ways the naive scan cried wolf, each needing a real distinction:
+
+- **`CLANG`.** Both call sites are behind `if(... STREQUAL "MSVC")`. Reading call
+  sites without evaluating their guards demands a 2 GB toolchain on every Linux
+  machine.
+- **`openssl`'s `NASM` and `CLANG`.** In `ports/openssl/windows/portfile.cmake` —
+  guarded by nothing in the file, only by the `include()` in its parent. The
+  platform split is at the **path** level, so the path has to be read.
+- **`else()` after a negated test.** `dav1d` is `if(NOT VCPKG_TARGET_IS_WINDOWS)
+  ... else()` — that `else` *is* the Windows branch. Treating every `else()` as
+  reachable imports the Windows-only `GASPREPROCESSOR`.
+- **`angle`'s `mesa-common-dev`.** A `message(WARNING)`. The portfile *also* has an
+  unrelated `FATAL_ERROR` about architectures, so a file-level "does it contain
+  both a FATAL_ERROR and an apt line" check staples them together. **Advice is not
+  a requirement**; the check anchors on the text of the `FATAL_ERROR` itself.
+
+Two entries can only be *named*, not verified: `autoconf-archive` ships m4 macros
+and `libltdl-dev` ships headers, so there is no binary to probe. They are reported
+as unverifiable rather than assumed satisfied — finding 35's rule again, in a third
+place: a check that cannot fail must not look like a check that passed.
+
+Verified negatively, which finding 38 could not be (`sudo` hangs in this sandbox,
+so I could not hide `/usr/bin/ninja`). Here the probe is `command -v`, so a
+restricted `$PATH` *is* a machine without the tools:
+
+```
+vcpkg_build: MISSING host tool: libtoolize|glibtoolize (apt: libtool)
+vcpkg_build:     needed by: vcpkg-make
+vcpkg_build: MISSING host tool: nasm (apt: nasm)
+vcpkg_build:     needed by: dav1d,ffmpeg,libjpeg-turbo,libvpx,openh264
+vcpkg_build:     sudo apt install libtool nasm autoconf-archive libltdl-dev
+```
+
+Both, from one run, in one second, with the ports that need each and one pasteable
+line — against the two failures that cost Ulf 40 minutes to learn two package
+names. Confirmed in a real `bazel build //:vcpkg_installed`: the TSV is a declared
+input (`aquery` shows `Meta/vcpkg_host_tools.tsv`), and the action ran the
+preflight and proceeded into the build. Suite 193/193, 11 new tests — one per false
+positive above, because each was a real bug in my own derivation.
+
+**The retrospective bit.** The environment notes at the bottom of this document
+have said "plus autoconf/nasm/glslang/mesa GL dev libs" since the beginning. The
+requirement was *documented and never checked* — so it was invisible to everyone
+who did not read the bottom of a 2,300-line file, which is everyone. Prose in a
+case study is not a preflight. `glslangValidator` is the same shape and is still
+open: two genrules in `codegen_root.bzl` name `/usr/bin/glslangValidator`, and
+`vcpkg_installed` does not ship it.
+
+## Finding 40: nine failures, one bug — a host requirement upstream checks and my overlay inherited silently
+
+Ulf's Ubuntu 24.04 machine ran the Bazel-built Ladybird headless and got a SIGSEGV
+from the GUI:
+
+```
+ladybird(...)
+QApplicationPrivate::init()
+QXcbConnection::initializeScreens(bool)
+QXcbConnection::handleScreenAdded(...)
+--> SIGSEGV in libQt6Core
+```
+
+and offered a deal: *"if you can figure out how to make it work, then I won't
+upgrade."* That machine is the most valuable thing in this migration. It has found
+**eight** real defects (findings 37, 38, 39 and the gaps between them) that this
+sandbox is structurally incapable of finding: gcc 15.2, Qt 6.10.2, ICU 78,
+`nasm`/`perl`/`glslang`/`libdrm` all present, every requirement silently satisfied.
+A machine that *disagrees* with mine is a test oracle, not an inconvenience, and the
+only way to keep it is to stop breaking it.
+
+### The bug
+
+The binary links Qt from the Bazel repo and loads Qt's **plugins** from wherever
+`libQt6Core`'s baked-in prefix points — on his box, the *distro* Qt's plugin
+directory. Two different Qt builds in one process.
+
+Qt does not link its QPA platform plugin; `QApplication`'s constructor `dlopen`s it.
+Where it looks is decided inside `libQt6Core`: `qt.conf` next to the executable, then
+`QT_PLUGIN_PATH`, then the prefix compiled into the library. Qt 6.9.2's `qt_prfxpath`
+is **empty** (`strings lib/libQt6Core.so.6.9.2`), so the prefix falls back to *the
+directory of the executable* — and a Bazel binary's directory has no `platforms/`, so
+the search falls through to the compiled-in system path and Qt loads
+`/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqxcb.so` into a process whose
+`libQt6Core` came from `bazel-bin/_solib_k8/...rules_qt++qt+qt...`.
+
+rules_qt is not at fault: it wires up Qt's *link* half faithfully (one SDK, discovered
+by `qmake -query`; headers, libs and moc all from it). Nothing wired up the *runtime*
+half, because on the machine where the overlay was written there was nothing to
+notice.
+
+**Which way the skew points decides which failure you get.** Both halves reproduced
+here, with a real X server:
+
+| plugin vs. linked libs | Qt's version gate | outcome |
+|---|---|---|
+| plugin **older** | rejects it: `factoryloader: Ignoring QPA plugin due to mismatching Qt versions 395520 394240` | `no Qt platform plugin could be initialized`, clean abort |
+| plugin **newer or equal-minor** | **passes** | plugin calls into an ABI it was not built against → SIGSEGV in `initializeScreens` → `handleScreenAdded` |
+
+(Those integers are Qt versions: `(v>>16, (v>>8)&255, v&255)`, so 395520 = 6.9.0 and
+394240 = 6.4.0.) The gate is the cruel part: it catches the harmless direction and
+waves through the one that corrupts memory.
+
+And on **my** box it passes. `QT_DEBUG_PLUGINS=1` on the Bazel-built binary here
+scanned `/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms` and loaded the **distro**
+`libqxcb.so` — the exact same wrong lookup — while `libQt6Core.so.6.10.2` came from
+Bazel's solib dir. Both are 6.10.2, so the ABI happens to match. **The bug was
+present in every green GUI run this project has ever reported.**
+
+Then the strongest evidence available: pointing `qt.local_repo` at the aqt **6.9.2**
+SDK on this machine and rebuilding reproduced **his backtrace, frame for frame** —
+`Ladybird::Application::create_platform_event_loop` → `QApplicationPrivate::init` →
+`QXcbConnection::initializeScreens` → `handleScreenAdded` → a fault in libQt6Core at
+`mov 0x8(%rdi),%rbx` with `rdi = 0`. Not a machine I cannot see any more.
+
+### The exoneration that mattered
+
+My first hypothesis was two ICUs: the binary needs `libicu*.so.78` (vcpkg) and aqt's
+`libQt6Core` needs `libicu*.so.73`, both in one process, and `ld` even warns *"may
+conflict"*. Wrong — worth recording because it is the kind of theory that sounds too
+good to check. I linked ICU 78 **and** aqt's ICU 73 into one process with
+`-Wl,--no-as-needed` and constructed a `QApplication`: `screens=1 qt=6.9.2`. ICU
+coexists fine; two sonames are two libraries. (The fixed build now does exactly this
+on purpose: `objdump -p` shows `libicu*.so.73` *and* `libicu*.so.78` in one binary,
+and it runs.) Any earlier note here blaming "two ICUs" is superseded: it was never an
+ICU problem, it was this same plugin/library provenance skew seen through a different
+symptom.
+
+### The fix: the Qt edge becomes self-contained, like `vcpkg_lib`
+
+`qt_runtime.bzl`, and the shape is deliberately the one Ring 2 arrived at for vcpkg —
+*the dependency arrives with the dep edge*:
+
+1. **`qt_plugins`** (repository rule) reads **@qt's own generated `qtconf.bzl`** for
+   `QT_INSTALL_PLUGINS` and symlinks every plugin the SDK ships into a repo, one
+   `filegroup` per plugin type. Reading @qt's file rather than a path of my own is the
+   whole point: the plugins cannot come from a different Qt than the libraries,
+   because both names come from one `qmake -query`. Every type, not the four Ladybird
+   needs today — a hand-picked list drifts, and a missing input method or file dialog
+   is a defect nobody notices for a month.
+2. **`qt_plugin_tree`** re-declares them as outputs of the package that holds the
+   binary, so they land at `bazel-bin/plugins/<type>/*.so` — and, as `data` of
+   `//:ladybird`, in the runfiles tree too.
+3. **`qt_conf`** writes the file that redirects the search:
+
+   ```
+   [Paths]
+   Prefix = .
+   Plugins = plugins
+   ```
+
+   Setting `Prefix` **replaces** the compiled-in prefix, so `/usr` is not outranked,
+   it is *never scanned* — `QT_DEBUG_PLUGINS=1` on the fixed build shows zero scans
+   of any `/usr` directory. `Prefix = .` is what makes one file correct in both
+   layouts, because Qt resolves it against the directory of the executable via
+   `/proc/self/exe`, so `bazel-bin/ladybird` and the runfiles tree's symlink to it
+   both land on the staged tree.
+4. **`runtime_libs`** carries the private libraries an SDK bundles beside Qt.
+
+That fourth piece was the hard one, and it is where the loader stopped being
+intuition and became a measurement. aqt's `libQt6Core` needs `libicui18n.so.73`,
+which exists only inside the SDK, so the binary died in `ld.so` before `main()` and
+`LD_LIBRARY_PATH=<sdk>/lib` was the workaround — a workaround a human has to remember
+is a bug that has been rounded down to a habit. **No rpath on the binary can fix
+it**, for two reasons I only believed after reducing them to three generated `.so`
+files:
+
+- `libQt6Core` finds its own ICU through `RUNPATH $ORIGIN`, and `$ORIGIN` is the
+  directory the loader **opened the object by** — Bazel's solib dir, not the SDK. (`ldd`
+  on that very symlink resolves ICU happily, because `ldd`'s `$ORIGIN` is the
+  realpath's directory. That near-miss is what made this look like a path problem.)
+- Adding the SDK dir to *our* rpath does not help either: `DT_RUNPATH` is consulted
+  only for an object's own direct dependencies, and while `DT_RPATH` **is** inherited
+  by transitive loads, an intermediate object that has a `DT_RUNPATH` of its own
+  blocks the inherited `DT_RPATH` entirely. `libQt6Core` has one. All four
+  combinations measured before believing it.
+
+So the fix is not a search path at all: make the SDK's private libraries real link
+inputs, so **Bazel** stages them and the binary's own runpath — the one glibc will
+consult, because they are now direct dependencies — resolves them. The list is
+derived, not written down: DT_NEEDED of the SDK's Qt modules ∩ the non-Qt `.so` files
+beside them. For aqt 6.9.2 that is exactly `libicui18n/libicuuc/libicudata.so.73`;
+for a distro Qt it is empty and the target degenerates to nothing.
+
+Five things I got wrong on the way, each caught by a probe rather than by reasoning:
+
+- **The staged plugins must be SYMLINKS, not copies.** A plugin needs Qt libraries
+  the binary does not link (`libqxcb.so` → `libQt6XcbQpa.so.6`), and aqt's plugins
+  carry `RUNPATH $ORIGIN/../../lib`, resolved from the object's real path. Copying
+  breaks exactly that; the distro's plugins have no `RUNPATH` at all, so a *copied*
+  distro plugin resolves `libQt6XcbQpa.so.6` from `/usr` — reintroducing the bug
+  through the fix.
+- **`plugins/` is a substring of `qt_plugins/`.** My path-stripping matched inside the
+  *repository name* and staged everything one directory too deep
+  (`bazel-bin/plugins/plugins/...`), which built cleanly and pointed `qt.conf` at an
+  empty tree. Found by looking at the output, not by the build failing.
+- **"Non-Qt libraries beside libQt6Core" is the whole system on a distro Qt.** Its lib
+  dir *is* `/usr/lib/x86_64-linux-gnu`, so the first version of the derivation
+  proposed linking 56 `cc_import`s including `ld-linux` into the binary. It is a
+  system directory, so it "worked" — which is precisely the kind of accident this
+  finding is about. The discriminator is whether the Qt lib dir is itself a default
+  loader directory.
+- **An embedded `:/qt/etc/qt.conf` Qt resource does not work.** Tempting, since we
+  already run `rcc`, and Qt 6.9.2 does look for that path — but the resource is
+  registered by a static initialiser in the binary and every variant I built ignored
+  it, while a file on disk worked first try.
+- **`--no-as-needed` is load-bearing.** The binary references no ICU 73 symbol (it has
+  its own ICU 78), so the linker drops the `DT_NEEDED` as unused and the staging
+  silently stops working.
+
+### The class, which is the finding
+
+Every one of the nine failures Ulf's machine has produced is the same sentence:
+
+| # | symptom on his box | the host requirement | who declares it |
+|---|---|---|---|
+| 1 | `vcpkg: No such file or directory` | the `Build/vcpkg` clone | `Meta/ladybird.py vcpkg` |
+| 2 | `fatal: unable to read tree` | that clone's `.git`, at a baseline | vcpkg's baseline resolution |
+| 3 | HSTS table differs | Chromium's JSON, *unpinned* | `Meta/CMake/hsts_preload.cmake` |
+| 4 | `glslangValidator: No such file` | `glslang-tools` | nothing — my genrule hardcodes `/usr/bin` |
+| 5 | `ninja-linux.zip MISSING FROM INDEX` | `ninja` ≥ 1.13.2 | `vcpkg_find_acquire_program` (probes, then downloads) |
+| 6 | `Could not find nasm` | `nasm` | `vcpkg_find_acquire_program` (Linux: no URL to pin) |
+| 7 | `gperf requires autoconf autoconf-archive automake libtoolize` | autotools | `vcpkg-make`'s bare `find_program` |
+| 8 | libdrm headers not found | `libdrm-dev` | CMake `pkg_check_modules(... REQUIRED)` |
+| 9 | **SIGSEGV in `initializeScreens`** | **Qt ≥ 6.9, and its plugins** | **`find_package(Qt6 6.9 REQUIRED)`** — upstream checks it; my overlay did not |
+
+Not nine bugs. One bug, nine times: **a host requirement that upstream declares and
+checks, which the Bazel overlay inherited without inheriting the check.** CMake's
+`find_package`, `pkg_check_modules(REQUIRED)` and `vcpkg_find_acquire_program` are not
+ceremony — they are the *preflight*, and translating a build system means translating
+its preflight, not only its compile lines. Nine times I translated the commands and
+dropped the assertion; nine times the machine that disagreed with mine was the one
+that told me.
+
+So `qt_plugins` also carries the floor. `UI/Qt/CMakeLists.txt` says
+`find_package(Qt6 6.9 REQUIRED COMPONENTS Core Widgets)`; the repo rule now fails at
+fetch time with the version it found, the prefix it found it in, the package to
+install, and a warning not to mix SDKs — the finding-39 mechanism (derive the
+requirement from the source of truth, check it where it is needed, name the fix in the
+error) extended from vcpkg's driver to the overlay's own build. `glslangValidator`
+(#4) is the last member of the table with no check at all.
+
+### One more wrong path, found by walking the recipe
+
+Verifying the GUI meant following the README's own staging recipe, which promptly
+failed with `UNEXPECTED ERROR: stat: No such file or directory at
+UI/Qt/WebContentView.cpp:1047` — the theme `.ini`. Two of its paths were wrong, both
+in the same way as this finding: written down instead of derived. The vcpkg tree it
+copies from is built in the **exec** configuration, so `bazel-bin/vcpkg_installed`
+does not exist at all (`k8-fastbuild-exec` is the directory); and the resource root
+is not `<bindir>/share/Lagom` but `<bindir>/../share/Lagom`, because
+`LibWebView/Utilities.cpp`'s `find_prefix()` takes the **parent** of the binary's
+directory. Both are now `bazel info` / `bazel cquery --output=files` invocations,
+which answer for whatever configuration you are on. Prose describing an output path
+is a pin with no checker (gap 5, closed).
+
+**Verified by removal**, which is the only kind of verification this document
+accepts. With `/usr/lib/x86_64-linux-gnu/qt6/plugins` hidden behind an empty tmpfs and
+**no `LD_LIBRARY_PATH`**: the aqt build loads `libqxcb.so` from the aqt SDK (previously:
+the distro's), zero `/usr` directories are scanned, and against the host Qt the GUI
+opens its window on Xvfb and stays up. Headless still renders the reference page.
+Passing because the host happened to agree is how all nine of these got here.
+
+## Finding 41: the plugin fix was right and the crash stayed — `-fPIE` gave `qApp` a copy relocation
+
+Finding 40 fixed the plugin path, Ulf updated his tree, and the GUI segfaulted in
+`QXcbConnection::initializeScreens` **again**, with the same backtrace. That is the
+most useful shape a bug can have: it proves the previous fix was necessary, not
+sufficient, and it means the earlier reasoning had a passenger.
+
+What the new evidence ruled out, before any theory:
+
+- `QT_DEBUG_PLUGINS=1` showed the scan hitting `bazel-out/.../bin/plugins/platforms`
+  and every plugin resolving to *his own* SDK's realpath. `/usr/lib/x86_64-linux-gnu/qt6`
+  was never touched. Finding 40's fix was working exactly as documented.
+- `info sharedlibrary` showed **one** `libQt6Core` in the process, and the `Qt 6.9.2
+  (x86_64-little_endian-lp64 ... GCC 10.3.1)` build strings of the Bazel-staged copy and
+  the SDK copy were byte-identical. Not a version mix, not two Qts.
+- The **offscreen** QPA plugin crashed identically. Whatever this was, it was not the
+  platform plugin, not xcb, not the X server, not a screen enumeration quirk.
+
+### The bug
+
+At the fault, `rdi = 0` and `si_addr = 0x8`, on `mov 0x8(%rdi),%rbx` — inside
+`doActivate` (`libQt6Core` + 0x1e89ce, just past
+`QObjectPrivate::ConnectionData::deleteOrphaned`), reached from
+`QWindowSystemInterface::handleScreenAdded` → `QGuiApplication::screenAdded`. Qt was
+emitting a signal from a **null `qApp`**, in the middle of `QApplication`'s own
+constructor, which had just set it.
+
+`readelf -rW` says why, in three lines:
+
+| object | relocation against `_ZN16QCoreApplication4selfE` |
+|---|---|
+| aqt `libQt6Core.so.6.9.2` | **none** — accessed PC-relative, its own BSS |
+| aqt `libQt6Gui.so.6.9.2` | `R_X86_64_GLOB_DAT` — read through the GOT |
+| `bazel-bin/ladybird` | **`R_X86_64_COPY`** — definition materialised in the exe |
+
+A copy relocation moves the *definition* of an extern data symbol into the
+executable's BSS and repoints every GOT slot at it. So `QApplication`'s constructor
+made Core write `self` in **Core's** BSS, while Gui read the **executable's** BSS,
+which was still zero. The first emit through it dies. His distro Qt 6.4.2 *does*
+carry a `GLOB_DAT` for `self` in Core, so both halves agree there and the bug cannot
+appear — which is why this only ever showed up against an official SDK.
+
+The cause is one flag. CMake puts `-fPIE` on every executable target
+(`CMAKE_POSITION_INDEPENDENT_CODE` + an exe), the capture recorded it faithfully, and
+`emit_build_bazel.py` copied it into `copts` on all seven generated `cc_binary`
+targets. Bazel appends per-target copts **after** the `.bazelrc`'s `--copt=-fPIC`,
+and for GCC the last of the pair wins: the UI/Qt objects compiled `-fPIE` while every
+library around them compiled `-fPIC`. Under `-fPIE` GCC may reference extern data
+directly instead of through the GOT, and the linker turns that into the copy
+relocation. Qt is built with `reduce_relocations` (in `mkspecs/qconfig.pri`;
+Debian's is not), which is what makes Core's side of the disagreement PC-relative.
+
+**Qt diagnoses this and the diagnosis could not fire.**
+`qcompilerdetection.h` has `#error "-fPIE is not sufficient if Qt was configured with
+-DFEATURE_reduce_relocations=ON ... Compile your code with -fPIC and without -fPIE"`
+— guarded by `#if ... || defined(__PIC__)`. Bazel passed **both** flags, so `__PIC__`
+was defined at preprocess time and the guard never triggered. The build was clean and
+the binary was broken: a compiler-authored checker, defeated by flag order.
+
+### Reduced, then fixed
+
+Eight lines, no Ladybird, no Bazel — `QGuiApplication` plus one `printf`, against the
+same SDK:
+
+```
+g++ -fPIE -pie  ... -> R_X86_64_COPY for self -> SIGSEGV (identical stack)
+g++ -fPIC -pie  ... -> GOT, no COPY reloc    -> "instance=0x… screens=1"
+```
+
+`-Wl,-z,nocopyreloc` is **not** an alternative: it converts the same defect into
+`Symbol _ZN16QCoreApplication4selfE causes overflow in R_X86_64_PC32`. The fix is to
+stop asking for `-fPIE`, which is also not a divergence from CMake's semantics —
+Bazel compiles a `cc_binary`'s objects PIC and links `-pie`, which is what
+`POSITION_INDEPENDENT_CODE` was asking for. So the flag is dropped in the generator
+(`DROPPED_TARGET_FLAGS`), not in the generated file, because `BUILD.bazel` is output
+and a hand-edit survives exactly one regeneration.
+
+**Verified by removal**, on both Qts and all six executables: `R_X86_64_COPY` count
+39 → **0** (including `qApp`, and incidentally `stdout`, `QString::_empty` and 20-odd
+`staticMetaObject`s, every one of them the same latent hazard). Against the aqt 6.9.2
+SDK the GUI now starts where it previously segfaulted under *both* the xcb and the
+offscreen plugin; against the distro Qt, unchanged. Guarded by
+`tests/test_pie_copy_relocation.py` (5 tests), which asserts the generated file is
+`-fPIE`-free, that the drop lives in the emitter and is consulted, that the reason is
+written at the drop site, and that global `--copt=-fPIC` — the thing that makes
+dropping `-fPIE` correct — is still in `bazelrc.txt`.
+
+**What this cost, and the lesson.** Two rounds on Ulf's machine for one crash, because
+after finding 40 I read "SIGSEGV in `initializeScreens`" as "the plugin bug, again"
+instead of as an unexplained fault. The plugin evidence was *checkable in one command*
+(`QT_DEBUG_PLUGINS=1`) and I asked for it only on the second pass. A backtrace that
+survives a fix is not the same bug; the frames say where a process died, never why.
+It also makes finding 40's own "verified by removal" honest about its scope: hiding
+the host plugin directory proved the plugins were right, and proved nothing at all
+about the objects that linked them. Two Qts in one process was a real bug. One Qt with
+two copies of one pointer was the next one down.
 
 ## Plan for the rest
 
@@ -1493,24 +2699,118 @@ every process (UI, WebContent, Compositor, RequestServer, ImageDecoder)
 Bazel-built, proven by removing the reference services and watching the CMake
 binary fail while the Bazel one renders.
 
-And with findings 33 and 34 it is a **clone-and-build**: Bazel fetches and builds
-the 77 vcpkg ports *and* the 10 Rust crates + `flapc` itself, with zero network
-access in the build actions, verified by removing each reference tree from the
-machine in turn. `Build/full` is now only the *converter's* input — the model the
-emitters read and the baseline the parity harness diffs — not the build's.
+And with findings 33, 34 **and 35**, Bazel fetches and builds the 77 vcpkg ports,
+the 10 Rust crates, `flapc`, `cranelift-compiler` and every generated header itself,
+with vcpkg's own downloader reaching the network zero times. It is **not** yet a
+clone-and-build: finding 36 lists the four inputs a fresh clone still lacks and the
+one vcpkg port that bypasses the pin with `pip`; findings 38 and 39 add the two
+classes of *host tool* that a capture on one machine structurally cannot see.
+`Build/full` is now only the *converter's* input — the model the emitters read and
+the baseline the parity harness diffs — not the build's, and this time that is
+measured: **0 targets under `Build/full` in the `cquery` closure of all six
+binaries** (down from 741), the three shim packages deleted outright, and all six
+binaries rebuilt from scratch with CMake's generated tree moved off the machine,
+rendering `--headless=text` *and* `--headless=layout-tree` byte-identically on
+three pages including two that execute WebAssembly.
+
+Findings 33 and 34 alone were **not** enough, and the gap between "I closed the
+binary dependencies" and "the build does not read the tree" is the most
+instructive part of this migration — see finding 35.
 
 **Scoreboard:** 43 `cc_library` + 6 `cc_binary` targets; ~4,400 Bazel actions
 from scratch (2,700 C++ plus the vcpkg and Rust rings);
 LibWeb alone 1,961 TUs (1,273 checked-in + 688 generated) with **zero**
 define/flag/include discrepancies vs CMake; 1,379/1,379 generated files
-byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; 34 findings, 3 of them real any2bazel engine fixes with
+byte-identical -> now 1,408/1,408 with every one of the build's 586 ninja CUSTOM_COMMANDs accounted for (findings 25-27); 77 vcpkg ports and 154 crates.io crates fetched and built by Bazel; **0 targets under `Build/full` in the closure of all six binaries (down from 741) and 0 absolute host paths in the emitted BUILD files** (finding 35); a fresh clone still needs 4 inputs the overlay does not carry and one port reaches PyPI via pip (finding 36 — found by actually cloning), and the host tools vcpkg cannot download are
+now named and preflighted rather than discovered one 20-minute build at a time
+(findings 38, 39); the Qt runtime half -- the plugins Qt `dlopen`s -- wired to the
+same SDK as the libraries (finding 40) and the `-fPIE` copy relocation that broke
+`qApp` against any `reduce_relocations` Qt removed (finding 41, 39 -> 0
+`R_X86_64_COPY`); 41 findings, 3 of them real any2bazel engine fixes with
 regression tests.
+
+**One number in this scoreboard was wrong for most of the migration, and it is
+worth ending on.** "Clone and build" was claimed after the two *binary*
+dependencies were closed, and the 741 remaining *header* dependencies went uncounted
+because the shims that supplied them could not fail. Every "verified by removal" in
+this document is only as strong as what was actually removed — which is the argument
+for removal as a method, not against it: it is the only check here that ever found
+this class of bug, and each time I widened what I removed, it found another.
+
+## Finding 42: the browser ran, then ran out of file descriptors — and my first four diagnoses were theories, not counts (and my fifth, the patch, was only half of it)
+
+The Bazel-built browser worked and then died overnight with `dup: Too many open files
+(errno=24)`. This finding is not about the migration at all: it is an upstream Ladybird
+bug that a long-running browser finds and a short test never does. It earns a place here
+because of *how badly I diagnosed it*, four times, before doing the obvious thing.
+
+The wrong answers, in order: lost fd acknowledgements in `TransportSocket` (Ulf correctly
+objected that a local `SOCK_STREAM` socketpair does not lose acks); a missed
+`AnonymousBuffer` / image-frame cache eviction (there were no memfds at all); leaked
+`TransportSocket`s (an artifact of **my own broken one-liner** — `sed 's/[0-9]*$//'` does
+not strip `pipe:[123]`, and `| head` hid the real distribution); and then
+`MessagePort::entangle_with`, which is a real leak that I read out of the code with high
+confidence and which **is not the bug that killed his browser**.
+
+What settled it was a count, not an argument. Ulf's two `/proc/<pid>/fd` censuses showed
+17,423 → 17,497 `socket:` with a *flat* 18 `pipe:`. The MessagePort leak allocates one
+socketpair **and two `pipe2` pairs** per port, so it leaks pipes and sockets at 4:1 — I
+reproduced it locally at 1,628 pipes : 409 sockets. **It cannot produce a sockets-only
+census.** The signature falsified my own best theory.
+
+Following the signature instead led to a leak of exactly **one socket per completed HTTP
+request** (103 requests → 107 sockets; 1,164 → 1,157; pipes never move), which matches
+Ulf's shape exactly and needs no exotic page — any browsing session leaks monotonically.
+`internals.dumpGCGraph()` names the holder directly, because GC roots carry their source
+location: after 202 requests, `808 Root
+nonstandard_resource_loader_file_or_http_network_fetch Fetching.cpp:2338` — 4 roots ×
+202 requests. The four fetch callbacks are `GC::Root`s (strong, uncollectable) moved into
+lambdas on the refcounted `Requests::Request`, which the `Response` then holds back by
+`RefPtr` — a cycle spanning the GC heap and the refcount heap, which neither collector
+can break, keeping the response fd open forever. `Request::defer_teardown()` is the only
+thing that clears the callbacks, and normal completion never calls it (only `stop()` and
+`did_transfer()` do). The A/B: aborted fetches, which *do* reach `stop()`, leak zero.
+
+Then the last lesson, which is the one I keep having to relearn: I wrote the "obvious"
+one-line fix (`defer_teardown()` at the end of `did_finish()`), rebuilt, and the leak went
+to **zero** — because loading was broken and pages rendered blank. A fix that makes the
+symptom disappear by removing the behaviour is indistinguishable from a fix, unless you
+check that the feature still works. I reverted it, re-verified that the clean build both
+renders *and* leaks, and took the diagnosis upstream without pretending I had the patch.
+
+Write-up for upstream: `docs/UPSTREAM-ladybird-fd-leaks.md` (both bugs, with the
+reproductions, the census method, and the cascade that turns one `EMFILE` into three dead
+processes via `MUST`/`VERIFY`).
+
+**Postscript, and the actual lesson.** An upstream patch equivalent to that fix landed;
+Ulf applied it; his browser still leaked. My patch was necessary and not sufficient, and I
+had written the doc as though it were the fix. What resolved it was making the census
+*self-classifying* instead of arguing about which page shape was to blame: an in-process
+`poll()`/`MSG_PEEK` probe on each retained response fd, which reports whether the **peer**
+is dead or alive. That one column splits the leak into two bugs with different fixes —
+peer **dead** means the request completed and WebContent is retaining a corpse (the
+teardown patch fixes exactly this, 143 → 0 locally); peer **alive** means `on_finish`
+never ran, so no teardown at that point can fire, and the fd is held by the GC-root ↔
+`RefPtr` cycle itself (40 → 40, unchanged by the patch). The same probe also separates
+*in-flight* from *retained* by age, which is what stops a freshly restarted process from
+looking like a fix — a mistake I made once already in this investigation.
+
+Two habits earned that: measuring the resource rather than reasoning about the code (the
+`pipe:`-to-`socket:` ratio is what falsified my confident MessagePort diagnosis), and
+making the *instrument* answer the classification question, so the next report is a count
+instead of another theory. The diagnostic build is kept, deliberately outside the overlay's
+`patches/*.patch` glob and pinned there by a test, as
+`examples/ladybird/patches/DIAGNOSTIC-fdleak-census.patch.txt`.
 
 ## Environment notes (this sandbox)
 
 - Toolchain via apt (needs passwordless sudo): cmake, ninja, ccache,
   build-essential, Qt6 (`qt6-base-dev` etc., 6.10.2), plus autoconf/nasm/
-  glslang/mesa GL dev libs. Rust via rustup (`~/.cargo`). Node/vcpkg bootstrap
+  glslang/mesa GL dev libs. **The vcpkg half of that list is no longer prose:**
+  `Meta/vcpkg_host_tools.tsv` is derived from vcpkg's own scripts and checked
+  before the build starts (finding 39). This line said "autoconf/nasm" for
+  months while both failures below were waiting to happen — documenting a
+  requirement is not checking it. Rust via rustup (`~/.cargo`). Node/vcpkg bootstrap
   per `Meta/Utils/build_vcpkg.py`.
 - `~/lb-env.sh` sets `LADYBIRD_SOURCE_DIR`, `VCPKG_ROOT`, CA certs.
 - Disk ~126G, RAM 16G, 16 cores. vcpkg from-source (no cache hit) for

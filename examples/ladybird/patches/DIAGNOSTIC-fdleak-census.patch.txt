@@ -1,0 +1,470 @@
+NOT AN OVERLAY PATCH -- do not put this in patches/*.patch, apply_overlay.sh globs
+those and this must never be part of a normal build.
+
+PREFER `examples/ladybird/fd_census.py`, WHICH NEEDS NO PATCH AT ALL.
+
+    python3 examples/ladybird/fd_census.py --find WebContent
+    python3 examples/ladybird/fd_census.py <pid> --watch 30
+
+It reports the same things this build does -- the /proc category census, peer
+DEAD/ALIVE per socket, retained-vs-in-flight by age, and which process holds the
+live peers -- by reading /proc and `ss` from outside a RUNNING browser. Verified
+against this build on the same workload: 143 DEAD / 4 ALIVE from inside, 143 DEAD /
+4 ALIVE from outside.
+
+Use it unless you specifically need something only the in-process build can see
+(the request id, `user_finish_called`, or the `LADYBIRD_FDLEAK_TEARDOWN` A/B).
+Patching a colleague's tree to run a diagnostic is the wrong trade when the
+information is visible from outside: it assumes their tree is at our pinned commit,
+it conflicts with a tree that already carries upstream's fix, and it means "reset
+your tree" for anyone who has their own commits.
+
+This is a temporary DIAGNOSTIC for the remaining Ladybird fd leak (see
+docs/UPSTREAM-ladybird-fd-leaks.md). Apply it to Libraries/LibRequests/Request.cpp
+in a Ladybird checkout, rebuild only LibRequests, and run the browser normally:
+
+    git apply .../DIAGNOSTIC-fdleak-census.patch.txt
+    ninja -C Build/full lib/liblagom-requests.so.0.1.0        # ~2 min warm
+    # or, for the Bazel build: bazel build //:ladybird  (LibRequests is a cc_library,
+    # so a .so cannot be dropped in -- the source patch is the delivery mechanism)
+
+Environment knobs (all optional):
+
+    LADYBIRD_FDLEAK_INTERVAL_SEC=30   census every N seconds (default 30)
+    LADYBIRD_FDLEAK_EVERY=64          also census every N requests started
+    LADYBIRD_FDLEAK_TEARDOWN=1        enable the completed-request fix, so ONE
+                                      build can A/B it (unset = upstream behaviour)
+
+What it prints, every interval, to WebContent's stderr:
+
+  FDLEAK[timer]: live=... created=... destroyed=... did_finish=...
+                 finish: delivered=... skipped=... | teardown=... stop=... transfer=...
+  FDLEAK[timer]: process fds: total=... sockets=...
+  FDLEAK live: in_flight(<30s)=... retained(>=30s)=... oldest_retained: id=... age=...s
+  FDLEAK retained-bucket  N x peer=DEAD|ALIVE torn_down=... did_finish=... user_finish=...
+                              request_done=... stream=... eof=... paused=... fd_open=...
+
+The two things it adds over an external /proc census:
+
+1. **in_flight vs retained.** A request younger than 30s is not a leak, it is a
+   request. Counting fds from outside cannot tell those apart, which is how a
+   freshly restarted process once looked like a fix.
+
+2. **peer=DEAD vs peer=ALIVE**, probed in-process with poll()+MSG_PEEK on the
+   response fd. This is the discriminator between the leak classes, and it is the
+   same signature as `ss -np`'s peer inode (`* 0` = dead):
+
+     peer=DEAD  -> RequestServer already closed its half: the request COMPLETED and
+                   WebContent is retaining a corpse. This is the class the upstream
+                   teardown patch fixes (verified locally: 143 dead-peer sockets
+                   before, 0 after).
+     peer=ALIVE -> RequestServer is still holding its half: on_finish never ran, so
+                   no teardown of any shape can fire. Reproduced locally with a
+                   server that declares Content-Length and then stalls: 40 retained,
+                   unchanged by the patch.
+
+So the buckets answer, with counts rather than inference, WHICH class a given
+browsing session is actually leaking -- which is exactly what is unresolved now
+that the upstream patch is applied and the leak continues.
+
+The census is O(retained) per interval and the whole thing is inert until the
+first request is created.
+diff --git a/Libraries/LibRequests/Request.cpp b/Libraries/LibRequests/Request.cpp
+index 6262425a..abaa78cc 100644
+--- a/Libraries/LibRequests/Request.cpp
++++ b/Libraries/LibRequests/Request.cpp
+@@ -5,15 +5,273 @@
+  */
+ 
+ #include <AK/Checked.h>
++#include <AK/HashMap.h>
++#include <AK/HashTable.h>
+ #include <AK/ScopeGuard.h>
+ #include <LibCore/EventLoop.h>
++#include <AK/Time.h>
++#include <LibCore/DirIterator.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ #include <LibCore/File.h>
++#include <LibCore/Timer.h>
+ #include <LibCore/System.h>
+ #include <LibRequests/Request.h>
+ #include <LibRequests/RequestClient.h>
+ 
+ namespace Requests {
+ 
++// === FDLEAK instrumentation (temporary diagnostic build; NOT for upstream) ===
++// Question it answers: for the response fds that are never closed, which exit
++// path did the request take? Prints a census every 64 requests started.
++namespace {
++
++struct FdleakCounters {
++    size_t created { 0 };
++    size_t destroyed { 0 };
++    size_t teardown { 0 };          // defer_teardown() entered
++    size_t did_finish { 0 };        // request_finished IPC delivered
++    size_t finish_no_stream { 0 };  // on_finish with m_internal_stream_data == null
++    size_t finish_delivered { 0 };  // the if-block ran: user_on_finish + teardown
++    size_t finish_skipped { 0 };    // the if-block was SKIPPED: no teardown, fd kept
++    size_t stops { 0 };
++    size_t transfers { 0 };
++    size_t skip_reason_not_done { 0 };       // !request_done
++    size_t skip_reason_short { 0 };          // request_done but delivered < total
++    size_t fd_still_open_at_destroy { 0 };
++};
++
++// The candidate fix is behind an env var so one build can A/B it:
++//   LADYBIRD_FDLEAK_TEARDOWN=1  -> tear the request down once its body is delivered
++//   unset                        -> upstream behaviour (leaks)
++size_t fdleak_report_interval()
++{
++    static size_t interval = [] -> size_t {
++        auto const* value = getenv("LADYBIRD_FDLEAK_EVERY");
++        if (!value || !*value)
++            return 64;
++        auto parsed = StringView { value, strlen(value) }.to_number<size_t>();
++        return parsed.value_or(64) ? parsed.value_or(64) : 64;
++    }();
++    return interval;
++}
++
++bool fdleak_teardown_enabled()
++{
++    static bool enabled = [] {
++        auto const* value = getenv("LADYBIRD_FDLEAK_TEARDOWN");
++        return value && *value && *value != '0';
++    }();
++    return enabled;
++}
++
++FdleakCounters& fdleak()
++{
++    static FdleakCounters counters;
++    return counters;
++}
++
++// Snapshot of every request that is still alive right now. A request that stays
++// in here after its response finished is a leak: its callbacks (and the
++// response fd) are retained forever.
++struct FdleakLiveState {
++    u64 id { 0 };
++    int fd { -1 };
++    MonotonicTime created_at { MonotonicTime::now() };
++    bool torn_down { false };
++    bool did_finish { false };
++    bool user_finish_called { false };
++    bool request_done { false };
++    bool has_stream { false };
++    bool eof { false };
++    bool paused { false };
++    bool fd_open { false };
++    u64 delivered { 0 };
++    u64 total { 0 };
++    unsigned skips { 0 };
++};
++
++HashMap<Request*, FdleakLiveState>& fdleak_live()
++{
++    static HashMap<Request*, FdleakLiveState> table;
++    return table;
++}
++
++// How many fds does this process hold right now, and how many of them are
++// sockets? Cheap enough at once-per-64-requests.
++struct FdCounts {
++    size_t total { 0 };
++    size_t sockets { 0 };
++};
++
++FdCounts fdleak_fd_counts()
++{
++    FdCounts counts;
++    Core::DirIterator it("/proc/self/fd", Core::DirIterator::SkipParentAndBaseDir);
++    while (it.has_next()) {
++        auto name = it.next_path();
++        ++counts.total;
++        char target[64] = {};
++        auto path = ByteString::formatted("/proc/self/fd/{}", name);
++        auto length = ::readlink(path.characters(), target, sizeof(target) - 1);
++        if (length > 0 && StringView { target, static_cast<size_t>(length) }.starts_with("socket:"sv))
++            ++counts.sockets;
++    }
++    return counts;
++}
++
++// Is the OTHER end of this fd gone? That is the discriminator between the two
++// leak classes: RequestServer closes its pipe half when the request is complete
++// (`ss -np` shows peer inode `* 0`), and keeps it open while the body is still
++// being produced. Reading it in-process means the census classifies itself.
++enum class PeerState {
++    Unknown,
++    Alive,
++    Dead,
++};
++
++PeerState fdleak_peer_state(int fd)
++{
++    if (fd < 0)
++        return PeerState::Unknown;
++    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
++    if (::poll(&pfd, 1, 0) < 0)
++        return PeerState::Unknown;
++    if (pfd.revents & (POLLHUP | POLLERR))
++        return PeerState::Dead;
++    if (!(pfd.revents & POLLIN))
++        return PeerState::Alive;  // readable-never: peer still holds it open
++    // Readable: a zero-byte peek is EOF, i.e. the peer closed after writing.
++    char scratch = 0;
++    auto peeked = ::recv(fd, &scratch, 1, MSG_PEEK | MSG_DONTWAIT);
++    if (peeked == 0)
++        return PeerState::Dead;
++    if (peeked < 0 && errno == EAGAIN)
++        return PeerState::Alive;
++    if (peeked < 0)
++        return PeerState::Unknown;
++    return PeerState::Alive;  // unread data waiting
++}
++
++StringView fdleak_peer_name(PeerState state)
++{
++    switch (state) {
++    case PeerState::Alive:
++        return "peer=ALIVE"sv;
++    case PeerState::Dead:
++        return "peer=DEAD"sv;
++    default:
++        return "peer=?"sv;
++    }
++}
++
++void fdleak_census()
++{
++    // Anything alive for more than this is not "in flight", it is retained.
++    static constexpr auto retained_after = AK::Duration::from_seconds(30);
++    auto now = MonotonicTime::now();
++
++    HashMap<ByteString, size_t> buckets;
++    size_t in_flight = 0;
++    size_t retained = 0;
++    u64 oldest_retained_id = 0;
++    i64 oldest_age_ms = 0;
++
++    for (auto const& [request, state] : fdleak_live()) {
++        auto age = now - state.created_at;
++        if (age < retained_after) {
++            ++in_flight;
++            continue;
++        }
++        ++retained;
++        if (age.to_milliseconds() > oldest_age_ms) {
++            oldest_age_ms = age.to_milliseconds();
++            oldest_retained_id = state.id;
++        }
++        auto bucket = ByteString::formatted("{} torn_down={} did_finish={} user_finish={} request_done={} stream={} eof={} paused={} fd_open={} short={} skips={}",
++            fdleak_peer_name(fdleak_peer_state(state.fd)),
++            state.torn_down, state.did_finish, state.user_finish_called, state.request_done,
++            state.has_stream, state.eof, state.paused, state.fd_open,
++            state.did_finish && state.delivered < state.total, state.skips > 0);
++        ++buckets.ensure(bucket, [] { return 0u; });
++    }
++
++    dbgln("FDLEAK live: in_flight(<30s)={} retained(>=30s)={} oldest_retained: id={} age={}s",
++        in_flight, retained, oldest_retained_id, oldest_age_ms / 1000);
++    for (auto const& [bucket, count] : buckets)
++        dbgln("FDLEAK retained-bucket {:5} x {}", count, bucket);
++}
++
++void fdleak_report(StringView tag)
++{
++    auto& c = fdleak();
++    dbgln("FDLEAK[{}]: live={} (created={} destroyed={}) did_finish={} finish: delivered={} skipped={} no_stream={} | skip_why: not_done={} short={} | teardown={} stop={} transfer={} fd_open_at_dtor={}",
++        tag, c.created - c.destroyed, c.created, c.destroyed, c.did_finish,
++        c.finish_delivered, c.finish_skipped, c.finish_no_stream,
++        c.skip_reason_not_done, c.skip_reason_short,
++        c.teardown, c.stops, c.transfers, c.fd_still_open_at_destroy);
++    auto fds = fdleak_fd_counts();
++    dbgln("FDLEAK[{}]: process fds: total={} sockets={}", tag, fds.total, fds.sockets);
++    fdleak_census();
++}
++
++// Refresh the snapshot for `request` from live state. Called from every place
++// that can change it, so a retained request that never finished is still
++// described accurately (rather than showing the default-false fields).
++void fdleak_note(Request* request, bool torn_down_flag, bool has_stream, bool eof, bool paused, bool fd_open, bool request_done, u64 delivered, u64 total, int fd)
++{
++    auto it = fdleak_live().find(request);
++    if (it == fdleak_live().end())
++        return;
++    auto& st = it->value;
++    st.fd = fd;
++    if (torn_down_flag)
++        st.torn_down = true;
++    st.has_stream = has_stream;
++    st.eof = eof;
++    st.paused = paused;
++    st.fd_open = fd_open;
++    st.request_done = request_done;
++    st.delivered = delivered;
++    st.total = total;
++}
++
++void fdleak_start_timer()
++{
++    static RefPtr<Core::Timer> timer;
++    if (timer)
++        return;
++    auto seconds = [] -> int {
++        auto const* value = getenv("LADYBIRD_FDLEAK_INTERVAL_SEC");
++        if (!value || !*value)
++            return 30;
++        return StringView { value, strlen(value) }.to_number<int>().value_or(30);
++    }();
++    timer = Core::Timer::create_repeating(seconds * 1000, [] {
++        fdleak_report("timer"sv);
++    });
++    timer->start();
++}
++
++}
++
++// Snapshot `this`'s current state into the live census. Usable anywhere inside a
++// Request member function.
++#define FDLEAK_NOTE(torn_down_flag)                                                                                     \
++    fdleak_note(this, (torn_down_flag),                                                                                 \
++        m_internal_stream_data && m_internal_stream_data->read_stream,                                                  \
++        m_internal_stream_data && m_internal_stream_data->read_stream && m_internal_stream_data->read_stream->is_eof(), \
++        m_body_delivery_paused,                                                                                         \
++        m_fd != -1 && (!m_fd_is_owned_by_read_stream || (m_internal_stream_data && m_internal_stream_data->read_stream)), \
++        m_internal_stream_data && m_internal_stream_data->request_done,                                                  \
++        m_internal_stream_data ? m_internal_stream_data->delivered_size : 0,                                             \
++        m_internal_stream_data ? m_internal_stream_data->total_size : 0,                                                  \
++        m_fd)
++
+ static Optional<Core::ImmutableBytes> map_body_file(int fd, u64 offset, u64 size)
+ {
+     ArmedScopeGuard close_fd = [fd] {
+@@ -53,10 +311,21 @@ Request::Request(RequestClient& client, u64 request_id)
+     : m_client(client)
+     , m_request_id(request_id)
+ {
++    auto& c = fdleak();
++    ++c.created;
++    fdleak_live().set(this, FdleakLiveState { .id = request_id });
++    fdleak_start_timer();
++    if (c.created % fdleak_report_interval() == 0)
++        fdleak_report("periodic"sv);
+ }
+ 
+ Request::~Request()
+ {
++    auto& c = fdleak();
++    ++c.destroyed;
++    fdleak_live().remove(this);
++    if (m_fd != -1)
++        ++c.fd_still_open_at_destroy;
+     if (m_fd != -1 && !m_fd_is_owned_by_read_stream)
+         (void)Core::System::close(m_fd);
+ }
+@@ -68,6 +337,7 @@ int Request::request_server_client_id() const
+ 
+ bool Request::stop()
+ {
++    ++fdleak().stops;
+     RefPtr keep_alive = *this;
+ 
+     // The client may already be gone if the RequestServer connection was lost while this request was in flight.
+@@ -250,6 +520,10 @@ void Request::set_stop_callback(RequestStopped on_stop)
+ 
+ void Request::did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error)
+ {
++    ++fdleak().did_finish;
++    if (auto it = fdleak_live().find(this); it != fdleak_live().end())
++        it->value.did_finish = true;
++    FDLEAK_NOTE(false);
+     auto effective_network_error = m_body_delivery_error.has_value() ? m_body_delivery_error : network_error;
+     if (on_finish)
+         on_finish(total_size, timing_info, effective_network_error);
+@@ -273,6 +547,7 @@ void Request::did_request_certificates(Badge<RequestClient>)
+ 
+ void Request::did_transfer(Badge<RequestClient>)
+ {
++    ++fdleak().transfers;
+     auto on_stop = move(m_on_stop);
+ 
+     defer_teardown();
+@@ -283,6 +558,14 @@ void Request::did_transfer(Badge<RequestClient>)
+ 
+ void Request::defer_teardown()
+ {
++    ++fdleak().teardown;
++    if (auto it = fdleak_live().find(this); it != fdleak_live().end()) {
++        it->value.torn_down = true;
++        // Teardown drops m_internal_stream_data, whose ReadStream owns and closes
++        // the response fd; m_fd keeps its (now stale) number, so stop reporting it.
++        it->value.has_stream = false;
++        it->value.fd_open = false;
++    }
+     if (m_internal_stream_data && m_internal_stream_data->read_notifier)
+         m_internal_stream_data->read_notifier->set_enabled(false);
+     m_mode = Mode::Unknown;
+@@ -308,8 +591,10 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+     auto user_on_finish = move(on_finish);
+     on_finish = [this](auto total_size, auto const& timing_info, auto network_error) {
+         // If the request was stopped while this IPC was in-flight, just bail.
+-        if (!m_internal_stream_data)
++        if (!m_internal_stream_data) {
++            ++fdleak().finish_no_stream;
+             return;
++        }
+ 
+         m_internal_stream_data->total_size = total_size;
+         m_internal_stream_data->network_error = network_error;
+@@ -325,8 +610,35 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+ 
+         auto has_received_all_reported_bytes = m_internal_stream_data->request_done && m_internal_stream_data->delivered_size >= m_internal_stream_data->total_size;
+         if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
++            ++fdleak().finish_delivered;
++            if (auto it = fdleak_live().find(this); it != fdleak_live().end())
++                it->value.user_finish_called = true;
++            FDLEAK_NOTE(false);
+             m_internal_stream_data->user_finish_called = true;
+             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
++
++            // The body is fully delivered: drop the callbacks (and the GC::Roots they captured)
++            // and close the response fd, as stop()/did_transfer() do for the abandoned cases.
++            if (fdleak_teardown_enabled())
++                defer_teardown();
++        } else if (!m_internal_stream_data->user_finish_called) {
++            // FDLEAK: this is the path that never tears down. Name the failing condition.
++            auto& c = fdleak();
++            ++c.finish_skipped;
++            if (auto it = fdleak_live().find(this); it != fdleak_live().end())
++                ++it->value.skips;
++            FDLEAK_NOTE(false);
++            if (!m_internal_stream_data->request_done)
++                ++c.skip_reason_not_done;
++            else
++                ++c.skip_reason_short;
++            dbgln("FDLEAK skip: id={} mode={} request_done={} delivered={} total={} eof={} paused={} remaining={}",
++                m_request_id, m_mode == Mode::Buffered ? "buffered" : (m_mode == Mode::Unbuffered ? "unbuffered" : "unknown"),
++                m_internal_stream_data->request_done, m_internal_stream_data->delivered_size,
++                m_internal_stream_data->total_size,
++                m_internal_stream_data->read_stream ? m_internal_stream_data->read_stream->is_eof() : true,
++                m_body_delivery_paused,
++                m_internal_stream_data->body_delivery_remaining_byte_count.has_value() ? (i64)*m_internal_stream_data->body_delivery_remaining_byte_count : (i64)-1);
+         }
+     };
+ 
+@@ -373,6 +685,8 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+             }
+         } while (true);
+ 
++        FDLEAK_NOTE(false);
++
+         if (m_internal_stream_data->read_stream->is_eof())
+             m_internal_stream_data->read_notifier->close();
+ 

@@ -7,9 +7,9 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 def root_codegen():
     native.genrule(
         name = 'gen_HSTSPreloadData',
-        srcs = ['Build/caches/HSTSPreload/transport_security_state_static.json'] + ["//Meta:generators"],
+        srcs = ['@hsts_preload_json//file'] + ["//Meta:generators"],
         outs = ['Libraries/LibHTTP/HSTSPreloadData.h', 'Libraries/LibHTTP/HSTSPreloadData.cpp'],
-        cmd = "PYTHONHASHSEED=0 python3 Meta/Generators/generate_hsts_preload_data.py -h $(location Libraries/LibHTTP/HSTSPreloadData.h) -c $(location Libraries/LibHTTP/HSTSPreloadData.cpp) -p $(location Build/caches/HSTSPreload/transport_security_state_static.json)",
+        cmd = "PYTHONHASHSEED=0 python3 Meta/Generators/generate_hsts_preload_data.py -h $(location Libraries/LibHTTP/HSTSPreloadData.h) -c $(location Libraries/LibHTTP/HSTSPreloadData.cpp) -p $(location @hsts_preload_json//file)",
     )
     native.genrule(
         name = 'gen_Op',

@@ -21,6 +21,11 @@ sh_binary(
     srcs = ["vcpkg_build.sh"],
 )
 
+# The host-prerequisite list, read by vcpkg_build.sh at action time and named as
+# an input by vcpkg.bzl (NOT as data on the sh_binary above: runfiles are not
+# beside the wrapper Bazel execs, so the script cannot find it by dirname $0).
+exports_files(["vcpkg_host_tools.tsv"])
+
 # Ring 2 part 3: the driver for the cargo build actions (see //:cargo.bzl). It
 # assembles the vendor directory from crates Bazel fetched, points CARGO_HOME at
 # action-local scratch, and runs `cargo rustc --offline --locked` -- so the build

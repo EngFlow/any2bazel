@@ -23,8 +23,13 @@ VCPKG = "//Meta/vcpkg"
 # See emit_build_bazel.py: the crates are Bazel-built now, and each crate is ONE
 # target (//:<crate>_lib) carrying its own archive and its own generated FFI
 # headers -- one for one with CMake's per-library edge, so LibWeb links the four
-# crates it uses and nothing else.
-RUST_LIB_FMT = "//:%s_lib"
+# crates it uses and nothing else. Plus, for a crate whose header LibWeb includes
+# with no directory, an implementation_deps edge -- IMPORTED from
+# emit_build_bazel rather than reimplemented, so the two emitters cannot disagree
+# about which crates those are (none of LibWeb's four today; the mechanism is here
+# because "none today" is a measurement, not an invariant).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from emit_build_bazel import rust_dep_labels
 
 GLOBAL_DEFINES = {
     "USE_VULKAN=1", "ENABLE_COMPILETIME_FORMAT_CHECK", "USE_FONTCONFIG=1",
@@ -43,8 +48,17 @@ ALWAYSLINK = True
 PRELUDE = '''load("@rules_cc//cc:defs.bzl", "cc_library")
 load(":codegen.bzl", "libweb_codegen", "libweb_bindings_codegen")
 load(":generated_srcs.bzl", "LIBWEB_GENERATED_SRCS", "LIBWEB_GENERATED_HDRS")
+load(":export_header.bzl", "libweb_export_header")
 
 package(default_visibility = ["//visibility:public"])
+
+# LibWeb's generate_export_header output. It is generated HERE rather than in the
+# root package because Bazel include dirs cannot escape a package: LibWeb is its
+# own package, so its Export.h has to be an output of this package (at
+# genroot/LibWeb/Export.h, with includes=["genroot"] -- includes=["../.."] is
+# rejected by Bazel, and rightly so). Emitted by
+# Meta/emit_export_headers_bazel.py --libweb.
+libweb_export_header()
 
 libweb_codegen()
 libweb_bindings_codegen()
@@ -204,7 +218,7 @@ def main():
     flags = target_flags(t)
     incs = target_private_includes(t)
 
-    deps, sysdeps, unknown = [], [], []
+    deps, impl_deps, sysdeps, unknown = [], [], [], []
     for d in t.get("deps", []):
         nm = d["name"]
         if not d.get("external"):
@@ -217,7 +231,9 @@ def main():
                 deps.append("//:%s" % tgt)
             continue
         if nm.endswith("_rust"):
-            deps.append(RUST_LIB_FMT % nm)
+            rdeps, rimpl = rust_dep_labels(nm)
+            deps.extend(rdeps)
+            impl_deps.extend(rimpl)
         elif nm in so or nm in ar:
             deps.append(VCPKG + ":" + nm)
         elif nm in SYSTEM_LIBS:
@@ -270,6 +286,11 @@ def main():
         out.append("    local_defines = %r," % defs)
     if copt_toks:
         out.append("    copts = [%s]," % ", ".join("%r" % x for x in copt_toks))
+    # PRIVATE deps -- see rust_dep_labels() in emit_build_bazel.py for why an
+    # unprefixed FFI include dir must not propagate.
+    if impl_deps:
+        out.append("    implementation_deps = [%s]," %
+                   ", ".join("%r" % x for x in sorted(set(impl_deps))))
     out.append("    deps = [")
     for d in sorted(set(deps)):
         out.append(f"        {d!r},")
