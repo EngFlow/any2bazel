@@ -258,12 +258,22 @@ even though the teardown ran. That is why the same patch zeroes the leak on my t
 leaves 97/min on his: we differ in what else holds a reference, not in what the teardown
 does.
 
-Two variants exist because `0004` and `0003` edit the same three lines:
-`0004-...-on-completion.patch` for a tree that already has the teardown fix (upstream's or
-`0003`), and `0004-...-on-clean-tree.patch` for one that does not. Applying the wrong one
-fails with `patch does not apply` — which is exactly what happened when I first generated
-the on-top patch against the clean commit, so it silently carried `0003`'s hunk and could
-not apply to the tree it was written for. Both are now checked against both trees.
+`0004` is the **next patch in the series**, applied on top of `0003` (or upstream's
+equivalent teardown fix) — not an alternative to it. Two mistakes on the way there, both
+caught by Ulf within minutes and both now pinned by tests:
+
+1. I generated it by diffing against the *clean* commit, so it silently carried `0003`'s
+   own hunk and could not apply to the tree it was written for (`patch does not apply`).
+2. Correcting that, I shipped *two* variants — one for a tree with the teardown fix, one
+   without. That cannot work: `apply_overlay.sh` applies `patches/*.patch` **by glob**, so
+   one of two mutually-exclusive patches is guaranteed to fail. `patches/` is a series,
+   not a menu; an alternative belongs outside the glob, like `DIAGNOSTIC-*.patch.txt`.
+   The clean-tree variant was also strictly weaker — it closed the fd without dropping the
+   callbacks, leaving the GC cycle, and with it class B, in place.
+
+A test now reconstructs the pinned versions of every file the patches touch and applies the
+whole series in glob order, exactly as the script does, so a patch that conflicts with its
+predecessor fails in CI rather than on someone else's clone.
 
 `patches/0004-*.patch` closes the fd explicitly, at the point the code has *already proven*
 the body is complete (the `user_finish_called` branch), deregistering the notifier before

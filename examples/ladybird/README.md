@@ -819,7 +819,9 @@ Honest inventory of what stops this from being a clone-and-build.
    `peer=DEAD` and all sent by RequestServer — because dropping the callbacks unpins
    the GC cycle but does not *close the descriptor*: the response pipe is released
    only by `~Request`, so any other reference to the request retains one fd per
-   completed request. `0004` closes it where the body is already proven complete.
+   completed request. `0004` closes it where the body is already proven complete — the
+   next patch in the series, applied on top of `0003`; `patches/*.patch` is applied by
+   glob in full, so an *alternative* to a patch must never live there.
    Measured A/B on 200 completed requests: **208 sockets (203 dead) → 6 (0 dead)**,
    with body delivery intact. "Collectable" and "closed" are different claims, and
    for an fd received over IPC only the second one is the bug.

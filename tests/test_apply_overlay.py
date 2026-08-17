@@ -280,18 +280,17 @@ def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete()
     patch = PATCHES / "0004-requests-release-response-fd-on-completion.patch"
     assert patch.exists()
     text = patch.read_text()
-    # TWO variants, because 0004 and 0003 edit the same three lines: the on-top one
-    # only applies to a tree that HAS the teardown fix, the clean-tree one only to a
-    # tree that does not. I generated the on-top patch against the clean commit first
-    # and it silently contained 0003's hunk, so it failed on the very tree it was
-    # written for -- Ulf hit that as "patch does not apply". Both are now checked
-    # against both trees, and each must be REJECTED by the other's.
-    clean_variant = PATCHES / "0004-requests-release-response-fd-on-clean-tree.patch"
-    assert clean_variant.exists(), \
-        "a tree without the teardown fix needs its own variant; the hunks collide"
-    for p_ in (patch, clean_variant):
-        assert "only one of them will apply" in p_.read_text(), \
-            "%s must say which tree it is for" % p_.name
+    # 0004 is the NEXT PATCH IN THE SERIES, not an alternative to 0003: it is
+    # generated on top of it and applies only after it. I first shipped a second
+    # "clean tree" variant for trees without the teardown fix, which cannot work --
+    # apply_overlay.sh globs patches/*.patch and applies them all, so one of the two
+    # was guaranteed to fail. Ulf hit it on the first run. The variant is deleted; it
+    # was also strictly weaker (it closed the fd without dropping the callbacks, so it
+    # left the GC cycle, and with it class B, in place).
+    assert not list(PATCHES.glob("*clean-tree*")), \
+        "an alternative in patches/*.patch cannot coexist with the glob that applies all"
+    assert "ON TOP OF the teardown fix" in text, \
+        "0004 must state that it builds on 0003 rather than replacing it"
     # the notifier must be deregistered before the fd is closed, or the event loop
     # is left polling a closed descriptor
     body = text[text.index("release_response_fd"):]
@@ -310,3 +309,87 @@ def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete()
     # against the wrong slice, so the file must not carry one.
     assert len([ln for ln in lines if ln.startswith("@window ")]) == 1, \
         "apply_overlay.sh honours one @window only"
+
+
+def test_the_patch_series_applies_as_a_series():
+    """patches/*.patch must apply IN GLOB ORDER, each on top of the last.
+
+    apply_overlay.sh applies every patches/*.patch by glob. That makes the directory a
+    series, not a menu -- and I broke it: 0004 needs 0003's hunk to be present, so I
+    shipped a second "clean tree" variant of 0004 for trees without the teardown fix.
+    Since the loop applies ALL of them, one of the two could only ever fail. Ulf hit it
+    on the first run: "tries to apply both patches at the same time".
+
+    So this reconstructs the pinned versions of every file the patches touch, straight
+    out of the target of each patch, and applies the series to them exactly as the
+    script does. A patch that conflicts with its predecessor -- or an alternative
+    smuggled into patches/*.patch -- fails here instead of on a colleague's clone.
+
+    Needs a git and the Ladybird checkout the pin refers to; skipped when absent,
+    because the suite must run in a bare container too.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    checkout = os.environ.get("LADYBIRD_CHECKOUT", os.path.expanduser("~/ladybird-work"))
+    if not os.path.isdir(os.path.join(checkout, ".git")):
+        return  # no reference checkout here; the shell-level check still runs in CI
+
+    patches = sorted(PATCHES.glob("*.patch"))
+    assert len(patches) >= 2, "a series needs at least two patches to be worth checking"
+
+    # every file any patch touches, at the pinned commit
+    targets = set()
+    for p in patches:
+        targets.update(re.findall(r"^\+\+\+ b/(\S+)", p.read_text(), re.M))
+    assert targets, "no patch targets found -- has the patch format changed?"
+
+    commit = re.search(r'LADYBIRD_COMMIT="([0-9a-f]{40})"', _text()).group(1)
+    tmp = tempfile.mkdtemp()
+    try:
+        subprocess.run(["git", "init", "-q", "."], cwd=tmp, check=True)
+        for t in sorted(targets):
+            blob = subprocess.run(["git", "show", "%s:%s" % (commit, t)],
+                                  cwd=checkout, capture_output=True, text=True)
+            if blob.returncode != 0:
+                return  # the pinned commit is not fetched here; nothing to check
+            dest = os.path.join(tmp, t)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w") as f:
+                f.write(blob.stdout)
+        subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "pinned"], cwd=tmp, check=True)
+
+        for p in patches:
+            r = subprocess.run(["git", "apply", str(p)], cwd=tmp,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, (
+                "%s does not apply on top of the patches before it.\n"
+                "patches/*.patch is a SERIES applied in glob order by "
+                "apply_overlay.sh; an ALTERNATIVE to another patch must live "
+                "outside that glob (see DIAGNOSTIC-*.patch.txt).\n%s"
+                % (p.name, r.stderr))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_no_two_patches_are_alternatives_of_each_other():
+    """A cheap structural guard that needs no checkout at all.
+
+    Two patches whose names differ only by a trailing variant suffix, or that claim in
+    their own header that only one of them applies, cannot both be in a glob-applied
+    series. This catches the mistake at review time rather than at apply time.
+    """
+    for p in sorted(PATCHES.glob("*.patch")):
+        text = p.read_text()
+        assert "only one of them will apply" not in text, (
+            "%s advertises itself as an alternative, but patches/*.patch is applied "
+            "in full by apply_overlay.sh -- move it outside the glob" % p.name)
+    # and the numeric prefixes must be unique: two patches sharing one number are
+    # variants by construction
+    prefixes = [p.name.split("-")[0] for p in sorted(PATCHES.glob("*.patch"))]
+    dupes = {n for n in prefixes if prefixes.count(n) > 1}
+    assert not dupes, \
+        "patches sharing a series number are alternatives, not a series: %r" % (dupes,)

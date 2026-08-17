@@ -221,11 +221,26 @@ fi
 note "at $(git rev-parse HEAD)"
 
 note "applying $(ls "$PATCHES"/*.patch | wc -l) patches (all reported upstream)"
+# patches/*.patch is a SERIES, applied in glob (numeric) order: a later patch may
+# depend on an earlier one having landed. 0004 edits lines adjacent to 0003's inside
+# the same branch, so it is generated against 0003 and only applies after it.
+#
+# That makes the glob load-bearing in a way it was not before. I briefly shipped two
+# mutually-exclusive variants of 0004 -- one for a tree with the teardown fix, one for
+# a tree without -- and since this loop applies EVERY *.patch, one of them could only
+# ever fail. Ulf hit it immediately: "tries to apply both patches at the same time".
+# Alternatives do not belong in this directory; a variant that is not part of the
+# series goes beside DIAGNOSTIC-*.patch.txt, outside the glob. The series-applies-as-a-
+# series property is now pinned by a test, so a future patch that silently conflicts
+# with its predecessor fails in CI rather than on someone's clone.
 for p in "$PATCHES"/*.patch; do
     if git apply --check -R "$p" >/dev/null 2>&1; then
         note "  already applied: $(basename "$p")"
     else
-        git apply "$p" || die "failed to apply $(basename "$p")"
+        git apply "$p" || die "failed to apply $(basename "$p") -- patches/ is a
+    series applied in order; a patch here must apply on top of the ones before it.
+    If this is an ALTERNATIVE to another patch rather than an addition, it must not
+    live in patches/*.patch, which is globbed and applied in full."
         note "  applied: $(basename "$p")"
     fi
 done
