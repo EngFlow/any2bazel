@@ -280,6 +280,18 @@ def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete()
     patch = PATCHES / "0004-requests-release-response-fd-on-completion.patch"
     assert patch.exists()
     text = patch.read_text()
+    # TWO variants, because 0004 and 0003 edit the same three lines: the on-top one
+    # only applies to a tree that HAS the teardown fix, the clean-tree one only to a
+    # tree that does not. I generated the on-top patch against the clean commit first
+    # and it silently contained 0003's hunk, so it failed on the very tree it was
+    # written for -- Ulf hit that as "patch does not apply". Both are now checked
+    # against both trees, and each must be REJECTED by the other's.
+    clean_variant = PATCHES / "0004-requests-release-response-fd-on-clean-tree.patch"
+    assert clean_variant.exists(), \
+        "a tree without the teardown fix needs its own variant; the hunks collide"
+    for p_ in (patch, clean_variant):
+        assert "only one of them will apply" in p_.read_text(), \
+            "%s must say which tree it is for" % p_.name
     # the notifier must be deregistered before the fd is closed, or the event loop
     # is left polling a closed descriptor
     body = text[text.index("release_response_fd"):]

@@ -1,8 +1,8 @@
 From: any2bazel Ladybird migration
-Subject: [PATCH] LibRequests: close the response fd on completion, not just at ~Request
+Subject: [PATCH] LibRequests: close the response fd on completion (clean-tree variant)
 
-Applies ON TOP OF the teardown fix (patches/0003, or upstream's equivalent). If your
-tree does NOT have that fix yet, use 0004-...-on-clean-tree.patch instead -- the two
+Variant for a tree WITHOUT the teardown fix (patches/0003 or upstream's equivalent).
+It includes the teardown-point release itself, so do not apply 0003 as well: the two
 touch the same three lines and only one of them will apply.
 
 WHY A SECOND PATCH. With the teardown fix applied, Ulf still measured 97 leaked
@@ -48,7 +48,7 @@ The generalisable point: "the object is collectable" and "the fd is closed" are
 different claims, and for a descriptor received over IPC only the second one is the
 bug. A fix verified through the object graph can pass while the resource still leaks.
 diff --git a/Libraries/LibRequests/Request.cpp b/Libraries/LibRequests/Request.cpp
-index 7bac6c8..d45133b 100644
+index 6262425..c25596b 100644
 --- a/Libraries/LibRequests/Request.cpp
 +++ b/Libraries/LibRequests/Request.cpp
 @@ -253,6 +253,10 @@ void Request::did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo
@@ -62,23 +62,21 @@ index 7bac6c8..d45133b 100644
  }
  
  void Request::did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache)
-@@ -281,6 +285,34 @@ void Request::did_transfer(Badge<RequestClient>)
+@@ -281,6 +285,32 @@ void Request::did_transfer(Badge<RequestClient>)
          on_stop();
  }
  
 +void Request::release_response_fd()
 +{
-+    // Close the response pipe received from RequestServer at the moment its job is
++    // Close the response pipe received from RequestServer, at the moment its job is
 +    // demonstrably over, instead of leaving it to the Request's destructor.
 +    //
 +    // The fd is one half of the socketpair RequestServer::RequestPipe::create() made
-+    // and handed over with request_started(). WebContent otherwise releases it only
-+    // when the Request itself dies (~Request, or the ReadStream inside
-+    // m_internal_stream_data) -- so ANY other surviving reference to the Request pins
-+    // one fd per COMPLETED request even though defer_teardown() ran correctly.
-+    // Dropping the callbacks makes the request collectable; it does not close the fd.
-+    // peer=DEAD in an `ss -np` census is exactly this: RequestServer already closed
-+    // its end and is waiting for us.
++    // and handed over with request_started(). Today WebContent releases it only when
++    // the Request itself dies (~Request, or the ReadStream inside
++    // m_internal_stream_data), so ANY extra reference to the Request -- e.g. the
++    // GC-root/RefPtr cycle -- pins one fd per completed request. Peer=DEAD in the
++    // census is exactly that: RequestServer already closed its end.
 +    //
 +    // Deregister the notifier BEFORE closing, or the event loop polls a closed fd.
 +    if (m_internal_stream_data) {
@@ -97,17 +95,14 @@ index 7bac6c8..d45133b 100644
  void Request::defer_teardown()
  {
      if (m_internal_stream_data && m_internal_stream_data->read_notifier)
-@@ -331,6 +363,14 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
-             // The body is fully delivered: drop the callbacks (and the GC::Roots they captured)
-             // and close the response fd, as stop()/did_transfer() do for the abandoned cases.
-             defer_teardown();
-+
-+            // ...and close the fd outright. defer_teardown() only nulls the owners it
-+            // knows about; if anything else still references this Request the fd stays
-+            // open. The guard above proves EOF or that every reported byte was
-+            // delivered, so closing here cannot truncate a body. (Closing on
-+            // request_finished alone DOES truncate -- blank pages -- because
-+            // RequestServer stops writing long before WebContent drains the pipe.)
+@@ -327,6 +357,11 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+         if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
+             m_internal_stream_data->user_finish_called = true;
+             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
++            // Only now: the guard above proves EOF or that every reported byte was
++            // delivered, so closing cannot truncate a body. Closing on
++            // request_finished alone DOES truncate (blank pages) -- RequestServer
++            // finishes writing long before WebContent drains the pipe.
 +            release_response_fd();
          }
      };

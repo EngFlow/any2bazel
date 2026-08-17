@@ -258,6 +258,13 @@ even though the teardown ran. That is why the same patch zeroes the leak on my t
 leaves 97/min on his: we differ in what else holds a reference, not in what the teardown
 does.
 
+Two variants exist because `0004` and `0003` edit the same three lines:
+`0004-...-on-completion.patch` for a tree that already has the teardown fix (upstream's or
+`0003`), and `0004-...-on-clean-tree.patch` for one that does not. Applying the wrong one
+fails with `patch does not apply` — which is exactly what happened when I first generated
+the on-top patch against the clean commit, so it silently carried `0003`'s hunk and could
+not apply to the tree it was written for. Both are now checked against both trees.
+
 `patches/0004-*.patch` closes the fd explicitly, at the point the code has *already proven*
 the body is complete (the `user_finish_called` branch), deregistering the notifier before
 closing so the event loop is never left polling a closed descriptor. It does **not** close
