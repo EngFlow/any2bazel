@@ -79,10 +79,19 @@ build --linkopt=-Wl,--allow-multiple-definition
 build --linkopt=-L/usr/lib/x86_64-linux-gnu
 # System includes for find_package/pkg_check_modules deps that are still
 # host-provided: libdrm, and (since 71fb301a) glib -- upstream added a
-# pkg_check_modules(GIO) for UI/Qt's ExternalURLActivationToken/Handler. glib puts
-# glibconfig.h under a LIBDIR, not an includedir, so both roots are needed.
-# Qt6 does not appear here: it comes from rules_qt as a real Bazel dep.
-build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include
+# pkg_check_modules(GIO) for UI/Qt's ExternalURLActivationToken/Handler.
+#
+# SIX roots, not the three that look obvious, and the list is DERIVED: it is
+# every absolute -I/-isystem in the CMake reference that no Bazel dep edge
+# carries, and emit_build_bazel.py now WARNS when one is missing here instead of
+# dropping it silently. I first transcribed three of them by hand and the build
+# failed 3,800 actions later on `gio/gdesktopappinfo.h: No such file or
+# directory`. glibconfig.h lives under a LIBDIR rather than an includedir;
+# gio-unix-2.0 is a separate root from glib-2.0 (the UNIX-only GIO headers);
+# blkid/libmount/sysprof-6 arrive transitively through glib's own pkg-config.
+# Qt6 does not appear here: it comes from rules_qt as a real Bazel dep, and the
+# vcpkg include dirs ride on //Meta/vcpkg:<port> (finding 33).
+build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include:/usr/include/gio-unix-2.0:/usr/include/blkid:/usr/include/libmount:/usr/include/sysprof-6
 
 # --- exec (host) configuration ---------------------------------------------
 # Every flag above is a --cxxopt/--copt/--linkopt, which Bazel applies only to
@@ -129,4 +138,4 @@ build --host_copt=-fPIC
 build --host_linkopt=-Wl,--allow-shlib-undefined
 build --host_linkopt=-Wl,--allow-multiple-definition
 build --host_linkopt=-L/usr/lib/x86_64-linux-gnu
-build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include
+build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include:/usr/include/gio-unix-2.0:/usr/include/blkid:/usr/include/libmount:/usr/include/sysprof-6

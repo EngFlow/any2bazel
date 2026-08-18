@@ -268,6 +268,59 @@ def test_the_moc_list_follows_what_cmake_compiles_not_a_name():
     # ...paired with the dep that makes it compile, or the moc output does not build.
     assert "'@qt//:QtPositioning'" in build
 
+
+def test_a_dropped_absolute_include_root_is_reported_not_silently_skipped():
+    """The emitter must not hide the difference between its input and .bazelrc.
+
+    An absolute include root (/usr/include/glib-2.0) cannot be a per-target
+    copt -- Bazel rejects a path outside the execution root even as -isystem --
+    so the emitter drops it and .bazelrc carries it globally as
+    CPLUS_INCLUDE_PATH. The drop was a bare `continue`, which means a root CMake
+    compiles with and .bazelrc lacks produces NO output at all.
+
+    That is how the last failure of this repin happened, and I caused it: having
+    just fixed four hand-copied facts, I hand-copied three of glib's roots out of
+    the model and missed the rest. The build failed ~3,800 actions later on
+    `UI/Qt/ExternalURLHandler.cpp:19: fatal error: gio/gdesktopappinfo.h: No such
+    file or directory` -- gio-unix-2.0 is a separate root from glib-2.0, and
+    blkid/libmount/sysprof-6 arrive transitively through glib's pkg-config.
+    Re-running the emitter with the check in place named all four at once.
+
+    Deliberately a WARNING, not a failure: which host escapes are acceptable is a
+    judgement (README gap 3), and Qt's roots are correctly absent because
+    rules_qt carries them on the dep edge. What is not a judgement is whether the
+    emitter says anything at all.
+    """
+    src = _read("Meta/emit_build_bazel.py")
+    # The bare skip is gone.
+    assert "record_host_include(i)" in src, \
+        "absolute include roots are dropped without being recorded"
+    assert "def report_host_includes" in src and "report_host_includes()" in \
+        src.split("def report_host_includes", 1)[1], \
+        "the shortfall is collected but never reported"
+    # The roots that ride on a dep edge must be exempt, or the warning cries wolf
+    # about Qt on every run and gets ignored -- which is how a real one hides.
+    exempt = src.split("HOST_INCLUDE_EXEMPT = ", 1)[1].split(")", 1)[0]
+    assert "qt6" in exempt and "vcpkg_installed" in exempt, exempt
+
+    # And .bazelrc actually carries the six roots this configuration needs, glib's
+    # non-obvious ones included. This is the assertion that would have failed
+    # while the build was broken.
+    rc = _read("bazelrc.txt")
+    paths = set()
+    for m in re.finditer(r"CPLUS_INCLUDE_PATH=(\S+)", rc):
+        paths |= set(m.group(1).split(":"))
+    for root in ("/usr/include/libdrm", "/usr/include/glib-2.0",
+                 "/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+                 "/usr/include/gio-unix-2.0", "/usr/include/blkid",
+                 "/usr/include/libmount", "/usr/include/sysprof-6"):
+        assert root in paths, "%s missing from CPLUS_INCLUDE_PATH" % root
+    # Target and exec configs must agree: a root in one and not the other is the
+    # finding-26 skew, and here it would mean a genrule tool that cannot compile.
+    envs = re.findall(r"--(?:host_)?action_env=CPLUS_INCLUDE_PATH=(\S+)", rc)
+    assert len(envs) == 2, envs
+    assert envs[0] == envs[1], "target and exec CPLUS_INCLUDE_PATH differ"
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

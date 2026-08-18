@@ -135,6 +135,60 @@ def global_flags():
 
 GLOBAL_FLAGS = global_flags()
 
+
+def bazelrc_host_includes():
+    """The include roots .bazelrc hands every action via CPLUS_INCLUDE_PATH.
+
+    These are the host escapes README gap 3 inventories. Read here so the
+    emitter can CHECK the ones it drops against them rather than dropping them
+    silently.
+    """
+    rc = open(os.path.join(ROOT, ".bazelrc")).read()
+    out = set()
+    for m in re.finditer(r"--(?:host_)?action_env=CPLUS_INCLUDE_PATH=(\S+)", rc):
+        out |= {p for p in m.group(1).split(":") if p}
+    return out
+
+
+BAZELRC_HOST_INCLUDES = bazelrc_host_includes()
+# Absolute include roots the model uses that .bazelrc does NOT carry. Collected
+# during emission and reported at the end: a per-target message would repeat
+# once per TU, and the useful unit is "which roots does this configuration need
+# that the build does not provide".
+MISSING_HOST_INCLUDES = set()
+# Roots that arrive with a dep edge instead of an env var, so their absence from
+# CPLUS_INCLUDE_PATH is correct rather than missing. Qt comes from rules_qt as a
+# real Bazel dep (@qt//:Qt<Module> carries its own include dirs) and the vcpkg
+# tree rides on //Meta/vcpkg:<port> as system_includes -- both deliberately NOT
+# global -isystem any more, which is what finding 33 bought.
+HOST_INCLUDE_EXEMPT = ("/usr/include/x86_64-linux-gnu/qt6",
+                       "/usr/lib/x86_64-linux-gnu/qt6",
+                       "vcpkg_installed")
+
+
+def record_host_include(path):
+    if any(x in path for x in HOST_INCLUDE_EXEMPT):
+        return
+    if path not in BAZELRC_HOST_INCLUDES:
+        MISSING_HOST_INCLUDES.add(path)
+
+
+def report_host_includes():
+    """Print the shortfall to stderr. Not fatal: see record_host_include."""
+    if not MISSING_HOST_INCLUDES:
+        return
+    sys.stderr.write(
+        "WARNING: %d absolute include root(s) CMake compiles with are absent "
+        "from\n         .bazelrc's CPLUS_INCLUDE_PATH, so a TU that needs one "
+        "will fail with\n         'No such file or directory' far from here:\n"
+        % len(MISSING_HOST_INCLUDES))
+    for p in sorted(MISSING_HOST_INCLUDES):
+        sys.stderr.write("    %s\n" % p)
+    sys.stderr.write(
+        "         Add them there (they cannot be per-target copts: Bazel "
+        "rejects a path\n         outside the execution root), or give the dep "
+        "a Bazel label that carries them.\n")
+
 # Flags CMake puts on a target that must NOT be copied into a Bazel copt.
 #
 # -fPIE is the one that matters, and it is a crash, not a nit. CMake adds it to
@@ -838,10 +892,20 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
         copt_toks = list(flags)
         for i in incs:
             if i.startswith("/"):
-                # System include roots (/usr Qt6, libdrm) can't be per-target
-                # copts: Bazel rejects a path outside the execution root even
-                # with -isystem. They live as global -isystem in .bazelrc
-                # (mirroring CMake's find_package include dirs).
+                # System include roots (/usr Qt6, libdrm, glib) can't be
+                # per-target copts: Bazel rejects a path outside the execution
+                # root even with -isystem. They live in .bazelrc's
+                # CPLUS_INCLUDE_PATH (mirroring CMake's find_package dirs) --
+                # and CHECKED against it, not just skipped. A silent `continue`
+                # here means a root CMake uses and .bazelrc lacks produces no
+                # output at all: I transcribed three of glib's four roots by
+                # hand and the build failed 3,800 actions later on
+                # `gio/gdesktopappinfo.h: No such file or directory`, which is
+                # the same hand-copied-fact bug as everything else in this
+                # repin. Reported, not fixed automatically: which roots are
+                # acceptable host escapes is a judgement (see README gap 3),
+                # so the emitter's job is to refuse to hide the difference.
+                record_host_include(i)
                 continue
             if i.startswith(BUILD_REL + "Libraries/"):
                 # CMake's per-library FFI dir (FFI_OUTPUT_DIR defaults to the
@@ -941,6 +1005,8 @@ def main():
                     # same sense as the cranelift-compiler binary LibWasm spawns.
                     extra_data=[":qt_conf", ":qt_plugins"])
     print(VCPKG_TAIL, end="")
+    # Last, so it is the final thing on stderr rather than buried in the middle.
+    report_host_includes()
 
 
 def lib_hdr_glob(name, srcs):
