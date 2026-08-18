@@ -383,6 +383,50 @@ while the control stays present; restored and relinked, `HAS 0004`. A non-Ladybi
 process reports "cannot tell". Both directions are tested, because a probe that can
 only confirm a fix is present is useless for the question that prompted it.
 
+#### Correction: the probe was wrong, and Ulf was right
+
+Ulf's reply to the above was *"the tool says it's not, but I'm sure it was applied"* —
+and then *"I have all the patches applied."* **He was right and the probe was wrong.**
+The flaw is worth recording in full because it is the same class of error as the
+measurements this whole document is about.
+
+Ladybird sets `ENABLE_LTO_FOR_RELEASE=ON` (`Meta/CMake/cmake_options.cmake:46`). In a
+**static** build — Ulf's — LTO inlines a small internal-only method like
+`release_response_fd()` into its single caller and leaves **no symbol and no string
+behind at all**. Reproduced from first principles: a private method called only within
+its TU, compiled `-O3 -flto` and linked, is absent from both `nm` and `strings` in the
+linked executable. My own build kept it only because a **shared** library has to export
+it. So the probe's answer depended on *how the binary was linked*, not on whether the
+fix was in it — and the one build shape it had to get right was the one it got wrong.
+
+The negative control did not save it, and that is the instructive part. `set_up_internal_stream_data`
+is vulnerable to the *same* optimisation: verified that a larger internal-only function
+also vanishes under LTO. **A negative control only rules out "unreadable" if it cannot
+disappear for the same reason as the thing it guards.** Mine failed in a different mode
+than the one it was guarding against, so it certified readability it had not
+established. I had written that the control was "the load-bearing part"; it was
+load-bearing in the wrong direction.
+
+Two fixes, both verified:
+
+1. **`.debug_str` is read as well as `.dynstr`/`.strtab`.** Debug info names
+   inlined-away functions, and Ladybird's `RelWithDebInfo` compiles with `-g` (and
+   `-g1`, also verified sufficient), so the answer survives there for exactly the
+   LTO/static case.
+2. **A fix is never reported MISSING unless a symbol that inlining cannot erase is
+   visible** (`UNINLINABLE_CONTROLS`: vtable/IPC-dispatched entry points such as
+   `request_started`, `headers_became_available`, and `Request`'s header-declared
+   out-of-line methods). If none is readable, the probe now says *"cannot tell whether
+   0004 is present"* and names inlining as the reason. Tested both ways: an
+   Ulf-shaped blob (0004 inlined away, control present, nothing uninlinable) yields
+   "cannot tell"; a genuinely unpatched-but-readable binary is still called out as
+   missing 0004, re-verified end-to-end against a rebuilt shared library.
+
+**What this means for the diagnosis.** With `0004` confirmed applied, the ~92/min
+class-A leak is *not* the response-pipe path `0004` closes. The fd has a **third
+owner**, and the two candidates below are no longer "still open" — they are the
+diagnosis.
+
 One more thing the probe caught on the way. Running the full census against a
 *healthy* browser to check the new block, the verdict line read
 `mixed DEAD/ALIVE -> both classes present` for 0 dead and 5 live sockets: both
@@ -392,7 +436,10 @@ mesh as a leak. Fixed with explicit `dead == 0` / `alive == 0` cases. It only su
 because the healthy case finally got looked at; a verdict that is wrong on healthy
 input will be believed when it is wrong on broken input too.
 
-### Still open: two retention paths `0004` does not cover
+### The remaining owner: two paths `0004` structurally cannot reach
+
+With `0004` confirmed present in the leaking binary, these are no longer speculative
+alternatives — one of them is the leak.
 
 Reading the ownership chain for the class-A case again, with "what else holds a
 `Requests::Request` after completion" as the question, turns up two paths that are
@@ -420,8 +467,32 @@ consistent with completed requests (peer=DEAD) retaining an fd:
    run and not in my earlier ones) adds cross-process navigation paths through exactly
    this code.
 
-Neither is confirmed. What makes (2) the better lead is that it is the first mechanism
-found that explains the *combination* Ulf measured — completed-and-closed by the peer,
+#### Falsified locally, and the measurement that replaces the guess
+
+I built the workload for (2): 330 top-level navigations to a URL whose body dribbles,
+each abandoned 250 ms in (before the body completes), with `--site-isolation=top-level`
+and the memory cache on. **Flat — 0 dead, no growth.** So (2) as I constructed it is not
+sufficient either, and I am now two falsified hypotheses deep on a leak I cannot
+reproduce.
+
+That is the point at which guessing again is the wrong move. The two candidates above
+look identical in every column the census prints, but they differ in one field `ss`
+already reports and I was throwing away: **`Recv-Q`, the bytes sitting unread in the
+socket.**
+
+- `Recv-Q > 0` — the body was **never drained**. The consumer stopped reading, so the
+  completion branch that closes the fd was never reached. The fix is resume-or-close on
+  the abandoned path.
+- `Recv-Q == 0` — the body **was fully read**; the descriptor is merely still *owned*.
+  The fix is dropping the surviving reference (the `RefPtr` in
+  `Response::m_request_server_request`, which `clone()` copies).
+
+Same signature, opposite fixes, one field. The census now prints
+`of retained peer=DEAD: body UNREAD=N body drained=M` and names which mechanism the
+numbers imply. Ulf's existing `--all` run already collects the `ss` line this comes
+from, so this costs nothing beyond re-running the census he has run before.
+
+Of the two, (2) is the one that explains the *combination* Ulf measured — completed-and-closed by the peer,
 retained, and indifferent to a fix that works locally — rather than only part of it.
 The memory cache, which I suspected next because `--enable-http-memory-cache` was on
 his command line and I had never tested it, is **ruled out** by reading

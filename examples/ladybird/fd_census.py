@@ -109,6 +109,44 @@ FIX_SYMBOLS = (
 # this whole probe exists to prevent.
 CONTROL_SYMBOL = "set_up_internal_stream_data"
 
+# ...and the control ALONE IS NOT ENOUGH, which is the correction that matters here.
+#
+# Ulf said "I have all the patches applied" and this probe said 0004 was absent. He was
+# right. The reason is a real flaw in the first version, not a mistake of his:
+# Ladybird sets ENABLE_LTO_FOR_RELEASE=ON, and in a STATIC build (his) LTO inlines a
+# small internal-only method like release_response_fd() into its single caller and
+# leaves NO symbol and NO string behind at all. Reproduced from first principles: a
+# private method called only within its TU, linked -O3 -flto, disappears from both
+# `nm` and `strings` in the linked executable -- while my own build keeps it, because
+# a SHARED library must export it. So the probe's answer depended on how the binary
+# was linked, not on whether the fix was in it.
+#
+# And the control did not catch it, because the control is vulnerable to exactly the
+# same optimisation: verified that a larger internal-only function also vanishes under
+# LTO. A control only rules out "unreadable" if it CANNOT disappear for the same
+# reason as the thing it guards. That is the general trap: a negative control has to
+# fail in the failure mode you are guarding against, and mine failed in a different
+# one.
+#
+# Two changes follow. (1) .debug_str is read as well as the symbol tables: debug info
+# names inlined-away functions, and Ladybird's RelWithDebInfo compiles with -g, so the
+# answer survives there for precisely the LTO/static case. (2) A symbol that is merely
+# ABSENT is never reported as a missing fix unless something PROVES the binary is
+# readable at a level inlining cannot erase -- see UNINLINABLE_CONTROLS.
+
+# Symbols that cannot be inlined away, so their presence proves the binary's names are
+# readable: virtual/IPC-dispatched entry points reached through a vtable or across a
+# library boundary. If NONE of these is visible, this binary cannot answer the
+# question, whatever else is or is not in it.
+UNINLINABLE_CONTROLS = (
+    # Reached via the IPC endpoint dispatch table, not a direct call.
+    "request_started",
+    "headers_became_available",
+    # Request's own out-of-line, externally-called entry points.
+    "did_receive_headers",
+    "set_unbuffered_request_callbacks",
+)
+
 # The Request code lives here; when Ladybird is built statically it is in the
 # executable instead, so the executable is always probed too.
 FIX_LIBRARY_HINT = "lagom-requests"
@@ -154,7 +192,14 @@ def elf_symbol_names(path):
                 name_off, sec_off, sec_size = entry(i)
                 end = shstrtab.find(b"\0", name_off)
                 name = shstrtab[name_off:end if end >= 0 else None]
-                if name in (b".dynstr", b".strtab") and sec_size < 64 * 1024 * 1024:
+                # .debug_str matters as much as the symbol tables: under LTO in a
+                # STATIC build, a small internal-only method like
+                # release_response_fd is inlined into its only caller and leaves NO
+                # symbol and NO string behind -- but the debug info still names it.
+                # Ladybird's RelWithDebInfo compiles with -g, so this is where the
+                # answer survives for exactly the build that prompted the question.
+                if name in (b".dynstr", b".strtab", b".debug_str") \
+                        and sec_size < 256 * 1024 * 1024:
                     f.seek(sec_off)
                     blob += f.read(sec_size)
             return blob or None
@@ -209,7 +254,25 @@ def probe_fixes(pid):
         return {}, ("symbols unreadable: the control symbol %s is absent too, so a "
                     "missing fix here would prove nothing (stripped binary, LTO, or "
                     "the code is in a binary not probed)" % CONTROL_SYMBOL)
-    return ({desc: (sym.encode() in blob) for sym, desc in FIX_SYMBOLS}, None)
+
+    findings = {desc: (sym.encode() in blob) for sym, desc in FIX_SYMBOLS}
+    if all(findings.values()):
+        return findings, None
+
+    # Something looks missing. Before saying so, establish that absence MEANS
+    # anything here: an internal-only method inlined by LTO leaves no trace, so
+    # "not found" is only evidence if names that CANNOT be inlined away are visible.
+    # Without this check the probe told Ulf 0004 was absent from a binary that had it.
+    readable = [c for c in UNINLINABLE_CONTROLS if c.encode() in blob]
+    if not readable:
+        missing = [d for d, present in findings.items() if not present]
+        return {}, ("cannot tell whether %s is present: this binary's names are not "
+                    "readable at a level inlining cannot erase (no uninlinable "
+                    "control symbol found). Under LTO in a static build a small "
+                    "internal-only method leaves no symbol AND no string, so its "
+                    "absence here is not evidence. Check the source or build with "
+                    "-g/shared libs." % "; ".join(missing))
+    return findings, None
 
 
 def fix_lines(pid):
@@ -264,7 +327,19 @@ def parse_ss(text):
             continue
         local_inode, peer_inode = int(inodes[-2]), int(inodes[-1])
         holders = re.findall(r'\("([^"]+)",pid=(\d+),fd=(\d+)\)', users)
-        sockets[local_inode] = (peer_inode, holders)
+        # Recv-Q: bytes sitting UNREAD in this socket. It is the third column of
+        # `ss` output and it discriminates between the two mechanisms that both
+        # present as "retained, peer=DEAD", which nothing else in this census can:
+        #   Recv-Q > 0  -> the body was never drained. The consumer stopped reading
+        #                  (e.g. delivery paused and never resumed), so the
+        #                  completion branch that closes the fd was never reached.
+        #   Recv-Q == 0 -> the body WAS fully read and the fd is merely still owned.
+        #                  That is the ownership bug, not a delivery bug.
+        # Same field, opposite fixes, so it is worth one column.
+        recv_q = None
+        if len(fields) >= 3 and fields[2].isdigit():
+            recv_q = int(fields[2])
+        sockets[local_inode] = (peer_inode, holders, recv_q)
     return sockets
 
 
@@ -282,10 +357,18 @@ def peer_state(inode, sockets):
     entry = sockets.get(inode)
     if entry is None:
         return "unknown", []
-    peer_inode, holders = entry
+    peer_inode, holders = entry[0], entry[1]
     if peer_inode == 0:
         return "DEAD", holders
     return "ALIVE", holders
+
+
+def recv_queue(inode, sockets):
+    """Unread bytes in one socket, or None if unknown."""
+    entry = sockets.get(inode)
+    if entry is None or len(entry) < 3:
+        return None
+    return entry[2]
 
 
 BROWSER_PROCESS_NAMES = ("Ladybird", "ladybird", "WebContent", "RequestServer",
@@ -371,11 +454,13 @@ class Census:
 
             inode = socket_inode(target)
             state, holders = ("n/a", [])
+            rq = None
             if inode is not None:
                 state, holders = peer_state(inode, sockets)
+                rq = recv_queue(inode, sockets)
             rows.append({
                 "fd": fd, "target": target, "category": category, "age": age,
-                "peer": state,
+                "peer": state, "recv_q": rq,
                 "peers": [h[0] for h in holders if int(h[1]) != int(self.pid)],
             })
 
@@ -414,6 +499,7 @@ class Census:
             rd = len([r for r in retained if r["peer"] == "DEAD"])
             ra = len([r for r in retained if r["peer"] == "ALIVE"])
             out.append("  of retained: peer DEAD=%d  peer ALIVE=%d" % (rd, ra))
+            out.extend(self.recv_q_lines(retained))
         else:
             # Every fd was first seen in THIS sample. With --watch that means the
             # process was just attached to, not that the fds are new -- ages are
@@ -453,6 +539,49 @@ class Census:
         out.extend(fix_lines(self.pid))
         return "\n".join(out)
 
+
+    def recv_q_lines(self, retained):
+        """Split the retained peer=DEAD fds by whether their body was ever drained.
+
+        THE MEASUREMENT THAT DISCRIMINATES. With the completion-path fix (0004)
+        confirmed present in a binary that still leaks ~92/min of retained,
+        peer=DEAD sockets, the fd has an owner that fix does not reach -- and there
+        are two candidate mechanisms that look IDENTICAL in every column above:
+
+          unread > 0  -> the body was never drained. Something stopped reading (a
+                         navigation whose body delivery was paused and never
+                         resumed), so the completion branch that closes the fd was
+                         never reached. Fix: resume-or-close on every abandoned path.
+          unread == 0  -> the body WAS fully read; the descriptor is merely still
+                         owned. Fix: drop the surviving reference (e.g. the RefPtr in
+                         Response::m_request_server_request, which clone() copies).
+
+        Same signature, opposite fixes. Guessing between them is what burned the last
+        several rounds, so this reads the answer off the socket instead.
+        """
+        dead = [r for r in retained if r["peer"] == "DEAD"]
+        known = [r for r in dead if r["recv_q"] is not None]
+        if not known:
+            return []
+        unread = [r for r in known if r["recv_q"] > 0]
+        drained = [r for r in known if r["recv_q"] == 0]
+        lines = ["  of retained peer=DEAD: body UNREAD=%d  body drained=%d"
+                 % (len(unread), len(drained))]
+        if unread and len(unread) >= 5 * max(len(drained), 1):
+            total = sum(r["recv_q"] for r in unread)
+            lines.append("  -> bodies were NEVER DRAINED (%d bytes still queued). The "
+                         "consumer stopped reading, so the completion path that "
+                         "closes the fd was never reached: look at body delivery "
+                         "being paused and not resumed, NOT at fd ownership." % total)
+        elif drained and len(drained) >= 5 * max(len(unread), 1):
+            lines.append("  -> bodies were FULLY READ, so delivery completed and the "
+                         "fd is merely still OWNED. Look for a surviving reference to "
+                         "the Requests::Request (Response::m_request_server_request is "
+                         "a RefPtr, and clone() copies it), NOT at delivery.")
+        elif unread and drained:
+            lines.append("  -> MIXED: both mechanisms are present; they need separate "
+                         "fixes and a re-census between them.")
+        return lines
 
     def rate_lines(self):
         """Growth since the first sample, as a rate. The decisive measurement.

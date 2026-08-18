@@ -56,8 +56,9 @@ def test_parses_a_dead_peer_as_inode_zero():
     """Peer inode 0 is the entire signal; if this parse is wrong, so is everything."""
     sockets = fd_census.parse_ss(SS_DEAD)
     assert 1452591 in sockets
-    peer, holders = sockets[1452591]
+    peer, holders, recv_q = sockets[1452591]
     assert peer == 0
+    assert recv_q == 0
     assert holders == [("WebContent", "24066", "85")]
     assert fd_census.peer_state(1452591, sockets)[0] == "DEAD"
 
@@ -65,8 +66,9 @@ def test_parses_a_dead_peer_as_inode_zero():
 def test_parses_a_live_peer_and_names_the_holder():
     """A live peer names the producer, which is what stops the next guess."""
     sockets = fd_census.parse_ss(SS_ALIVE)
-    peer, holders = sockets[1451359]
+    peer, holders, recv_q = sockets[1451359]
     assert peer == 1451360
+    assert recv_q == 0
     assert ("RequestServer", "22712", "144") in holders
     state, holders = fd_census.peer_state(1451359, sockets)
     assert state == "ALIVE"
@@ -519,6 +521,96 @@ def test_probe_reports_cannot_tell_rather_than_fix_absent(tmp_path=None):
         "must never claim a fix is missing when the symbols were unreadable"
 
 
+def test_absence_is_not_reported_as_a_missing_fix_when_inlining_could_explain_it():
+    """The correction Ulf's "I have all the patches applied" forced.
+
+    The probe told him 0004 was absent from a binary that contained it. He was right
+    and the tool was wrong: Ladybird sets ENABLE_LTO_FOR_RELEASE=ON, and in a STATIC
+    build LTO inlines a small internal-only method like release_response_fd() into its
+    only caller, leaving NO symbol and NO string. Reproduced from first principles: a
+    private method called only within its TU, linked -O3 -flto, is gone from both `nm`
+    and `strings`, while a SHARED build keeps it because it must be exported. So the
+    verdict depended on how the binary was LINKED, not on what was in it.
+
+    CONTROL_SYMBOL did not catch this, because it is vulnerable to the very same
+    optimisation (verified: a larger internal-only function also vanishes under LTO).
+    A negative control only rules out "unreadable" if it cannot disappear for the same
+    reason as the thing it guards -- mine failed in a different mode than the one it
+    was guarding against, which is the general trap.
+
+    So: a fix reported MISSING requires a symbol that inlining cannot erase to be
+    visible. Otherwise the answer is "cannot tell".
+    """
+    mod = fd_census
+    control = mod.CONTROL_SYMBOL.encode()
+
+    def classify(blob):
+        if control not in blob:
+            return "no-control", {}
+        findings = {d: (s.encode() in blob) for s, d in mod.FIX_SYMBOLS}
+        if all(findings.values()):
+            return "verdict", findings
+        if not any(c.encode() in blob for c in mod.UNINLINABLE_CONTROLS):
+            return "cannot-tell", {}
+        return "verdict", findings
+
+    # Ulf's build: 0004 inlined away, control survived, nothing uninlinable visible.
+    ulf_like = control + b"\0defer_teardown\0"
+    assert classify(ulf_like)[0] == "cannot-tell", \
+        "an LTO-inlined fix must not be reported as absent -- this is the bug itself"
+
+    # A genuinely unpatched but READABLE binary must still be called out.
+    unpatched = control + b"\0defer_teardown\0request_started\0did_receive_headers\0"
+    state, findings = classify(unpatched)
+    assert state == "verdict"
+    assert not findings[dict(mod.FIX_SYMBOLS)["release_response_fd"]]
+
+    # And a patched one is unambiguous either way.
+    assert classify(control + b"\0defer_teardown\0release_response_fd\0")[0] == "verdict"
+
+
+def test_uninlinable_controls_are_actually_uninlinable():
+    """They must be reached via vtable/IPC dispatch or across a library boundary.
+
+    A directly-called internal helper here would reintroduce the false negative: it
+    could be inlined away exactly when the fix is, and then "readable" would be as
+    wrong as the fix's absence.
+    """
+    mod = fd_census
+    assert mod.UNINLINABLE_CONTROLS
+    src = Path("/home/ubuntu/ladybird-work/Libraries/LibRequests")
+    if not src.is_dir():
+        return  # the Ladybird tree is not present in every checkout
+    text = (src / "Request.cpp").read_text() + (src / "RequestClient.cpp").read_text()
+    for name in mod.UNINLINABLE_CONTROLS:
+        assert name in text, \
+            "%s must exist in LibRequests or it cannot serve as a control" % name
+    # each must be an externally-reachable entry point, not a private helper
+    header = (src / "Request.h").read_text() + (src / "RequestClient.h").read_text()
+    for name in mod.UNINLINABLE_CONTROLS:
+        assert name in header, \
+            ("%s is not declared in a header, so it is internal-only and LTO can "
+             "erase it -- exactly the failure this control must not share" % name)
+
+
+def test_debug_str_is_searched_because_it_names_inlined_away_functions():
+    """Under LTO the symbol tables lose the fix; debug info keeps the name.
+
+    Verified: with -g (and even -g1), a function fully inlined away by LTO still
+    appears in .debug_str, and Ladybird's RelWithDebInfo compiles with -g. Dropping
+    this section would make the probe blind to exactly the build that prompted it.
+    """
+    mod = fd_census
+    text = SCRIPT.read_text()
+    assert ".debug_str" in text
+    assert "inlin" in text.lower()
+    real = Path("/home/ubuntu/ladybird-work/Build/full/lib/"
+                "liblagom-requests.so.0.1.0")
+    if real.exists():
+        blob = mod.elf_symbol_names(str(real))
+        assert blob and b"release_response_fd" in blob
+
+
 def test_control_symbol_is_present_in_both_patched_and_unpatched_builds():
     """The control must be code neither patch adds, or it proves nothing.
 
@@ -625,3 +717,55 @@ def test_verdict_never_claims_a_class_with_zero_members():
     assert "class A" in mod.verdict(203, 1)
     assert "class B" in mod.verdict(1, 203)
     assert "no unix sockets" in mod.verdict(0, 0)
+
+
+def test_recv_q_discriminates_never_drained_from_merely_owned():
+    """The measurement that separates the two mechanisms left after 0004.
+
+    Ulf confirmed 0004 IS applied to the binary still leaking ~92/min of retained
+    peer=DEAD sockets, so the fd has an owner that fix does not reach. Two candidate
+    mechanisms look identical in every other column:
+
+      unread > 0  -> the body was never drained (delivery paused, never resumed), so
+                     the completion branch that closes the fd was never reached;
+      unread == 0 -> the body was fully read and the fd is merely still owned.
+
+    Same signature, opposite fixes. Guessing between them burned several rounds, so
+    the census reads it off the socket's Recv-Q instead of asking for another A/B.
+    """
+    mod = fd_census
+    c = mod.Census(1234, retained_after=1.0)
+
+    def rows(pairs):
+        return [{"peer": "DEAD", "recv_q": q, "age": 99.0} for q in pairs]
+
+    never_drained = "\n".join(c.recv_q_lines(rows([4096] * 20)))
+    assert "UNREAD=20" in never_drained
+    assert "NEVER DRAINED" in never_drained
+    assert "paused" in never_drained
+    assert "81920 bytes" in never_drained  # the queued bytes are named, not implied
+
+    merely_owned = "\n".join(c.recv_q_lines(rows([0] * 20)))
+    assert "drained=20" in merely_owned
+    assert "FULLY READ" in merely_owned
+    assert "m_request_server_request" in merely_owned, \
+        "must name the surviving reference, not just say 'ownership'"
+
+    mixed = "\n".join(c.recv_q_lines(rows([0] * 10 + [512] * 10)))
+    assert "MIXED" in mixed
+
+    # unknown Recv-Q must produce no claim at all
+    assert c.recv_q_lines([{"peer": "DEAD", "recv_q": None, "age": 99.0}]) == []
+    # and ALIVE sockets are not part of this question
+    assert c.recv_q_lines([{"peer": "ALIVE", "recv_q": 4096, "age": 99.0}]) == []
+
+
+def test_parse_ss_reads_recv_q_from_the_real_column():
+    """Recv-Q is ss's third column; a wrong index would invent a diagnosis."""
+    mod = fd_census
+    line = ('u_str ESTAB 8192   0                  * 1452591            * 0       '
+            'users:(("WebContent",pid=24066,fd=85))')
+    sockets = mod.parse_ss(line)
+    assert mod.recv_queue(1452591, sockets) == 8192
+    assert mod.peer_state(1452591, sockets)[0] == "DEAD"
+    assert mod.recv_queue(999999, sockets) is None

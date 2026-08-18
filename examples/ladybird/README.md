@@ -833,8 +833,14 @@ Honest inventory of what stops this from being a clone-and-build.
    binary contains** (`--build` for that alone), read out of the process's own mapped
    ELF symbols: a leak rate is uninterpretable without it, since "still leaking at
    92/min" means "the fix does not work" or "the fix was not in this build" and those
-   need opposite next steps. It reports *"cannot tell"* rather than "fix absent" when
-   the symbols are unreadable — a stripped binary must not read as an unpatched one.
+   need opposite next steps. It reports *"cannot tell"* rather than "fix absent"
+   whenever absence could be explained by inlining: under LTO in a **static** build a
+   small internal-only method is inlined into its only caller and leaves no symbol and
+   no string behind, so `.debug_str` is read too and a "missing" verdict requires a
+   symbol inlining cannot erase to be visible. This is a correction — the first version
+   told Ulf `0004` was absent from a binary that contained it, and the negative control
+   did not catch it because it was vulnerable to the same optimisation. A control only
+   rules out "unreadable" if it cannot vanish for the same reason as what it guards.
    Since upstream has landed its own fix,
    `--verify` also accepts an equivalent fix in place of our exact bytes: a patch we
    carry only until upstream fixes it has an `.effect-grep` beside it, and verify
