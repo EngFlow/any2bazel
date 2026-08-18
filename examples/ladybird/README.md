@@ -312,7 +312,8 @@ an FFI header collision and an entire missing Rust target. See
 | `qt_runtime.bzl` | Qt's **runtime** half: a repo rule that stages the plugins of the SDK `@qt` itself names (read out of @qt's generated `qtconf.bzl`, so plugins and libraries cannot come from different Qts), the private libraries an SDK bundles beside Qt (derived from DT_NEEDED), a generated `qt.conf` pointing the binary at them, and the Qt >= 6.9 floor `UI/Qt/CMakeLists.txt` declares. Without it Qt `dlopen`ed the HOST's plugin into Bazel's Qt — finding 40 |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
 | `codegen_root.bzl` | Non-LibWeb generator genrules (IPC endpoints, LibJS Bytecode/Op, HSTS table, WebGL replayer, TIFF tag tables, the two SPIR-V shader headers, and the chained `generate_interpreter_layout` → `flapc` interpreter assembly). **Generated** by `Meta/emit_root_codegen_bazel.py` |
-| `Libraries/LibWeb/BUILD.bazel`, `generated_srcs.bzl` | LibWeb (~1,961 compile inputs). **Generated** by `Meta/emit_libweb_bazel.py` |
+| `Libraries/LibWeb/BUILD.bazel` | LibWeb (~1,961 compile inputs). **Generated** by `Meta/emit_libweb_bazel.py` |
+| `Libraries/LibWeb/generated_srcs.bzl` | Which of those inputs come from codegen: 692 `.cpp` (the reference build's compile list) + 693 headers (`codegen.bzl`'s `outs`). **Generated** by `Meta/emit_libweb_bazel.py --generated-srcs` — it claimed to be for a long time before it was (Known gaps 9) |
 | `Libraries/LibWeb/codegen.bzl` | LibWeb's 26 generator genrules + the bindings mega-genrule (663 `.idl` → 1,340 files). **Generated** by `Meta/emit_codegen_bazel.py` |
 | `Meta/emit_*.py` | The emitters. They read CMake's `build.ninja` + the File API codemodel and write the four generated files above |
 | `Meta/bazel_parity_harness.py` | Buckets every ninja `CUSTOM_COMMAND` as covered / excluded-with-reason / unhandled, re-runs the covered ones and byte-compares against CMake's tree. Non-zero unhandled is a failure |
@@ -413,6 +414,10 @@ python3 Meta/emit_build_bazel.py > BUILD.bazel
 python3 Meta/emit_codegen_bazel.py Libraries/LibWeb > Libraries/LibWeb/codegen.bzl
 python3 Meta/emit_root_codegen_bazel.py > codegen_root.bzl
 python3 Meta/emit_libweb_bazel.py > Libraries/LibWeb/BUILD.bazel
+# ...and the generated-source lists that BUILD.bazel loads. A SECOND output,
+# because the BUILD file load()s it, so the two cannot share one stdout. It used
+# to say AUTO-GENERATED while nothing generated it (see Known gaps 9).
+python3 Meta/emit_libweb_bazel.py --generated-srcs > Libraries/LibWeb/generated_srcs.bzl
 # The vcpkg rules regenerate from the committed capture alone — no vcpkg, no network.
 python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --distfiles > vcpkg_distfiles.bzl
 python3 Meta/emit_vcpkg_bazel.py --assets Meta/vcpkg_assets.tsv --index     > vcpkg_index.bzl
@@ -665,10 +670,15 @@ Honest inventory of what stops this from being a clone-and-build.
    cross-compile, at which point the skew is silent. Bazel makes the two
    namespaces explicit and thereby makes the duplication visible; the right fix
    is a shared `.bzl` flag list or a custom toolchain, not more `--host_*` lines.
-3. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm`
-   and `-L/usr/lib/x86_64-linux-gnu`, both because libdrm and Vulkan are
-   host-provided. (The `-L`/`-rpath` into `Build/full/vcpkg_installed/` are gone —
-   finding 33.)
+3. **`.bazelrc` still has host escapes:** `--action_env=CPLUS_INCLUDE_PATH` naming
+   `/usr/include/libdrm` **and glib's two roots** (`/usr/include/glib-2.0`,
+   `/usr/lib/x86_64-linux-gnu/glib-2.0/include` — glib puts `glibconfig.h` under a
+   *libdir*, not an includedir), plus `-L/usr/lib/x86_64-linux-gnu`: libdrm,
+   Vulkan, glib and xkbcommon are all host-provided. glib joined at the 71fb301a
+   repin, when upstream added a `pkg_check_modules(GIO)` for UI/Qt's
+   `ExternalURLActivationToken`/`Handler`; xkbcommon arrives transitively with the
+   now-required `Qt6::GuiPrivate`. (The `-L`/`-rpath` into
+   `Build/full/vcpkg_installed/` are gone — finding 33.)
 
    **No absolute host path remains in the generated BUILD files.** Two did until
    recently, and both were the same mistake in different clothing: a value that is
@@ -849,6 +859,77 @@ Honest inventory of what stops this from being a clone-and-build.
    `FEATURES style-recording` from the *same crate* as `libweb_rust`'s staticlib),
    which the parser only read on the `import_rust_crate` side: it would have built
    a different binary than CMake does and said nothing.
+
+   **Then, once loading was fixed, the build failed four more times — and every
+   one was the same bug in a different file.** The glob was only the first
+   *capture* to come due, i.e. a value derived once on the capturing machine,
+   written down, and thereafter believed. None of the four was found by reasoning
+   about the repin; each was found by the next error message. In the order the
+   build produced them:
+
+   * `Libraries/LibWeb/generated_srcs.bzl` began with the line
+     `# AUTO-GENERATED by Meta/emit_libweb_bazel.py` and **no code path in that
+     emitter wrote it**. Its two lists (which of LibWeb's ~1,390 compile inputs
+     come from codegen) were hand-maintained, so upstream's five new generated
+     headers and four new `.cpp` were absent, and a *generated* header included a
+     *generated* header the `cc_library` did not declare:
+     `Bindings/Window.h:17: fatal error: LibWeb/Bindings/WindowGlobalMixin.h: No
+     such file or directory` — with the file present on disk beside the one that
+     included it. A false AUTO-GENERATED claim is worse than an honest
+     hand-written file, because it tells the next repin that re-running the
+     emitter will refresh it. Both lists are now derived (the reference build's
+     compile list; `codegen.bzl`'s own `outs`) and the file is emitted by
+     `--generated-srcs`.
+   * Fixing that exposed a **second bug it had been hiding**: `genrule_outputs()`
+     regexed the whole of `codegen.bzl` for anything path-shaped, so a genrule's
+     `srcs` counted as outputs too. Four *checked-in* headers that
+     `generate_dom_tree.py` reads (`HTML/TagNames.h` and friends) were classified
+     as generated — which is the `hdrs` `exclude=` list, so they were dropped from
+     the source glob and re-added as labels nothing produces. It never broke the
+     build only because the stale capture was consulted instead of the function's
+     answer. One capture concealing a live bug is the strongest argument against
+     keeping one.
+   * `QT_MAP` was a three-entry dict of the Qt modules Ladybird used when it was
+     measured. Upstream made `Qt6::Positioning` **required**; the dict had no key,
+     the dep fell through to `UNKNOWN`, and `//:ladybird` failed with
+     `QGeoPositionInfo: No such file or directory`. CMake's `Qt6<Module>` →
+     rules_qt's `@qt//:Qt<Module>` is a *rename*, so it is now a rule — and one
+     that still returns `None` for a non-Qt name, because reporting UNKNOWN is
+     right and inventing a label is not.
+   * `moc_headers()` ended with `not h.endswith("GeolocationProviderQt.h")`,
+     justified in its docstring by "Qt6::Positioning is not found in this
+     configuration" — a fact about the capturing machine, false at this pin. The
+     condition is now *does the reference build compile the sibling `.cpp`*, which
+     is in the model. Wrong in both directions: moc'ing a header CMake does not is
+     a target only Bazel builds; skipping one it does is a missing vtable at link.
+
+   One of the five did not surface as an error at all, and would not have: the
+   extractor turned `/usr/lib/libgio-2.0.so` into the dep name `gio-2`, because it
+   cut the basename at the **first dot** instead of the extension. Invisible for
+   `libz.so` and `libQt6Widgets.so.6.10.2`; wrong for every library whose name
+   contains a dot. It only became visible because the three glib deps upstream
+   added arrived as unresolvable `UNKNOWN`s — had the emitter guessed a label
+   instead of reporting, `-lgio-2` would have failed at link time, far from here.
+   **An emitter that reports what it could not resolve converts a silent wrong
+   answer into a loud missing one**; that property found this bug, and it is the
+   same property that makes gap 9's `allow_empty = False` worth keeping.
+
+   The vcpkg equivalent is still open, and is the cleanest specimen of the class.
+   `Meta/vcpkg_assets.tsv` is a capture that deliberately *replaces* the static
+   portfile parse (a portfile is a CMake program; the regex cannot see through its
+   platform branches). The reasoning was checked once, against three rows that
+   were genuinely Windows-only — and then frozen into the diagnostic, which
+   printed **every** casualty as an entry "vcpkg never asked for on this
+   platform". At this pin `vcpkg.json` moved `sdl3` to 3.2.28, the versions-db
+   derivation resolves that correctly, and the message reported the correct
+   current pin being discarded in favour of a stale captured 3.4.12 as a
+   Windows-only fetch. The checked-in `vcpkg_distfiles.bzl` fetches 3.4.12 to this
+   day. The classification needs no new input — a dropped row whose *URL family*
+   the capture also has is the same project at another version, i.e. a stale
+   capture — and the emitter now says so; re-capturing is filed. **A replace-wins
+   rule whose message asserts the reason for the replacement instead of checking
+   it will eventually be confidently wrong**, and that sentence describes every
+   item in this list.
 
 10. **Two upstreamable Ladybird fixes — down from four, and that is the point of a
    repin.** Two of the four are **fixed upstream** at this pin (`71fb301a`) and their

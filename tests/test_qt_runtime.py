@@ -157,7 +157,7 @@ def test_the_emitter_generates_that_edge():
     assert "QT_RUNTIME_BLOCK" in emitter and "emit_qt_runtime()" in emitter
     assert 'extra_data=[":qt_conf", ":qt_plugins"]' in emitter
     assert '"@qt_plugins//:runtime_libs"' in emitter, \
-        "the private-libs dep must come from QT_MAP's resolution, not by hand"
+        "the private-libs dep must come from qt_label()'s resolution, not by hand"
     assert 'load(":qt_runtime.bzl", "qt_conf", "qt_plugin_tree")' in \
         emitter.split("ALL_LOADS = ", 1)[1], "the generated file needs the load()"
 
@@ -197,6 +197,76 @@ def test_repo_rule_is_local():
     rule = bzl.split("qt_plugins = repository_rule(", 1)[1].split(")\n", 1)[0]
     assert "local = True" in rule
 
+
+
+def test_a_qt_module_upstream_starts_requiring_resolves_without_an_edit():
+    """The Qt mapping is a RULE, because the three-entry table went stale.
+
+    CMake names Qt targets Qt6<Module>; rules_qt names one cc_library per module
+    of the discovered SDK as @qt//:Qt<Module>. That is a rename, and it was
+    written as a dict of the three modules Ladybird used when it was measured
+    (Core, Gui, Widgets). At 71fb301a upstream turned Qt6::Positioning from
+    OPTIONAL to REQUIRED for UI/Qt/GeolocationProviderQt.cpp; the dict had no
+    key, so the dep became an UNKNOWN and //:ladybird failed to compile with
+    "QGeoPositionInfo: No such file or directory".
+
+    A table of the deps a project has today cannot express "and whatever it needs
+    tomorrow", so this asserts the derivation -- including that a NON-Qt name
+    still falls through (returning a label for it would put a nonexistent
+    @qt//:X in the build) .
+    """
+    import importlib.util
+    os.environ["LADYBIRD_ROOT"] = _WS
+    spec = importlib.util.spec_from_file_location(
+        "_ebb_src", os.path.join(_WS, "Meta", "emit_build_bazel.py"))
+    src = _read("Meta/emit_build_bazel.py")
+    # Exec just the function, not the module: emit_build_bazel does real work at
+    # import time (it parses the reference build's build.ninja), and this is a
+    # pure string rule.
+    ns = {}
+    body = "def qt_label" + src.split("def qt_label", 1)[1].split("\ndef ", 1)[0]
+    exec(body, ns)
+    qt_label = ns["qt_label"]
+    assert qt_label("Qt6Core") == "@qt//:QtCore"
+    assert qt_label("Qt6Gui") == "@qt//:QtGui"
+    assert qt_label("Qt6Widgets") == "@qt//:QtWidgets"
+    # THE regression: the module nobody wrote down.
+    assert qt_label("Qt6Positioning") == "@qt//:QtPositioning"
+    # And modules Ladybird does not use today, to show the rule is not a longer list.
+    assert qt_label("Qt6Network") == "@qt//:QtNetwork"
+    assert qt_label("Qt6Multimedia") == "@qt//:QtMultimedia"
+    # Not Qt: must NOT resolve, so it is reported as UNKNOWN rather than becoming
+    # a label for a target that does not exist.
+    for other in ("xkbcommon", "glib-2.0", "OpenGL", "Qt6", "vulkan", ""):
+        assert qt_label(other) is None, other
+    # Structural: no dict may map Qt module names to labels again.
+    assert "QT_MAP" not in src, "the Qt table is back"
+
+
+def test_the_moc_list_follows_what_cmake_compiles_not_a_name():
+    """A conditionally-compiled Q_OBJECT header, decided by measurement.
+
+    moc_headers() returns the UI/Qt headers CMake's AUTOMOC would moc. It ended
+    with a hardcoded `not h.endswith("GeolocationProviderQt.h")`, justified in a
+    docstring by "Qt6::Positioning is not found in this configuration" -- a fact
+    about the machine that captured it. At 71fb301a Positioning is required and
+    CMake compiles GeolocationProviderQt.cpp, so the exclusion silently dropped a
+    real moc target. Wrong in both directions: moc'ing a header CMake does not is
+    a target only Bazel builds; skipping one it does is a missing vtable at link.
+
+    The condition is now "does the reference build compile the sibling .cpp",
+    which is in the model, so it cannot disagree with CMake.
+    """
+    src = _read("Meta/emit_build_bazel.py")
+    fn = src.split("def moc_headers", 1)[1].split("\ndef ", 1)[0]
+    assert "GeolocationProviderQt" not in fn.split('"""', 2)[-1],         "moc_headers filters by FILE NAME again"
+    assert "compiled" in fn and "CppCompile" in fn,         "the filter must read the reference build's compile list"
+    # And the generated file reflects it: the header is moc'd at this pin.
+    build = _read("BUILD.bazel")
+    moc = build.split("qt_cc_moc(", 1)[1].split(")", 1)[0]
+    assert "UI/Qt/GeolocationProviderQt.h" in moc, moc
+    # ...paired with the dep that makes it compile, or the moc output does not build.
+    assert "'@qt//:QtPositioning'" in build
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 

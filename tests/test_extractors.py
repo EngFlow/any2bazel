@@ -433,6 +433,47 @@ def test_ts_program_splits_into_per_file_tscompile_actions():
         # role is set by the extractor and must not be demoted to AGGREGATE
         assert t.role.value == "production", t.role
 
+
+def test_a_library_name_keeps_the_dots_that_are_part_of_it():
+    """`libgio-2.0.so` is `gio-2.0`, not `gio-2`.
+
+    _library_identity turns a link fragment into the abstract dep name a resolver
+    looks up (the -l name). It used to cut at the FIRST dot -- fine for libz.so
+    and libQt6Widgets.so.6.10.2, and wrong for glib, whose sonames carry the API
+    version in the NAME: libgio-2.0.so became `gio-2`, which names no library on
+    any system. Ladybird's 71fb301a pin is where that surfaced: upstream added a
+    pkg_check_modules(GIO) to UI/Qt, and the three glib deps arrived at the
+    Bazel emitter as unresolvable UNKNOWNs. Had the emitter guessed instead of
+    reporting, the -l flag would have failed at LINK time, far from the cause.
+
+    The rule is "strip the extension", so the cases that matter are: a dot in
+    the name, a version suffix after the extension, both at once, and .dylib not
+    being read as a truncated .d.
+    """
+    f = extract_cmake._library_identity
+    cases = {
+        "/usr/lib/x86_64-linux-gnu/libgio-2.0.so": "gio-2.0",
+        "/usr/lib/x86_64-linux-gnu/libglib-2.0.so": "glib-2.0",
+        "/usr/lib/x86_64-linux-gnu/libgobject-2.0.so": "gobject-2.0",
+        # A dotted name AND a version suffix: both cuts have to be right.
+        "/usr/lib/libgio-2.0.so.0.8200.4": "gio-2.0",
+        # The cases that already worked, pinned so the fix cannot regress them.
+        "/usr/lib/x86_64-linux-gnu/libQt6Widgets.so.6.10.2": "Qt6Widgets",
+        "vcpkg_installed/x64-linux-dynamic/lib/libcpptrace.so.1.0.2": "cpptrace",
+        "/usr/lib/libvulkan.so": "vulkan",
+        "/usr/lib/libfoo.a": "foo",
+        "-lz": "z",
+        "-framework Cocoa": "Cocoa",
+        # macOS: .dylib must not be matched as ".d" + "ylib".
+        "/x/libbar.dylib": "bar",
+        "/x/libbar.2.dylib": "bar.2",
+        # Not a library at all -- None, so the caller does not invent a dep.
+        "notalib.so": None,
+        "": None,
+    }
+    for frag, want in cases.items():
+        assert f(frag) == want, "%r -> %r, want %r" % (frag, f(frag), want)
+
 # No `if __name__ == "__main__"` runner here on purpose. There used to be one in
 # every test file, and in this file it sat MID-FILE -- so four tests appended after
 # it were defined, never called, and the file still printed "6/6 passed". The third

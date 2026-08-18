@@ -77,9 +77,12 @@ build --linkopt=-Wl,--allow-shlib-undefined
 build --linkopt=-Wl,--allow-multiple-definition
 # System library search path for find_package deps (Qt6, GLX/OpenGL).
 build --linkopt=-L/usr/lib/x86_64-linux-gnu
-# System includes for find_package deps that are still host-provided (libdrm).
-# Qt6 no longer appears here: it comes from rules_qt as a real Bazel dep.
-build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm
+# System includes for find_package/pkg_check_modules deps that are still
+# host-provided: libdrm, and (since 71fb301a) glib -- upstream added a
+# pkg_check_modules(GIO) for UI/Qt's ExternalURLActivationToken/Handler. glib puts
+# glibconfig.h under a LIBDIR, not an includedir, so both roots are needed.
+# Qt6 does not appear here: it comes from rules_qt as a real Bazel dep.
+build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include
 
 # --- exec (host) configuration ---------------------------------------------
 # Every flag above is a --cxxopt/--copt/--linkopt, which Bazel applies only to
@@ -126,4 +129,4 @@ build --host_copt=-fPIC
 build --host_linkopt=-Wl,--allow-shlib-undefined
 build --host_linkopt=-Wl,--allow-multiple-definition
 build --host_linkopt=-L/usr/lib/x86_64-linux-gnu
-build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm
+build --host_action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include

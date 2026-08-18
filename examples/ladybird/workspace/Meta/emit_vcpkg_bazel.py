@@ -831,6 +831,55 @@ def collect():
     return distfiles, externals, unresolved, unexpanded
 
 
+def _url_family(url):
+    """The URL with its final path component removed: 'where this comes from'.
+
+    Two distfiles of the SAME upstream project at different versions share a
+    family (.../libsdl-org/SDL/archive/release-3.2.28.tar.gz and
+    .../release-3.4.12.tar.gz); two unrelated projects do not. That is all the
+    identity needed to tell "the capture never fetched this" apart from "the
+    capture fetched a DIFFERENT VERSION of this".
+    """
+    return url.rsplit("/", 1)[0]
+
+
+def classify_static_only(distfiles, capture):
+    """Split derived-but-not-captured rows into (platform_only, stale_capture).
+
+    The capture REPLACES the static parse (see main()), for good reasons. But the
+    diagnostic that reported the casualties asserted its reason instead of
+    checking it: it printed every one of them as an entry "vcpkg never asked for
+    on this platform", which was true of the three it was written against
+    (libiconv/pthreads4w/dirent, all behind `if(VCPKG_TARGET_IS_WINDOWS)`) and
+    became false the moment a pin MOVED.
+
+    At Ladybird's 71fb301a, vcpkg.json pins sdl3 3.2.28 -- confirmed by the
+    reference build's vcpkg_installed/vcpkg/info/sdl3_3.2.28_*.list -- and the
+    versions-db derivation gets that right. The capture, taken at the previous
+    pin, has release-3.4.12, so the correct current pin was dropped in favour of
+    a stale one and the message called it a Windows-only fetch. The checked-in
+    vcpkg_distfiles.bzl fetches 3.4.12 to this day.
+
+    A distfile whose URL FAMILY the capture also has is not platform-only: it is
+    the same upstream project at a different version, i.e. the capture is stale
+    with respect to the manifest. Returns:
+
+      platform_only  [sha]                 -- genuinely absent from the capture
+      stale_capture  [(sha, capture_sha)]  -- derived pin vs the captured one
+    """
+    fams = {}
+    for sha, (url, _name, _port, _src) in capture.items():
+        fams.setdefault(_url_family(url), []).append(sha)
+    platform_only, stale = [], []
+    for sha in sorted(set(distfiles) - set(capture)):
+        same = fams.get(_url_family(distfiles[sha][0]))
+        if same:
+            stale.append((sha, sorted(same)[0]))
+        else:
+            platform_only.append(sha)
+    return platform_only, stale
+
+
 def observed_git_archives(downloads_dir, distfiles):
     """The archives in a completed run's downloads/ that the asset cache never saw.
 
@@ -1078,17 +1127,34 @@ def main():
         # that can break the build when an unrelated upstream URL rots, in
         # exchange for nothing. Meanwhile the union covered none of the 5 files
         # the capture genuinely misses -- the static parse misses those too. So
-        # the instrument wins outright, and the shortfall is REPORTED.
-        static_only = sorted(set(distfiles) - set(cap))
+        # the instrument wins outright, and the shortfall is REPORTED -- but
+        # CLASSIFIED, not asserted. See classify_static_only: a dropped row whose
+        # URL family the capture also has is the same project at a different
+        # version, i.e. a STALE CAPTURE, and calling that "a fetch vcpkg never
+        # asked for on this platform" is how sdl3 3.2.28 got silently replaced by
+        # a captured 3.4.12 for a whole pin.
+        platform_only, stale = classify_static_only(distfiles, cap)
         sys.stderr.write("capture: %d distfiles (static parse had %d)\n"
                          % (len(cap), len(distfiles)))
-        if static_only:
+        if platform_only:
             sys.stderr.write(
-                "  dropping %d static-only entries vcpkg never asked for on this "
-                "platform:\n" % len(static_only))
-            for sha in static_only:
+                "  dropping %d entries vcpkg never asked for on this platform "
+                "(no capture row for that upstream at all):\n" % len(platform_only))
+            for sha in platform_only:
                 sys.stderr.write("    %-40s %s\n"
                                  % (distfiles[sha][1], distfiles[sha][2]))
+        if stale:
+            sys.stderr.write(
+                "  STALE CAPTURE: %d port(s) where vcpkg.json's pin and the "
+                "capture disagree.\n"
+                "  The capture wins (it is the only exact source), so the "
+                "EMITTED rules fetch the\n"
+                "  captured version, NOT the pinned one. Re-run "
+                "Meta/vcpkg_capture_assets.sh.\n" % len(stale))
+            for sha, cap_sha in stale:
+                sys.stderr.write("    %-12s pinned %s\n" % (distfiles[sha][2],
+                                                            distfiles[sha][1]))
+                sys.stderr.write("    %-12s captured %s\n" % ("", cap[cap_sha][1]))
         distfiles, unexpanded = cap, []
         # vcpkg's OWN tools are unioned in from their COMMITTED pin, not replaced
         # and not re-derived: they are a different class from port distfiles, and

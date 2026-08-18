@@ -583,3 +583,78 @@ def test_the_preflight_reports_every_missing_tool_at_once():
     assert len(apt_line) == 1, r.stderr
     assert "nasm" in apt_line[0] and "libtool" in apt_line[0]
     assert "perl" not in apt_line[0], "must not demand a tool that is present"
+
+
+def test_a_moved_pin_is_reported_as_a_stale_capture_not_a_windows_only_fetch():
+    """The capture wins -- so when it is WRONG, the message has to say which.
+
+    Under --assets the capture REPLACES the static portfile parse, deliberately:
+    a portfile is a CMake program, so the static regex cannot see through its
+    platform branches, and every row the static parse had and the capture did not
+    turned out to be a Windows-only fetch. That reasoning was checked once, on
+    three rows (libiconv, pthreads4w, dirent, all behind
+    `if(VCPKG_TARGET_IS_WINDOWS)`), and then FROZEN INTO THE MESSAGE: the emitter
+    printed every casualty as an entry "vcpkg never asked for on this platform".
+
+    Ladybird's 71fb301a repin is where that came due. vcpkg.json pins sdl3
+    3.2.28 (the reference build agrees: vcpkg_installed/vcpkg/info/ holds
+    sdl3_3.2.28_x64-linux-dynamic.list) and the versions-db derivation resolves
+    it correctly. The capture predates the repin and holds release-3.4.12, so the
+    RIGHT answer was discarded in favour of a stale one -- and the diagnostic
+    asserted a reason that happened to be false, which is why nobody looked. The
+    checked-in vcpkg_distfiles.bzl still fetches 3.4.12.
+
+    The distinction is available without any new input: a dropped row whose URL
+    FAMILY the capture also has is the same upstream project at a different
+    version. That is a stale capture. A row whose family the capture has never
+    seen at all is genuinely a fetch this platform does not do.
+    """
+    cap = {
+        "a" * 128: ("https://github.com/libsdl-org/SDL/archive/release-3.4.12.tar.gz",
+                    "libsdl-org-SDL-release-3.4.12.tar.gz", "captured", "capture"),
+        "b" * 128: ("https://sqlite.org/2026/sqlite-autoconf-3530300.tar.gz",
+                    "sqlite-autoconf-3530300.tar.gz", "captured", "capture"),
+    }
+    derived = {
+        # THE case: same project, the version vcpkg.json actually pins.
+        "c" * 128: ("https://github.com/libsdl-org/SDL/archive/release-3.2.28.tar.gz",
+                    "libsdl-org-SDL-release-3.2.28.tar.gz", "sdl3", "versions-db"),
+        # Genuinely platform-only: nothing from this upstream is in the capture.
+        "d" * 128: ("https://ftpmirror.gnu.org/gnu/libiconv/libiconv-1.19.tar.gz",
+                    "libiconv-1.19.tar.gz", "libiconv", "versions-db"),
+        "e" * 128: ("https://github.com/tronkko/dirent/archive/1.26.tar.gz",
+                    "tronkko-dirent-1.26.tar.gz", "dirent", "versions-db"),
+        # A row the capture HAS (by sha) is not a casualty at all.
+        "b" * 128: ("https://sqlite.org/2026/sqlite-autoconf-3530300.tar.gz",
+                    "sqlite-autoconf-3530300.tar.gz", "sqlite3", "versions-db"),
+    }
+    platform_only, stale = emit.classify_static_only(derived, cap)
+    assert stale == [("c" * 128, "a" * 128)], stale
+    assert sorted(platform_only) == ["d" * 128, "e" * 128], platform_only
+
+    # And the emitter SAYS it, in those words, on the real tree's data. Run as a
+    # subprocess so this exercises the message and not just the classifier.
+    import subprocess
+    ws = os.path.join(os.path.dirname(__file__), "..", "examples", "ladybird",
+                      "workspace")
+    tsv = os.path.join(ws, "Meta", "vcpkg_assets.tsv")
+    r = subprocess.run(["python3", _EMIT, "--assets", tsv, "--index"],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, LADYBIRD_ROOT=tempfile.mkdtemp(),
+                                VCPKG_ROOT=tempfile.mkdtemp()))
+    assert r.returncode == 0, r.stderr
+    # With no vcpkg there is no derivation to compare against, so neither
+    # category can appear -- the message must not be printed speculatively.
+    assert "STALE CAPTURE" not in r.stderr, r.stderr
+    assert "never asked for on this platform" not in r.stderr, r.stderr
+
+    # Structurally: the old wording claimed the reason for EVERY dropped row.
+    # Whatever the emitter says about platform-only entries, it may only say it
+    # about rows that survived the classification.
+    with open(_EMIT) as f:
+        src = f.read()
+    body = src.split("def main(", 1)[1]
+    assert "classify_static_only(" in body, \
+        "main() must classify the dropped rows, not assert a reason for them"
+    assert "static_only = sorted(set(distfiles) - set(cap))" not in body, \
+        "the unclassified set-difference is back"

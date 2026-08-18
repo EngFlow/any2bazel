@@ -83,13 +83,38 @@ GLOBAL_DEFINES = {
     "NDEBUG",
 }
 # System libs with no vcpkg .so (linked via linkopts on the final binary).
-SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan", "pulse"}
-# Qt6 CMake target -> rules_qt label.
-QT_MAP = {
-    "Qt6Core": "@qt//:QtCore",
-    "Qt6Gui": "@qt//:QtGui",
-    "Qt6Widgets": "@qt//:QtWidgets",
-}
+# glib/gio/gobject and xkbcommon joined at 71fb301a: upstream added a
+# pkg_check_modules(GIO) for UI/Qt/ExternalURLActivationToken + ExternalURLHandler,
+# and xkbcommon arrives transitively with the now-required Qt6::GuiPrivate. Their
+# include roots (/usr/include/glib-2.0, /usr/lib/*/glib-2.0/include) are absolute,
+# so like libdrm's they cannot be per-target copts and live in .bazelrc's
+# CPLUS_INCLUDE_PATH -- see the host-tool preflight todo: this whole set is a
+# configure-time host probe that neither build system derives on our side yet.
+SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan", "pulse",
+               "gio-2.0", "gobject-2.0", "glib-2.0", "xkbcommon"}
+
+
+def qt_label(nm):
+    """CMake's Qt6<Module> -> rules_qt's @qt//:Qt<Module>, by RULE not by table.
+
+    This was a three-entry dict {Qt6Core, Qt6Gui, Qt6Widgets}, which is the same
+    shape as every other capture in this tree: correct for the pin that was
+    measured, silent about the next one. At 71fb301a upstream made
+    Qt6::Positioning REQUIRED (UI/Qt/GeolocationProviderQt.cpp), the dict had no
+    Qt6Positioning key, so the dep fell through to UNKNOWN and //:ladybird failed
+    to compile with
+
+        UI/Qt/GeolocationProviderQt.h:11:10: fatal error: QGeoPositionInfo:
+            No such file or directory
+
+    rules_qt names one cc_library per module in the discovered SDK, so the
+    mapping is a rename, and every module the SDK has is already a label. A
+    module the SDK does NOT have must still fail -- as an UNKNOWN dep naming it,
+    which is why this returns None rather than a label it has not checked.
+    """
+    if not nm.startswith("Qt6") or len(nm) <= 3:
+        return None
+    return "@qt//:Qt" + nm[len("Qt6"):]
 
 # CMake's AUTOMOC/AUTORCC output, prebuilt under Build/full/<target>_autogen.
 # Bazel runs moc/rcc itself (qt_cc_moc / qt_cc_rcc), so these are dropped from
@@ -375,14 +400,15 @@ def dep_label(d, targets, so, ar):
     # path is a global -L in .bazelrc.
     # Qt6 is a real Bazel dep via rules_qt: its qt.local_repo discovers the host
     # SDK through qmake, so moc/rcc and the Qt cc_librarys all come from one SDK.
-    if nm in QT_MAP:
+    qt = qt_label(nm)
+    if qt:
         # Plus @qt_plugins//:runtime_libs -- the PRIVATE libraries an SDK ships
         # beside Qt (aqt bundles ICU 73) which rules_qt does not stage, and which
         # libQt6Core cannot find on its own because its RUNPATH $ORIGIN expands to
         # Bazel's solib dir. Making them link inputs is what removed the need for
         # LD_LIBRARY_PATH=<sdk>/lib. Empty for a distro Qt. See qt_runtime.bzl /
         # finding 40.
-        return Dep(deps=[QT_MAP[nm], "@qt_plugins//:runtime_libs"])
+        return Dep(deps=[qt, "@qt_plugins//:runtime_libs"])
     SYS_MAP = {"GLX": "GLX", "OpenGL": "OpenGL"}
     if nm in SYS_MAP:
         return Dep(sys=[SYS_MAP[nm]])
@@ -695,23 +721,42 @@ def emit_qt_runtime():
     print(QT_RUNTIME_BLOCK, end="")
 
 
-def moc_headers():
+def moc_headers(exes=None):
     """UI/Qt headers with Q_OBJECT, i.e. the ones CMake's AUTOMOC would moc.
 
-    GeolocationProviderQt.h is excluded: it is only compiled when Qt6::Positioning
-    is found, which this configuration does not have (the model shows no
-    GeolocationProviderQt.cpp compile), so mocking it would be a target Bazel
-    builds and CMake does not.
+    Conditionally-compiled headers are filtered by whether the reference build
+    COMPILES the matching .cpp, not by name. This used to end with
+
+        return [h for h in hdrs if not h.endswith("GeolocationProviderQt.h")]
+
+    justified by "Qt6::Positioning is not found in this configuration" -- true
+    when written, false at 71fb301a, where upstream made Positioning required and
+    CMake compiles GeolocationProviderQt.cpp. A name-based exclusion cannot
+    notice that; asking the model can. Mocking a header CMake does not moc is a
+    target Bazel builds and CMake does not; NOT mocking one it does is a missing
+    vtable at link time, so the condition has to be the measurement.
     """
     qt_dir = os.path.join(ROOT, "UI/Qt")
+    compiled = set()
+    if exes:
+        for t in exes.values():
+            for a in t["actions"]:
+                if a["mnemonic"] == "CppCompile":
+                    compiled |= {os.path.basename(i) for i in a["inputs"]}
     hdrs = []
     for f in sorted(os.listdir(qt_dir)):
         if not f.endswith(".h"):
             continue
         if "Q_OBJECT" not in open(os.path.join(qt_dir, f), errors="ignore").read():
             continue
+        # A Q_OBJECT header with a sibling .cpp is compiled-or-not with it. One
+        # with NO sibling .cpp (a header-only QObject) has nothing to measure, so
+        # it is moc'd -- AUTOMOC would.
+        cpp = f[:-2] + ".cpp"
+        if exes and os.path.exists(os.path.join(qt_dir, cpp)) and cpp not in compiled:
+            continue
         hdrs.append("UI/Qt/" + f)
-    return [h for h in hdrs if not h.endswith("GeolocationProviderQt.h")]
+    return hdrs
 
 
 def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
@@ -887,7 +932,7 @@ def main():
     print(AK_BLOCK_TAIL, end="")
     for name in ROOT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar)
-    emit_qt_autogen(moc_headers())
+    emit_qt_autogen(moc_headers(exes))
     emit_qt_runtime()
     for name in QT_TARGETS:
         emit_target(name, targets, libs, exes, so, ar,

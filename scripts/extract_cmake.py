@@ -182,6 +182,16 @@ def _library_identity(fragment: str) -> Optional[str]:
 
     '-lz' -> 'z'; '/usr/lib/libfoo.a' -> 'foo'; '-framework Cocoa' -> 'Cocoa'.
     Resolution to a Bazel label is the resolver adapter's job, not ours.
+
+    The name is what a linker would take after -l, so the EXTENSION is stripped,
+    not everything after the first dot. That distinction is invisible for
+    libz.so and libQt6Widgets.so.6.10.2, and wrong for a library whose name
+    contains a dot: glib's soname is libgio-2.0.so, whose -l name is `gio-2.0`.
+    Truncating at the first dot produced `gio-2`, which names no library at all
+    -- so a resolver either fails to find it (Ladybird's 71fb301a pin: three
+    UNKNOWN deps, gio-2/gobject-2/glib-2, after upstream added a
+    pkg_check_modules(GIO)) or, worse, emits `-lgio-2` and the link fails a long
+    way from here. An abstract dep name that no tool can resolve is not abstract.
     """
     frag = fragment.strip()
     if not frag:
@@ -192,8 +202,16 @@ def _library_identity(fragment: str) -> Optional[str]:
         parts = frag.split()
         return parts[1] if len(parts) > 1 else None
     base = os.path.basename(frag)
-    if base.startswith("lib") and "." in base:
-        return base[3:].split(".")[0]
+    if not base.startswith("lib"):
+        return None
+    stem = base[3:]
+    # Cut at the extension, longest-first so `.dylib` is not read as `.d`.
+    for ext in (".dylib", ".so", ".tbd", ".a", ".lib"):
+        i = stem.find(ext + ".")          # versioned: libfoo.so.1.2.3
+        if i < 0 and stem.endswith(ext):
+            i = len(stem) - len(ext)      # unversioned: libfoo.so
+        if i > 0:
+            return stem[:i]
     return None
 
 
