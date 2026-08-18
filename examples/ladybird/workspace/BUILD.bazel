@@ -9,7 +9,7 @@ load(":vcpkg_index.bzl", "VCPKG_DISTFILE_INDEX")
 
 package(default_visibility = ["//visibility:public"])
 
-# 24 generator genrules for this package: the IPC endpoints, LibJS Bytecode/Op,
+# 25 generator genrules for this package: the IPC endpoints, LibJS Bytecode/Op,
 # LibHTTP's HSTS table, the Compositor WebGL replayer, the TIFF tag tables, the
 # two SPIR-V shader headers and the Flap interpreter assembly. Bazel now
 # GENERATES all of them instead of consuming CMake's prebuilt copies from
@@ -112,6 +112,7 @@ cc_library(
         'AK/StringConversions.cpp',
         'AK/StringUtils.cpp',
         'AK/StringView.cpp',
+        'AK/ThreadID.cpp',
         'AK/Time.cpp',
         'AK/Utf16FlyString.cpp',
         'AK/Utf16String.cpp',
@@ -341,7 +342,7 @@ cc_library(
     ],
 )
 
-# === LibGC (shared_library, 19 TU) ===
+# === LibGC (shared_library, 20 TU) ===
 cc_library(
     name = 'LibGC',
     srcs = [
@@ -353,6 +354,7 @@ cc_library(
         'Libraries/LibGC/ConservativeRangeProvider.cpp',
         'Libraries/LibGC/ConservativeVector.cpp',
         'Libraries/LibGC/CrossHeapMember.cpp',
+        'Libraries/LibGC/ExternalEntityTable.cpp',
         'Libraries/LibGC/Heap.cpp',
         'Libraries/LibGC/HeapBlock.cpp',
         'Libraries/LibGC/HeapGroup.cpp',
@@ -610,7 +612,6 @@ cc_library(
 cc_library(
     name = 'LibJS',
     srcs = [
-        ':Libraries/LibJS/Bytecode/Op.cpp',
         ':Libraries/LibJS/Interpreter/interpreter_x86_64.S',
         'Libraries/LibJS/Bytecode/Executable.cpp',
         'Libraries/LibJS/Bytecode/IdentifierTable.cpp',
@@ -626,6 +627,7 @@ cc_library(
         'Libraries/LibJS/Contrib/Test262/GlobalObject.cpp',
         'Libraries/LibJS/Contrib/Test262/IsHTMLDDA.cpp',
         'Libraries/LibJS/CyclicModule.cpp',
+        'Libraries/LibJS/Debugger.cpp',
         'Libraries/LibJS/Heap/Cell.cpp',
         'Libraries/LibJS/Interpreter/Interpreter.cpp',
         'Libraries/LibJS/Interpreter/SlowPaths.cpp',
@@ -910,12 +912,12 @@ cc_library(
     ],
 )
 
-# === LibMedia (shared_library, 45 TU) ===
+# === LibMedia (shared_library, 54 TU) ===
 cc_library(
     name = 'LibMedia',
     srcs = [
-        'Libraries/LibMedia/Audio/AudioBuffer.cpp',
         'Libraries/LibMedia/Audio/AudioDevices.cpp',
+        'Libraries/LibMedia/Audio/AudioRingBuffer.cpp',
         'Libraries/LibMedia/Audio/NullPlaybackStream.cpp',
         'Libraries/LibMedia/Audio/PlaybackStream.cpp',
         'Libraries/LibMedia/Audio/PlaybackStreamPulseAudio.cpp',
@@ -942,8 +944,9 @@ cc_library(
         'Libraries/LibMedia/FFmpeg/FFmpegHelpers.cpp',
         'Libraries/LibMedia/FFmpeg/FFmpegIOContext.cpp',
         'Libraries/LibMedia/FFmpeg/FFmpegVideoDecoder.cpp',
-        'Libraries/LibMedia/GenericTimeProvider.cpp',
         'Libraries/LibMedia/IncrementallyPopulatedStream.cpp',
+        'Libraries/LibMedia/MediaTime.cpp',
+        'Libraries/LibMedia/MonotonicMediaClock.cpp',
         'Libraries/LibMedia/PlaybackManager.cpp',
         'Libraries/LibMedia/PlaybackStates/BufferingStateHandler.cpp',
         'Libraries/LibMedia/PlaybackStates/PausedStateHandler.cpp',
@@ -955,10 +958,18 @@ cc_library(
         'Libraries/LibMedia/Processors/AudioTimeStretchProcessor.cpp',
         'Libraries/LibMedia/Producers/DecodedAudioProducer.cpp',
         'Libraries/LibMedia/Producers/DecodedVideoProducer.cpp',
+        'Libraries/LibMedia/Producers/RemoteVideoProducer.cpp',
         'Libraries/LibMedia/Sinks/AudioPlaybackSink.cpp',
         'Libraries/LibMedia/Sinks/DisplayingVideoSink.cpp',
+        'Libraries/LibMedia/Sinks/RemoteVideoSink.cpp',
         'Libraries/LibMedia/TimeRanges.cpp',
+        'Libraries/LibMedia/VideoEdgeQueue.cpp',
         'Libraries/LibMedia/VideoFrame.cpp',
+        'Libraries/LibMedia/VideoFrameHandle.cpp',
+        'Libraries/LibMedia/VideoFramePool.cpp',
+        'Libraries/LibMedia/VideoPresentation/PresentedFramePage.cpp',
+        'Libraries/LibMedia/VideoPresentation/VideoPresentationClientConnection.cpp',
+        'Libraries/LibMedia/VideoPresentation/VideoPresentationServerConnection.cpp',
     ],
     hdrs = glob(["Libraries/LibMedia/**/*.h"], allow_empty = True),
     local_defines = ['LIBMEDIA_AUDIO_BACKEND=1', 'LibMedia_EXPORTS', '_REENTRANT'],
@@ -1286,7 +1297,7 @@ cc_library(
     ],
 )
 
-# === LibDevTools (shared_library, 35 TU) ===
+# === LibDevTools (shared_library, 36 TU) ===
 cc_library(
     name = 'LibDevTools',
     srcs = [
@@ -1323,6 +1334,7 @@ cc_library(
         'Libraries/LibDevTools/Actors/WatcherActor.cpp',
         'Libraries/LibDevTools/Connection.cpp',
         'Libraries/LibDevTools/DevToolsServer.cpp',
+        'Libraries/LibDevTools/FirefoxClient.cpp',
         'Libraries/LibDevTools/IndexedDBSerialization.cpp',
         'Libraries/LibDevTools/StorageHelpers.cpp',
     ],
@@ -1333,6 +1345,7 @@ cc_library(
     deps = [
         '//:AK',
         '//:LibCore',
+        '//:LibFileSystem',
         '//:LibHTTP',
         '//:LibURL',
         '//:all_source_headers',
@@ -1340,11 +1353,12 @@ cc_library(
     ],
 )
 
-# === LibWebView (shared_library, 57 TU) ===
+# === LibWebView (shared_library, 64 TU) ===
 cc_library(
     name = 'LibWebView',
     srcs = [
         'Libraries/LibWebView/Application.cpp',
+        'Libraries/LibWebView/ApplyHistoryStep.cpp',
         'Libraries/LibWebView/Attribute.cpp',
         'Libraries/LibWebView/Autocomplete.cpp',
         'Libraries/LibWebView/AutocompleteMuxer.cpp',
@@ -1362,6 +1376,9 @@ cc_library(
         'Libraries/LibWebView/DOMNodeProperties.cpp',
         'Libraries/LibWebView/DictionaryLookup.cpp',
         'Libraries/LibWebView/DownloadPresentation.cpp',
+        'Libraries/LibWebView/DownloadSegmentation.cpp',
+        'Libraries/LibWebView/DownloadStore.cpp',
+        'Libraries/LibWebView/ExternalURLHandler.cpp',
         'Libraries/LibWebView/FileDownloader.cpp',
         'Libraries/LibWebView/Geolocation.cpp',
         'Libraries/LibWebView/HSTSStore.cpp',
@@ -1382,6 +1399,9 @@ cc_library(
         'Libraries/LibWebView/Profile.cpp',
         'Libraries/LibWebView/SearchEngine.cpp',
         'Libraries/LibWebView/SessionHistory.cpp',
+        'Libraries/LibWebView/SessionHistorySnapshotStorage.cpp',
+        'Libraries/LibWebView/SessionHistoryTraversalQueue.cpp',
+        'Libraries/LibWebView/SessionStore.cpp',
         'Libraries/LibWebView/Settings.cpp',
         'Libraries/LibWebView/SiteIsolation.cpp',
         'Libraries/LibWebView/SiteIsolationManager.cpp',
@@ -1803,7 +1823,8 @@ qt_plugin_tree(
 qt_conf(
     name = "qt_conf",
 )
-# === ladybird (executable, 21 TU) ===
+# === ladybird (executable, 24 TU) ===
+#   UNKNOWN deps: ['Qt6Positioning', 'gio-2', 'gobject-2', 'glib-2', 'xkbcommon']
 cc_binary(
     name = 'ladybird',
     srcs = [
@@ -1817,7 +1838,10 @@ cc_binary(
         'UI/Qt/DevToolsBanner.cpp',
         'UI/Qt/EventLoopImplementationQt.cpp',
         'UI/Qt/EventLoopImplementationQtEventTarget.cpp',
+        'UI/Qt/ExternalURLActivationToken.cpp',
+        'UI/Qt/ExternalURLHandler.cpp',
         'UI/Qt/FindInPageWidget.cpp',
+        'UI/Qt/GeolocationProviderQt.cpp',
         'UI/Qt/Icon.cpp',
         'UI/Qt/LocationEdit.cpp',
         'UI/Qt/Menu.cpp',
@@ -1831,7 +1855,8 @@ cc_binary(
         'UI/Qt/WindowControlButton.cpp',
         'UI/Qt/main.cpp',
     ],
-    local_defines = ['QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_WIDGETS_LIB'],
+    local_defines = ['LADYBIRD_QT_HAVE_POSITIONING=1', 'QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_POSITIONING_LIB', 'QT_WIDGETS_LIB'],
+    copts = ['-pthread'],
     linkopts = ['-lGLX', '-lOpenGL', '-lvulkan'],
     data = [':qt_conf', ':qt_plugins'],
     deps = [
@@ -1845,6 +1870,7 @@ cc_binary(
         '//:LibMain',
         '//:LibRequests',
         '//:LibSync',
+        '//:LibThreading',
         '//:LibURL',
         '//:LibUnicode',
         '//:LibWakeLock',

@@ -54,6 +54,7 @@ CARGO_CRATE_FILES = {
     'fastrand 2.4.0 a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f': '@crate_fastrand_2_4_0//:srcs',
     'flatbuffers 25.12.19 35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3': '@crate_flatbuffers_25_12_19//:srcs',
     'foldhash 0.1.5 d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2': '@crate_foldhash_0_1_5//:srcs',
+    'foldhash 0.2.0 77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb': '@crate_foldhash_0_2_0//:srcs',
     'form_urlencoded 1.2.2 cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf': '@crate_form_urlencoded_1_2_2//:srcs',
     'getrandom 0.4.2 0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555': '@crate_getrandom_0_4_2//:srcs',
     'gimli 0.31.1 07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f': '@crate_gimli_0_31_1//:srcs',
@@ -174,7 +175,7 @@ CARGO_CRATE_FILES = {
 CARGO_CRATE_SPECS = {
     'libgfx_rust': {
         "manifest": 'Libraries/LibGfx/Rust/Cargo.toml',
-        "features": [],
+        "features": ['allocator'],
         "ffi_headers": ['RustFFI.h'],
         "ffi_prefix": 'LibGfx',
         "ffi_bare_include": True,
@@ -221,24 +222,10 @@ CARGO_CRATE_SPECS = {
         "ffi_prefix": 'LibWeb',
         "ffi_bare_include": False,
     },
-    'libweb_css_rust': {
-        "manifest": 'Libraries/LibWeb/CSS/Rust/Cargo.toml',
-        "features": ['allocator'],
-        "ffi_headers": ['ComputedValuesRustFFI.h', 'RustFFI.h', 'SelectorRustFFI.h', 'StyleValueRustFFI.h'],
-        "ffi_prefix": 'LibWeb',
-        "ffi_bare_include": False,
-    },
-    'libweb_layout_rust': {
-        "manifest": 'Libraries/LibWeb/Layout/Rust/Cargo.toml',
-        "features": ['allocator'],
-        "ffi_headers": ['Layout/TreeBuilderRustFFI.h'],
-        "ffi_prefix": 'LibWeb',
-        "ffi_bare_include": False,
-    },
     'libweb_rust': {
         "manifest": 'Libraries/LibWeb/Rust/Cargo.toml',
-        "features": [],
-        "ffi_headers": ['HTML/Parser/RustFFI.h', 'HTMLTokenizerRustFFI.h'],
+        "features": ['style-recording'],
+        "ffi_headers": ['ComputedValuesRustFFI.h', 'HTML/Parser/RustFFI.h', 'HTMLTokenizerRustFFI.h', 'Layout/LayoutRustFFI.h', 'Layout/TreeBuilderRustFFI.h', 'RustFFI.h', 'SelectorRustFFI.h', 'StyleEngineBridgeGenerated.h', 'StyleEngineBridgeGenerated.inc', 'StyleEngineRustFFI.h', 'StyleEngineStateFactsGenerated.inc', 'StyleValueRustFFI.h'],
         "ffi_prefix": 'LibWeb',
         "ffi_bare_include": False,
     },

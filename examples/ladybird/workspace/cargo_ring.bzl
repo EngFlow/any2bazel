@@ -2,8 +2,8 @@
 load(":cargo.bzl", "cargo_binary", "cargo_crate", "cargo_lib", "cargo_bare_include", "rust_sysroot")
 load(":cargo_index.bzl", "CARGO_CRATE_FILES", "CARGO_CRATE_SPECS")
 
-# Ladybird's 10 production Rust crates and 2 binary crates, BUILT BY BAZEL
-# from the 154 crates.io crates Bazel fetched -- replacing the prebuilt
+# Ladybird's 8 production Rust crates and 4 binary crates, BUILT BY BAZEL
+# from the 155 crates.io crates Bazel fetched -- replacing the prebuilt
 # 260 MB librust_combined.a that was copied out of Build/full/cargo/, the
 # `ar -M` merge that produced it (README step 1b), and the reference build's
 # flapc and cranelift-compiler binaries. Nothing here names Build/full.
@@ -29,11 +29,16 @@ def cargo_ring():
     # cargo WORKSPACE. Each of them path-depends on
     # Libraries/RustAllocator.rs and several are path-dependencies of each
     # other, so cargo resolves the whole workspace whichever crate you ask
-    # for. Over-declaring costs a rebuild of 11 crates when any .rs changes;
-    # under-declaring silently reuses a stale archive. The trade is the right
-    # way round, and it is real debt: per-crate source sets need the
-    # path-dependency graph read out of the manifests.
-    crate_srcs = native.glob(['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'Libraries/RustAllocator.rs', 'Libraries/*/Rust/**', 'Libraries/LibJS/BytecodeDef/**'], allow_empty = False) + ['//Libraries/LibWeb:rust_crate_srcs']
+    # for. Over-declaring costs a rebuild of every crate when any .rs
+    # changes; under-declaring silently reuses a stale archive. The trade is
+    # the right way round, and it is real debt: per-crate source sets need
+    # the path-dependency graph read out of the manifests.
+    #
+    # The patterns are DERIVED from Cargo.toml's member list closed over the
+    # manifests' `path =` deps, not written down: a directory written down
+    # here is an allow_empty=False glob that outlives the directory, and
+    # loading then fails before any target can say why.
+    crate_srcs = native.glob(['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'Libraries/RustAllocator.rs', 'Libraries/LibGfx/Rust/**', 'Libraries/LibJS/Flap/**', 'Libraries/LibJS/Rust/**', 'Libraries/LibRegex/Rust/**', 'Libraries/LibTextCodec/Rust/**', 'Libraries/LibURL/Rust/**', 'Libraries/LibUnicode/Rust/**', 'Libraries/LibWasm/Rust/**'], exclude = ['Libraries/LibGfx/Rust/target/**', 'Libraries/LibJS/Flap/target/**', 'Libraries/LibJS/Rust/target/**', 'Libraries/LibRegex/Rust/target/**', 'Libraries/LibTextCodec/Rust/target/**', 'Libraries/LibURL/Rust/target/**', 'Libraries/LibUnicode/Rust/target/**', 'Libraries/LibWasm/Rust/target/**'], allow_empty = False) + ['//Libraries/LibWeb:rust_crate_srcs']
 
     cargo_crate(
         name = 'libgfx_rust',
@@ -78,7 +83,7 @@ def cargo_ring():
         # Build-script inputs, taken from the reference build's DEPFILES
         # rather than from reading build.rs: this crate's build script
         # generates Rust from these, so they are compile inputs.
-        srcs = crate_srcs + ['Libraries/LibJS/Bytecode/Bytecode.def'],
+        srcs = crate_srcs + ['Libraries/LibJS/Interpreter/interpreter.flap'],
         sysroot = ":rust_sysroot",
     )
 
@@ -240,60 +245,6 @@ def cargo_ring():
     )
 
     cargo_crate(
-        name = 'libweb_css_rust',
-        crate = 'libweb_css_rust',
-        crates = CARGO_CRATE_FILES,
-        crate_features = CARGO_CRATE_SPECS['libweb_css_rust']["features"],
-        ffi_headers = CARGO_CRATE_SPECS['libweb_css_rust']["ffi_headers"],
-        ffi_prefix = CARGO_CRATE_SPECS['libweb_css_rust']["ffi_prefix"],
-        ffi_bare_include = CARGO_CRATE_SPECS['libweb_css_rust']["ffi_bare_include"],
-        manifest = CARGO_CRATE_SPECS['libweb_css_rust']["manifest"],
-        srcs = crate_srcs,
-        sysroot = ":rust_sysroot",
-    )
-
-    # The consumable target: this crate's archive to link and this
-    # crate's generated FFI headers to include, one for one with
-    # CMake's per-library edge. NOT a shared --start-group over all
-    # ten archives: the crates have no true cross-crate symbol
-    # references (measured: 0), the shared symbols are each crate's
-    # own copy of rust-std, and a group makes ld satisfy one crate's
-    # std symbol from another crate's object -- dragging that
-    # crate's C++ FFI into a target that never linked it. See the
-    # block comment in cargo.bzl.
-    cargo_lib(
-        name = 'libweb_css_rust_lib',
-        crate = ':libweb_css_rust',
-    )
-
-    cargo_crate(
-        name = 'libweb_layout_rust',
-        crate = 'libweb_layout_rust',
-        crates = CARGO_CRATE_FILES,
-        crate_features = CARGO_CRATE_SPECS['libweb_layout_rust']["features"],
-        ffi_headers = CARGO_CRATE_SPECS['libweb_layout_rust']["ffi_headers"],
-        ffi_prefix = CARGO_CRATE_SPECS['libweb_layout_rust']["ffi_prefix"],
-        ffi_bare_include = CARGO_CRATE_SPECS['libweb_layout_rust']["ffi_bare_include"],
-        manifest = CARGO_CRATE_SPECS['libweb_layout_rust']["manifest"],
-        srcs = crate_srcs,
-        sysroot = ":rust_sysroot",
-    )
-
-    # The consumable target: this crate's archive to link and this
-    # crate's generated FFI headers to include, one for one with
-    # CMake's per-library edge. NOT a shared --start-group over all
-    # ten archives: the crates have no true cross-crate symbol
-    # references (measured: 0), the shared symbols are each crate's
-    # own copy of rust-std, and a group makes ld satisfy one crate's
-    # std symbol from another crate's object -- dragging that
-    # crate's C++ FFI into a target that never linked it. See the
-    # block comment in cargo.bzl.
-    cargo_lib(
-        name = 'libweb_layout_rust_lib',
-        crate = ':libweb_layout_rust',
-    )
-
-    cargo_crate(
         name = 'libweb_rust',
         crate = 'libweb_rust',
         crates = CARGO_CRATE_FILES,
@@ -338,14 +289,29 @@ def cargo_ring():
     #                      includes. It is a root-workspace member, so its
     #                      source set is the shared crate_srcs.
     cargo_binary(
+        name = 'generate-libjs-bytecode',
+        bin = 'generate-libjs-bytecode',
+        crate = 'flapc',
+        crates = CARGO_CRATE_FILES,
+        manifest = 'Libraries/LibJS/Flap/Cargo.toml',
+        # Its OWN workspace (`exclude`d from the root one), so its source
+        # set is its own subtree plus what it include_str!s from above
+        # it -- both derived, the subtree from Cargo.toml's `exclude`
+        # and the rest by scanning for include_str!.
+        srcs = native.glob(['Libraries/LibJS/Flap/**', 'Libraries/LibJS/Interpreter/interpreter.flap', 'rust-toolchain.toml'], exclude = ['Libraries/LibJS/Flap/target/**'], allow_empty = False),
+        sysroot = ":rust_sysroot",
+    )
+    cargo_binary(
         name = 'flapc',
         bin = 'flapc',
         crate = 'flapc',
         crates = CARGO_CRATE_FILES,
         manifest = 'Libraries/LibJS/Flap/Cargo.toml',
         # Its OWN workspace (`exclude`d from the root one), so its source
-        # set is its own subtree.
-        srcs = native.glob(['Libraries/LibJS/Flap/Cargo.toml', 'Libraries/LibJS/Flap/Cargo.lock', 'Libraries/LibJS/Flap/src/**', 'Libraries/LibJS/Flap/benches/**', 'Libraries/LibJS/Flap/tests/**', 'Libraries/LibJS/BytecodeDef/**', 'Libraries/LibJS/Bytecode/Bytecode.def', 'Libraries/LibJS/Interpreter/interpreter.flap', 'rust-toolchain.toml'], allow_empty = False),
+        # set is its own subtree plus what it include_str!s from above
+        # it -- both derived, the subtree from Cargo.toml's `exclude`
+        # and the rest by scanning for include_str!.
+        srcs = native.glob(['Libraries/LibJS/Flap/**', 'Libraries/LibJS/Interpreter/interpreter.flap', 'rust-toolchain.toml'], exclude = ['Libraries/LibJS/Flap/target/**'], allow_empty = False),
         sysroot = ":rust_sysroot",
     )
     cargo_binary(
@@ -379,4 +345,21 @@ def cargo_ring():
     cargo_bare_include(
         name = 'libwasm_cranelift_bare_include',
         crate = ':cranelift-compiler',
+    )
+    cargo_binary(
+        name = 'style-replay',
+        bin = 'style-replay',
+        crate = 'libweb_rust',
+        crates = CARGO_CRATE_FILES,
+        manifest = 'Libraries/LibWeb/Rust/Cargo.toml',
+        # build_rust_binary() takes FEATURES too, and this one does:
+        # the same crate builds a staticlib and this binary, and only
+        # the features distinguish what each gets.
+        crate_features = ['style-recording'],
+        # A member of the ROOT cargo workspace (Cargo.toml lists it), so
+        # cargo resolves the whole workspace whichever crate you ask for
+        # and the source set is the shared one -- same over-declaration,
+        # same reason, as the staticlib crates.
+        srcs = crate_srcs,
+        sysroot = ":rust_sysroot",
     )

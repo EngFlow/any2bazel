@@ -32,7 +32,13 @@ with a few seeds is what keeps it fixed.
 import os, re, subprocess, sys, shutil, filecmp
 
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FULL = os.path.join(ROOT, "Build/full")
+# The reference CMake build tree the emitter reads. An env var, not a
+# hardcoded "Build/full": a repin needs a SECOND reference build side by side
+# with the old one (you cannot delete the tree you are still diffing against),
+# and CMake bakes the build dir's absolute path into build.ninja -- so
+# "just rename the directory afterwards" corrupts it. Found by doing exactly
+# that during the 71fb301a repin.
+FULL = os.environ.get("LADYBIRD_BUILD_DIR") or (ROOT + "/Build/full")
 SCRATCH = os.environ.get("PARITY_SCRATCH", os.path.join(ROOT, "Build/parity_out"))
 
 # ---------------------------------------------------------------------------
@@ -56,6 +62,20 @@ COVERED = [
     (r'(?:^|&& )\S*bin/generate_interpreter_layout\b',
                                        'generate_interpreter_layout (self-built)'),
     (r'(?:^|&& )\S*bin/flapc\b',       'flapc (self-built)'),
+    # generate-libjs-bytecode: upstream a32d9c9f replaced the Python bytecode
+    # generator with a Rust BINARY (a second bin of the flapc crate) that emits
+    # Bytecode/Op.h + OpCodes.h from interpreter.flap.
+    #
+    # It has to be listed HERE, above EXCLUDED, and that is the whole lesson: its
+    # ninja command is `<tool> --input ... && cmake -E copy_if_different ...`, so
+    # the `copy_if_different` exclusion matched it first and the harness bucketed a
+    # GENERATOR as "resource staging" -- reporting 0 UNHANDLED while two generated
+    # headers had no owner at all. A first-match-wins classifier makes every
+    # exclusion pattern a potential silent capture of a command it was never
+    # written for, and the count that is supposed to catch that cannot, because the
+    # command was counted.
+    (r'(?:^|&& )\S*bin/generate-libjs-bytecode\b',
+                                       'generate-libjs-bytecode (self-built)'),
 ]
 
 # ---------------------------------------------------------------------------

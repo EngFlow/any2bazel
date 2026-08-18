@@ -176,6 +176,20 @@ def _fixture():
     with open(os.path.join(d, "Cargo.toml"), "w") as f:
         f.write('[workspace]\nmembers = ["Libraries/LibWasm/Rust"]\n'
                 'exclude = ["Libraries/LibJS/Flap"]\n')
+    # The crate DIRECTORIES the member list names, because a source set derived
+    # from Cargo.toml is only derived if the directory has to exist -- that is
+    # exactly the property that made the hardcoded BytecodeDef/** glob outlive its
+    # directory. The LibWasm crate path-depends on nothing; LibWeb's does, on the
+    # excluded flapc workspace, which is how a path dep reaches OUTSIDE the
+    # workspace (libjs_rust build-depends on flapc that way).
+    for crate, manifest in (
+            ("Libraries/LibWasm/Rust", '[package]\nname = "libwasm_cranelift"\n'),
+            ("Libraries/LibWeb/Rust",
+             '[package]\nname = "libweb_rust"\n\n[build-dependencies]\n'
+             'flapc = { path = "../../LibJS/Flap" }\n')):
+        os.makedirs(os.path.join(d, crate), exist_ok=True)
+        with open(os.path.join(d, crate, "Cargo.toml"), "w") as f:
+            f.write(manifest)
     for lib, text in (("LibGfx", CMAKE_GFX), ("LibWeb", CMAKE_WEB),
                       ("LibJS", CMAKE_JS), ("LibWasm", CMAKE_WASM)):
         os.makedirs(os.path.join(d, "Libraries", lib), exist_ok=True)
@@ -197,15 +211,15 @@ def test_only_checksummed_packages_become_fetch_rules():
     assert {n for n, _v in workspace} == {"libgfx_rust", "libweb_rust"}
 
 
-def test_the_real_lock_splits_154_registry_from_13_workspace():
+def test_the_real_lock_splits_155_registry_from_11_workspace():
     """Pins the counts against the checked-in generated file, which is ground
     truth neither this test nor the emitter produced (finding 25's rule)."""
     crates = _read("cargo_crates.bzl")
-    assert crates.count("http_archive(") == 154, crates.count("http_archive(")
+    assert crates.count("http_archive(") == 155, crates.count("http_archive(")
     # And every one of them names a crates.io URL, i.e. none is a workspace member
     # that slipped through.
     urls = re.findall(r"urls = \['([^']+)'\]", crates)
-    assert len(urls) == 154
+    assert len(urls) == 155
     assert all(u.startswith("https://static.crates.io/crates/") for u in urls)
 
 
@@ -254,15 +268,15 @@ def test_repo_names_are_unique_per_crate_version():
     """`-` and `.` are illegal in a repo name; the normalization must not collide."""
     assert emit.repo_name("aho-corasick", "1.1.4") == "crate_aho_corasick_1_1_4"
     names = set(re.findall(r"name = '([^']+)'", _read("cargo_crates.bzl")))
-    # 154 crates -> 154 distinct repo names, i.e. the normalization is injective
+    # 155 crates -> 155 distinct repo names, i.e. the normalization is injective
     # on the real input set.
-    assert len(names) == 154
+    assert len(names) == 155
 
 
 def test_a_crate_archive_declares_its_type_because_dot_crate_is_not_known():
     """http_archive rejects a `.crate` suffix; without type= the fetch fails with
     a message about .zip/.tar.gz that says nothing about the cause."""
-    assert _read("cargo_crates.bzl").count('type = "tgz"') == 154
+    assert _read("cargo_crates.bzl").count('type = "tgz"') == 155
 
 
 # ---------------------------------------------------------------------------
@@ -277,24 +291,31 @@ def test_features_are_parsed_per_crate_including_the_variable_form():
     assert specs["libweb_css_rust"]["features"] == ["allocator"]
 
 
-def test_the_real_feature_set_is_three_of_ten_and_not_libgfx():
-    """The spec for this work said libgfx_rust takes `allocator`. It does not --
-    cargo fails outright ("the package 'libgfx_rust' does not contain this
-    feature"). Pinned against the generated index, so a future bump that changes
-    a feature has to change this number deliberately."""
+def test_the_real_feature_set_is_parsed_per_crate_and_moves_with_upstream():
+    """Features are the ABI, so they are PARSED, and the parse is pinned here.
+
+    The spec for this work said libgfx_rust takes `allocator`; at the commit this
+    overlay first targeted it did not even HAVE that feature (cargo: "the package
+    'libgfx_rust' does not contain this feature"), and one repin later it does.
+    That is the whole argument for parsing rather than writing it down -- and it
+    is why this test asserts the parsed SET against the generated index rather
+    than a remembered number: a crate gaining, losing or merging a feature has to
+    change this assertion deliberately.
+    """
     index = _read("cargo_index.bzl")
     specs = re.findall(r"'(\w+)': \{\n\s+\"manifest\": '[^']+',\n\s+"
                        r"\"features\": (\[[^\]]*\])", index)
     feats = {name: eval(f) for name, f in specs}
-    assert len(feats) == 10, sorted(feats)
+    assert len(feats) == 8, sorted(feats)
     with_alloc = {n for n, f in feats.items() if f == ["allocator"]}
-    assert with_alloc == {"libregex_rust", "liburl_rust", "libunicode_rust",
-                          "libweb_content_blocker_rust", "libweb_css_rust",
-                          "libweb_layout_rust"}, sorted(with_alloc)
-    assert feats["libgfx_rust"] == []
+    assert with_alloc == {"libgfx_rust", "libregex_rust", "libunicode_rust",
+                          "liburl_rust", "libweb_content_blocker_rust"}, \
+        sorted(with_alloc)
     assert feats["libjs_rust"] == []
     assert feats["libtextcodec_rust"] == []
-    assert feats["libweb_rust"] == []
+    # The consolidated LibWeb crate carries a feature that is NOT `allocator`, so
+    # a parse that only ever looked for that one word would drop it silently.
+    assert feats["libweb_rust"] == ["style-recording"]
 
 
 # ---------------------------------------------------------------------------
@@ -306,13 +327,24 @@ def test_ffi_header_lists_are_not_uniform():
     hdrs = dict(re.findall(r"'(\w+)': \{\n(?:.*\n)*?\s+\"ffi_headers\": (\[[^\]]*\])",
                            index))
     hdrs = {k: eval(v) for k, v in hdrs.items()}
-    assert hdrs["libweb_css_rust"] == ["ComputedValuesRustFFI.h", "RustFFI.h",
-                                       "SelectorRustFFI.h", "StyleValueRustFFI.h"]
-    assert hdrs["libweb_layout_rust"] == ["Layout/TreeBuilderRustFFI.h"]
     assert hdrs["libweb_content_blocker_rust"] == ["ContentBlockerRustFFI.h"]
     assert hdrs["libgfx_rust"] == ["RustFFI.h"]
-    # 14 headers across 10 crates, which is the number in CMake's own build tree.
-    assert sum(len(v) for v in hdrs.values()) == 14
+    # Upstream consolidated libweb_css_rust and libweb_layout_rust back INTO
+    # libweb_rust, so one crate now writes what three used to -- 12 files, two of
+    # them `.inc` rather than `.h`. An undeclared .inc is deleted by Bazel exactly
+    # like an undeclared header, so the suffix must not be what decides whether a
+    # generated file is declared.
+    assert hdrs["libweb_rust"] == [
+        "ComputedValuesRustFFI.h", "HTML/Parser/RustFFI.h",
+        "HTMLTokenizerRustFFI.h", "Layout/LayoutRustFFI.h",
+        "Layout/TreeBuilderRustFFI.h", "RustFFI.h", "SelectorRustFFI.h",
+        "StyleEngineBridgeGenerated.h", "StyleEngineBridgeGenerated.inc",
+        "StyleEngineRustFFI.h", "StyleEngineStateFactsGenerated.inc",
+        "StyleValueRustFFI.h"]
+    assert [h for h in hdrs["libweb_rust"] if h.endswith(".inc")], \
+        "the .inc outputs stopped being declared"
+    # 19 files across 8 crates, which is the number in CMake's own build tree.
+    assert sum(len(v) for v in hdrs.values()) == 19
 
 
 def test_the_header_cmake_never_declares_is_still_declared_here():
@@ -384,8 +416,8 @@ def test_headers_are_prefixed_so_both_include_spellings_resolve():
     different package."""
     mod = _load(_fixture())
     assert mod.FFI_PREFIX["liburl_rust"] == "LibURL"
-    assert mod.FFI_PREFIX["libweb_css_rust"] == "LibWeb"
-    assert mod.FFI_PREFIX["libweb_layout_rust"] == "LibWeb"
+    assert mod.FFI_PREFIX["libweb_rust"] == "LibWeb"
+    assert mod.FFI_PREFIX["libweb_content_blocker_rust"] == "LibWeb"
     # Every crate with observed headers has a prefix: a missing one would stage
     # the header at the include root and silently change its include spelling.
     assert set(mod.FFI_HEADERS_OBSERVED) <= set(mod.FFI_PREFIX)
@@ -418,7 +450,7 @@ def test_the_index_key_carries_name_version_and_hash():
     key, since a Bazel label carries none of them."""
     index = _read("cargo_index.bzl")
     keys = re.findall(r"^    '([^']+)': '@crate_", index, re.M)
-    assert len(keys) == 154
+    assert len(keys) == 155
     for k in keys:
         name, version, sha = k.split(" ")
         assert re.fullmatch(r"[0-9a-f]{64}", sha), k
@@ -559,15 +591,15 @@ def test_each_crate_links_its_own_archive_and_no_others():
     assert "user_link_flags = [archive.path]" in impl, "must link exactly one archive"
     assert "additional_inputs" in impl, "the archive would not be in the sandbox"
     ring = _read("cargo_ring.bzl")
-    assert ring.count("cargo_crate(") == 10
-    # One consumable target per crate that has something to consume: the 10
+    assert ring.count("cargo_crate(") == 8
+    # One consumable target per crate that has something to consume: the 8
     # staticlib crates, plus libwasm_cranelift -- a `--bin` crate, so it has NO
     # archive at all and cargo_lib yields a headers-only CcInfo for it (the
     # executable is spawned at run time, and travels as `data`). That "archive
     # may be None" branch is the shape a binary crate needs, and it is why the
-    # count is 11 rather than 10.
-    assert ring.count("cargo_lib(") == 11, "one consumable target per crate"
-    assert ring.count("cargo_binary(") == 2
+    # count is 9 rather than 8.
+    assert ring.count("cargo_lib(") == 9, "one consumable target per crate"
+    assert ring.count("cargo_binary(") == 4
     assert "cargo_libs(" not in ring, "the shared link group is gone"
     assert "if archive == None:" in impl, "a --bin crate has no archive to link"
 
@@ -594,9 +626,11 @@ def test_a_library_depends_on_the_crates_it_uses_and_no_others():
     assert crates_of(root, "LibGfx") == ["libgfx_rust"]
     assert crates_of(root, "LibJS") == ["libjs_rust"]
     assert crates_of(root, "LibRegex") == ["libregex_rust"]
+    # Two, not four: upstream consolidated libweb_css_rust and libweb_layout_rust
+    # into libweb_rust, and the dep edges follow CMake's
+    # target_link_libraries(LibWeb PRIVATE libweb_rust libweb_content_blocker_rust).
     assert crates_of(libweb, "LibWeb") == [
-        "libweb_content_blocker_rust", "libweb_css_rust",
-        "libweb_layout_rust", "libweb_rust",
+        "libweb_content_blocker_rust", "libweb_rust",
     ]
 
 
@@ -657,8 +691,8 @@ def test_every_build_rust_binary_crate_is_in_the_ring_with_its_header():
     a staticlib crate gets.
     """
     mod = _load(_fixture())
-    bins = {b["crate"]: b for b in mod.binary_specs()}
-    assert set(bins) == {"flapc", "libwasm_cranelift"}, sorted(bins)
+    bins = {b["bin"]: b for b in mod.binary_specs()}
+    assert set(bins) == {"flapc", "cranelift-compiler"}, sorted(bins)
     # flapc's call site has no FFI_OUTPUT_DIR, so it declares no header at all;
     # asking for one would fail the action (cargo never writes it).
     assert bins["flapc"]["ffi_headers"] == []
@@ -666,14 +700,21 @@ def test_every_build_rust_binary_crate_is_in_the_ring_with_its_header():
     # libwasm_cranelift's does, so the header is a DECLARED output -- Bazel
     # deletes what nothing declares -- and the bare-include flag comes from
     # SCANNING the tree for the directory-less spelling, not from a list.
-    assert bins["libwasm_cranelift"]["ffi_headers"] == ["CraneliftFFI.h"]
-    assert bins["libwasm_cranelift"]["ffi_bare_include"] is True
+    assert bins["cranelift-compiler"]["ffi_headers"] == ["CraneliftFFI.h"]
+    assert bins["cranelift-compiler"]["ffi_bare_include"] is True
 
     # And the same two, present in the checked-in ring and consumed by the root
-    # package. Pinned by count so a third call site cannot appear unnoticed.
+    # package. Pinned by count so a call site cannot appear unnoticed.
+    #
+    # FOUR at the real commit, not two: upstream added `generate-libjs-bytecode`
+    # (a SECOND --bin out of the flapc crate, which replaced the deleted Python
+    # bytecode generator) and `style-replay` (a --bin out of libweb_rust, which
+    # also builds a staticlib). Keyed by BIN rather than by crate for exactly that
+    # reason -- two of the four share a crate with another target, so a dict keyed
+    # by crate name silently drops one of each pair.
     ring = _read("cargo_ring.bzl")
     root = _read("BUILD.bazel")
-    assert ring.count("cargo_binary(") == 2, ring.count("cargo_binary(")
+    assert ring.count("cargo_binary(") == 4, ring.count("cargo_binary(")
     for b in bins.values():
         assert re.search(r"bin = ['\"]%s['\"]" % re.escape(b["bin"]), ring), b
         if not b["ffi_headers"]:
@@ -722,14 +763,115 @@ def test_the_libweb_package_exports_its_crate_sources():
     """
     libweb = _read("Libraries/LibWeb/BUILD.bazel")
     assert 'name = "rust_crate_srcs"' in libweb
-    for sub in ("Rust/**", "CSS/Rust/**", "Layout/Rust/**",
-                "ContentBlocker/Rust/**", "HTML/Parser/Rust/**"):
-        assert '"%s"' % sub in libweb, sub
-    # The CSS data files libweb_css_rust's build script GENERATES Rust from.
+    for sub in ("ContentBlocker/Rust/**", "HTML/Parser/Rust/**", "Rust/**"):
+        assert "'%s'" % sub in libweb, sub
+    # The CSS data files libweb_rust's build script GENERATES Rust from.
     for data in ("CSS/Properties.json", "CSS/Keywords.json", "CSS/Enums.json",
                  "HTML/TagNames.h", "HTML/Parser/Entities.json"):
-        assert '"%s"' % data in libweb, data
+        assert "'%s'" % data in libweb, data
     assert "//Libraries/LibWeb:rust_crate_srcs" in _read("cargo_ring.bzl")
+
+
+def test_no_allow_empty_false_glob_names_a_directory_that_is_written_down():
+    """The failure this repin existed to fix, as a test.
+
+    Ulf's build died at LOADING time with
+
+        Error in glob: glob pattern 'Libraries/LibJS/BytecodeDef/**' didn't match
+        anything, but allow_empty is set to False
+
+    because upstream a32d9c9f deleted that directory and the pattern was a
+    hardcoded string in the emitter. Two properties make this the worst shape of
+    stale constant in the repo:
+
+      * `allow_empty = False` is CORRECT and must stay. The alternative
+        (allow_empty = True) is what let three Build/full shim packages match
+        nothing for weeks and fail 1,600 actions later -- see
+        test_nothing_generated_still_reads_the_cmake_cargo_tree.
+      * A loading-time error has no target to blame, so nothing in the build graph
+        can report it and no per-target test can catch it. It is not "a crate
+        failed"; it is "the workspace does not load".
+
+    So the guard is structural: every directory an allow_empty=False glob names
+    must be DERIVED from the tree (Cargo.toml's members closed over `path =`
+    deps), and the assertion is that the emitter's own derivation is what appears
+    in the generated file -- with no directory-shaped pattern left over that the
+    derivation did not produce.
+    """
+    d = _fixture()
+    mod = _load(d)
+    # The fixture's Cargo.toml lists ONE member, whose manifest path-depends on
+    # the EXCLUDED flapc workspace; the closure therefore reaches outside the
+    # member list, which is how libjs_rust reaches flapc in the real tree.
+    assert mod.crate_dirs() == ["Libraries/LibWasm/Rust"], mod.crate_dirs()
+    assert mod.crate_src_globs() == mod.CRATE_SRC_ROOT_FILES + \
+        ["Libraries/LibWasm/Rust/**"]
+    # A crate inside another Bazel package does NOT become a root-package glob --
+    # it becomes a label, because glob() cannot cross a package boundary.
+    assert mod.crate_src_labels() == []
+    # Delete the crate and the pattern goes away rather than outliving it: THE
+    # property. Under the old hardcoded list the pattern survived the directory,
+    # and Bazel then refused to load the workspace at all.
+    import shutil
+    shutil.rmtree(os.path.join(d, "Libraries/LibWasm/Rust"))
+    assert mod.crate_dirs() == []
+    assert "Libraries/LibWasm/Rust/**" not in mod.crate_src_globs()
+
+    # And structurally, in the emitter source: no module-level constant may hold a
+    # directory-shaped glob pattern. That is the form the bug took -- a `<dir>/**`
+    # string in a list literal, which nothing re-derives and no build-graph test
+    # can reach, because the glob fails before any target exists.
+    for rel in ("Meta/emit_cargo_bazel.py", "Meta/emit_libweb_bazel.py"):
+        src = _read(rel)
+        # Strip docstrings/comments: the block comments here NAME the deleted
+        # directories on purpose, to record what broke.
+        code = "\n".join(l for l in src.splitlines()
+                          if not l.strip().startswith("#"))
+        code = re.sub(r'\'\'\'.*?\'\'\'', "", code, flags=re.S)
+        code = re.sub(r'""".*?"""', "", code, flags=re.S)
+        bad = [m.group(1) for m in re.finditer(r'"([A-Za-z][\w/.-]*/\*\*)"', code)]
+        bad += [m.group(1) for m in re.finditer(r"'([A-Za-z][\w/.-]*/\*\*)'", code)]
+        assert not bad, "%s hardcodes crate directories: %s" % (rel, bad)
+
+
+def test_the_target_dir_exclusion_is_anchored_to_each_crate_root():
+    """`**/target/**` is wrong, and it took down the build to prove it.
+
+    Excluding cargo's output directory is right -- it is never an input, and a
+    developer who ran cargo by hand in the tree would otherwise get it globbed
+    into every crate's action inputs. Spelling it `**/target/**` is not: flapc has
+    a Rust MODULE at `src/target/` (the code generator's per-architecture
+    backends), so the unanchored pattern silently dropped 40 source files and
+    `//:generate-libjs-bytecode` failed to compile with
+
+        error[E0583]: file not found for module `target`
+
+    A glob exclusion is a pattern over PATHS and knows nothing about what a
+    directory means. "The directory cargo writes to" is `<crate root>/target`, and
+    only the anchored form says that -- so this asserts every exclusion in the
+    generated files is rooted at a crate directory, not floating.
+    """
+    mod = _load()
+    dirs = ["Libraries/LibJS/Flap", "Libraries/LibGfx/Rust"]
+    assert mod.crate_src_glob_excludes(dirs) == [
+        "Libraries/LibJS/Flap/target/**", "Libraries/LibGfx/Rust/target/**"]
+    # Nothing in the tree may carry the unanchored form, in the emitters or in
+    # what they generated.
+    for rel in ("cargo_ring.bzl", "Libraries/LibWeb/BUILD.bazel",
+                "Meta/emit_cargo_bazel.py", "Meta/emit_libweb_bazel.py"):
+        txt = _read(rel)
+        code = "\n".join(l for l in txt.splitlines()
+                          if not l.strip().startswith("#"))
+        assert "**/target/**" not in code, \
+            "%s excludes target/ unanchored -- it eats src/target/" % rel
+    # Every exclusion that IS there is rooted at a directory the SAME file globs
+    # as a crate, so an exclusion cannot name a directory no crate owns.
+    for rel, in (("cargo_ring.bzl",), ("Libraries/LibWeb/BUILD.bazel",)):
+        txt = _read(rel)
+        globbed = set(re.findall(r"'([A-Za-z0-9_/.-]+)/\*\*'", txt))
+        for m in re.finditer(r"'([A-Za-z0-9_/.-]+)/target/\*\*'", txt):
+            assert m.group(1) in globbed, \
+                "%s excludes %s/target but globs no such crate" % (rel, m.group(1))
 
 
 def test_every_extension_created_repo_is_named_in_module_bazel():

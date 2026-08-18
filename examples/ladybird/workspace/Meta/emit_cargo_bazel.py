@@ -51,8 +51,8 @@ Three things here are load-bearing, and each was measured rather than reasoned:
     enumerate; Bazel deletes undeclared outputs. So the header list is the union
     of CMake's declaration and the observed set, and the observed set wins where
     they differ (see FFI_HEADERS_OBSERVED).
-  * **The registry/workspace split is the whole reason this is cheap.** 154 of
-    the 167 `[[package]]` entries have a checksum; the other 13 are the in-tree
+  * **The registry/workspace split is the whole reason this is cheap.** 155 of
+    the 166 `[[package]]` entries have a checksum; the other 11 are the in-tree
     workspace members, which have no checksum because they are *sources*. A
     crate with no checksum must never become a fetch rule (it would 404), and a
     registry crate that silently drops out is a build failure a long way from its
@@ -215,10 +215,18 @@ FFI_HEADERS_OBSERVED = {
     "libtextcodec_rust": ["RustFFI.h"],
     "liburl_rust": ["RustFFI.h"],
     "libunicode_rust": ["RustFFI.h"],
-    "libweb_rust": ["HTML/Parser/RustFFI.h", "HTMLTokenizerRustFFI.h"],
-    "libweb_layout_rust": ["Layout/TreeBuilderRustFFI.h"],
-    "libweb_css_rust": ["ComputedValuesRustFFI.h", "RustFFI.h",
-                        "SelectorRustFFI.h", "StyleValueRustFFI.h"],
+    # Upstream consolidated libweb_css_rust and libweb_layout_rust BACK into
+    # libweb_rust, so this one crate now writes what three used to -- eleven
+    # files of its own plus HTMLTokenizerRustFFI.h from its path-dependency
+    # libweb_html_tokenizer, which lands in the same FFI_OUTPUT_DIR. Two of them
+    # are .inc, not .h: an undeclared .inc is deleted by Bazel exactly like an
+    # undeclared header, and it is #included the same way.
+    "libweb_rust": ["ComputedValuesRustFFI.h", "HTML/Parser/RustFFI.h",
+                    "HTMLTokenizerRustFFI.h", "Layout/LayoutRustFFI.h",
+                    "Layout/TreeBuilderRustFFI.h", "RustFFI.h",
+                    "SelectorRustFFI.h", "StyleEngineBridgeGenerated.h",
+                    "StyleEngineBridgeGenerated.inc", "StyleEngineRustFFI.h",
+                    "StyleEngineStateFactsGenerated.inc", "StyleValueRustFFI.h"],
     "libweb_content_blocker_rust": ["ContentBlockerRustFFI.h"],
     # A BINARY crate that also emits a header -- see BINARY_CMAKELISTS below.
     "libwasm_cranelift": ["CraneliftFFI.h"],
@@ -237,8 +245,6 @@ FFI_PREFIX = {
     "liburl_rust": "LibURL",
     "libunicode_rust": "LibUnicode",
     "libweb_rust": "LibWeb",
-    "libweb_layout_rust": "LibWeb",
-    "libweb_css_rust": "LibWeb",
     "libweb_content_blocker_rust": "LibWeb",
     "libwasm_cranelift": "LibWasm",
 }
@@ -252,68 +258,223 @@ FFI_PREFIX = {
 # found most of these; the depfile finds all of them, including the ones reached
 # through a `manifest_dir.parent()` join.
 CRATE_EXTRA_INPUTS = {
-    "libjs_rust": ["Libraries/LibJS/Bytecode/Bytecode.def"],
+    # libjs_rust's build script derives its instruction types from the Flap
+    # interpreter (upstream a32d9c9f: `include_str!("../../Interpreter/
+    # interpreter.flap")` via flapc::metadata), so the .flap file is a compile
+    # input reached by a `manifest_dir.parent()` join -- exactly the shape the
+    # depfile finds and reading build.rs nearly misses. It replaced
+    # Libraries/LibJS/Bytecode/Bytecode.def, which that commit DELETED.
+    "libjs_rust": ["Libraries/LibJS/Interpreter/interpreter.flap"],
     # libwasm_cranelift's build.rs reads `manifest_dir.join("../Opcode.h")` and
     # generates a Rust constant per `M(name, value, ...)` line, so the WASM
-    # opcode table is a compile input to the cranelift compiler binary. Exactly
-    # the `manifest_dir.parent()` join the depfile finds and reading build.rs
-    # nearly misses.
+    # opcode table is a compile input to the cranelift compiler binary.
     "libwasm_cranelift": ["Libraries/LibWasm/Opcode.h"],
-    # The LibWeb ones (8 CSS data files for libweb_css_rust, TagNames.h +
-    # AttributeNames.h + Entities.json for libweb_rust) are NOT here: they are
-    # inside the Libraries/LibWeb package, so they ride in that package's
-    # rust_crate_srcs filegroup instead. Same measurement, different side of a
-    # package boundary.
+    # The LibWeb ones are NOT here: they are inside the Libraries/LibWeb package,
+    # so they ride in that package's rust_crate_srcs filegroup instead --
+    # PACKAGE_EXTRA_INPUTS below. Same measurement, different side of a package
+    # boundary.
+}
+
+# The same measurement for the files that live inside ANOTHER Bazel package, so
+# the root package cannot glob them: libweb_rust's build script generates Rust
+# from the CSS data files and reads the HTML name headers + Entities.json. Kept
+# here rather than in emit_libweb_bazel.py so ONE place holds the measurement and
+# ONE --report checks it against the reference build's depfiles.
+PACKAGE_EXTRA_INPUTS = {
+    "Libraries/LibWeb": [
+        "CSS/Enums.json",
+        "CSS/Keywords.json",
+        "CSS/LogicalPropertyGroups.json",
+        "CSS/Properties.json",
+        "CSS/PseudoClasses.json",
+        "CSS/PseudoElementPropertyGroups.txt",
+        "CSS/PseudoElements.json",
+        "CSS/TransformFunctions.json",
+        "CSS/Units.json",
+        "HTML/AttributeNames.h",
+        "HTML/Parser/Entities.json",
+        "HTML/TagNames.h",
+    ],
 }
 
 # The crate source trees. A crate depends on more than its own directory: every
 # one of them `#[path = "../../../RustAllocator.rs"]`s the shared allocator shim,
 # and several are path-dependencies of each other (libweb_rust ->
-# libweb_html_tokenizer, liburl_rust -> libregex_rust), which cargo resolves
-# through the workspace. So the source set is "all the in-tree crates plus the
-# shim", declared once. Over-declaring costs a rebuild of 11 crates when any .rs
-# changes; under-declaring silently reuses a stale archive. For a first landing
-# that trade is the right way round, and it is honest debt to name.
+# libweb_html_tokenizer, liburl_rust -> libregex_rust, libjs_rust -> flapc),
+# which cargo resolves through the workspace. So the source set is "all the
+# in-tree crates plus the shim", declared once. Over-declaring costs a rebuild of
+# every crate when any .rs changes; under-declaring silently reuses a stale
+# archive. For a first landing that trade is the right way round, and it is
+# honest debt to name (todo 6f39dd58).
 #
-# Split in two because BAZEL PACKAGES CUT ACROSS THE CARGO WORKSPACE: five of the
+# DERIVED from Cargo.toml's member list and the manifests' `path =`
+# dependencies, never written down -- because a directory written down here is a
+# glob that outlives the directory. Upstream a32d9c9f deleted
+# Libraries/LibJS/BytecodeDef/, which was a hardcoded `allow_empty = False` glob
+# pattern in this list, and the whole build then failed at LOADING time with
+# "glob pattern didn't match anything" -- before any target could report why.
+# Deriving the patterns means a deleted crate deletes its own pattern.
+#
+# Split in two because BAZEL PACKAGES CUT ACROSS THE CARGO WORKSPACE: some of the
 # crates live under Libraries/LibWeb, which is its own package, and glob() is
 # package-relative -- the root package cannot see them at all. So they arrive as
 # a filegroup label that LibWeb's own BUILD file defines
-# (//Libraries/LibWeb:rust_crate_srcs, emitted by emit_libweb_bazel.py). This is
-# the first place in this migration where the two systems' unit of grouping
-# genuinely disagree: cargo says "one workspace", Bazel says "two packages", and
-# a label is the only thing that crosses.
-CRATE_SRC_GLOBS = [
+# (//Libraries/LibWeb:rust_crate_srcs, emitted by emit_libweb_bazel.py from
+# package_crate_globs() HERE, so the two sides cannot disagree about which
+# directories exist). This is the first place in this migration where the two
+# systems' unit of grouping genuinely disagree: cargo says "one workspace", Bazel
+# says "two packages", and a label is the only thing that crosses.
+FOREIGN_PACKAGES = {"Libraries/LibWeb": "//Libraries/LibWeb:rust_crate_srcs"}
+
+# Files at the repo root that every crate needs: the two workspace files, the
+# toolchain pin and the shared allocator shim. Not a directory between them, so
+# nothing here can outlive a crate.
+CRATE_SRC_ROOT_FILES = [
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
     "Libraries/RustAllocator.rs",
-    "Libraries/*/Rust/**",
-    "Libraries/LibJS/BytecodeDef/**",
 ]
 
-CRATE_SRC_LABELS = ["//Libraries/LibWeb:rust_crate_srcs"]
+# `target/` is cargo's own output dir: never an input, and a developer who has run
+# cargo by hand in the tree would otherwise have it globbed into every crate's
+# action inputs (the reference build sets CARGO_TARGET_DIR into the build dir, so
+# it does not exist here -- but that is a property of how we invoke cargo, not of
+# the tree).
+#
+# ANCHORED to each crate root, NOT `**/target/**`. The unanchored form is wrong
+# and fails loudly, which is the only good thing about it: flapc has a Rust MODULE
+# at `src/target/` (the code generator's per-architecture backends), so
+# `**/target/**` dropped 40 source files and the build died with
+# `error[E0583]: file not found for module 'target'`. A glob exclusion is a
+# pattern over paths and knows nothing about what a directory MEANS; "the dir
+# cargo writes to" is `<crate root>/target`, and only the anchored form says that.
+def crate_src_glob_excludes(dirs):
+    return [d + "/target/**" for d in dirs]
 
-# flapc's own workspace: excluded from the root one, its own lock, 3 packages.
-FLAPC_SRC_GLOBS = [
-    "Libraries/LibJS/Flap/Cargo.toml",
-    "Libraries/LibJS/Flap/Cargo.lock",
-    "Libraries/LibJS/Flap/src/**",
-    # benches/ and tests/ are not built by `cargo rustc --bin flapc`, but they
-    # ARE manifest inputs: Cargo.toml declares `[[bench]] name = "compiler"`, and
-    # cargo validates every declared target while PARSING the manifest, before it
-    # decides what to build ("can't find `compiler` bench at
-    # benches/compiler.rs"). The bench also include_str!s
-    # tests/interpreter-layout.conf. So the manifest's target list is part of the
-    # input set whether or not those targets are compiled -- a distinction CMake
-    # never makes, and one only a sandbox reveals.
-    "Libraries/LibJS/Flap/benches/**",
-    "Libraries/LibJS/Flap/tests/**",
-    "Libraries/LibJS/BytecodeDef/**",
-    "Libraries/LibJS/Bytecode/Bytecode.def",
-    "Libraries/LibJS/Interpreter/interpreter.flap",
-    "rust-toolchain.toml",
-]
+
+def _manifest_path_deps(manifest_rel):
+    """The `path = "..."` dependency dirs declared by one manifest, ROOT-relative.
+
+    Read from the manifest rather than from the workspace member list, because a
+    path dependency can point OUTSIDE the workspace: libjs_rust build-depends on
+    `flapc = { path = "../Flap" }`, and Libraries/LibJS/Flap is `exclude`d from
+    the root workspace. Miss it and touching a flapc source does not rebuild the
+    crate whose instruction types are derived from it.
+    """
+    path = os.path.join(ROOT, manifest_rel)
+    if not os.path.exists(path):
+        return []
+    d = os.path.dirname(manifest_rel)
+    out = []
+    for m in re.finditer(r'path\s*=\s*"([^"]+)"', open(path).read()):
+        p = os.path.normpath(os.path.join(d, m.group(1)))
+        if os.path.isdir(os.path.join(ROOT, p)):
+            out.append(p)
+    return out
+
+
+def crate_dirs():
+    """Every in-tree crate DIRECTORY the root workspace resolves, ROOT-relative.
+
+    Starts from Cargo.toml's `members` and closes over `path =` dependencies, so
+    a crate that is added, moved or deleted upstream needs no edit here.
+    """
+    seen = set()
+    queue = sorted(root_workspace_members())
+    while queue:
+        d = queue.pop()
+        if d in seen or not os.path.isdir(os.path.join(ROOT, d)):
+            continue
+        seen.add(d)
+        queue += _manifest_path_deps(os.path.join(d, "Cargo.toml"))
+    return sorted(seen)
+
+
+def _in_foreign_package(d):
+    for pkg in FOREIGN_PACKAGES:
+        if d == pkg or d.startswith(pkg + "/"):
+            return pkg
+    return None
+
+
+def crate_src_globs():
+    """The ROOT package's glob patterns for the shared crate source set."""
+    return CRATE_SRC_ROOT_FILES + [
+        d + "/**" for d in crate_dirs() if not _in_foreign_package(d)]
+
+
+def crate_src_labels():
+    """One filegroup label per foreign package that actually holds a crate."""
+    return sorted({FOREIGN_PACKAGES[p] for p in
+                   (_in_foreign_package(d) for d in crate_dirs()) if p})
+
+
+def package_crate_globs(pkg):
+    """The crate globs for a foreign package, PACKAGE-relative.
+
+    Called by emit_libweb_bazel.py, so the filegroup on that side of the boundary
+    and the glob on this side are derived from one list.
+    """
+    return sorted(os.path.relpath(d, pkg) + "/**"
+                  for d in crate_dirs() if _in_foreign_package(d) == pkg)
+
+
+def _excluded_dirs():
+    """The workspaces Cargo.toml `exclude`s, which resolve their own locks."""
+    ws = _toml(os.path.join(ROOT, "Cargo.toml"))["workspace"]
+    return [os.path.normpath(d) for d in ws.get("exclude", [])
+            if os.path.isdir(os.path.join(ROOT, d))]
+
+
+def flapc_src_globs():
+    """The `exclude`d flapc workspace: its own subtree, plus what it reads out of
+    the tree above it.
+
+    One `<dir>/**` rather than a pattern per subdirectory, because the manifest's
+    TARGET list is part of the input set whether or not those targets are built:
+    Cargo.toml declares `[[bench]] name = "compiler"`, and cargo validates every
+    declared target while PARSING the manifest, before it decides what to build
+    ("can't find `compiler` bench at benches/compiler.rs"). That bench also
+    include_str!s tests/interpreter-layout.conf. A distinction CMake never makes,
+    and one only a sandbox reveals -- and a whole-subtree glob cannot lose a
+    subdirectory the way an enumerated list of them can.
+    """
+    dirs = _excluded_dirs()
+    extra = ["rust-toolchain.toml"]
+    for d in dirs:
+        # src/metadata.rs include_str!s the interpreter definition from two
+        # directories up: flapc DERIVES the bytecode from it (upstream a32d9c9f),
+        # so it is an input, and it lives outside the excluded subtree.
+        extra += [x for x in _include_str_paths(d) if not x.startswith(d + "/")]
+    return sorted(d + "/**" for d in dirs) + sorted(set(extra))
+
+
+def _include_str_paths(d):
+    """ROOT-relative paths a crate subtree include_str!s, derived by scanning it.
+
+    Derived rather than listed for the same reason as everything else here: the
+    one file flapc reads from outside its own subtree changed name and location
+    in the commit this repin follows.
+    """
+    out = set()
+    pat = re.compile(r'include_str!\s*\(\s*"([^"]+)"')
+    for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, d)):
+        dirnames[:] = [x for x in dirnames if x != "target"]
+        for fn in filenames:
+            if not fn.endswith(".rs"):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                text = open(full, errors="replace").read()
+            except OSError:
+                continue
+            for m in pat.finditer(text):
+                p = os.path.normpath(os.path.join(
+                    os.path.relpath(dirpath, ROOT), m.group(1)))
+                if os.path.exists(os.path.join(ROOT, p)):
+                    out.add(p)
+    return sorted(out)
 
 # Where each crate's Cargo.toml lives, relative to the source root. Parsed from
 # the import_rust_crate() call site: MANIFEST_PATH is relative to the CMakeLists
@@ -389,7 +550,10 @@ def parse_cmake_crates():
         # var -> features, for the `if (NOT BUILD_SHARED_LIBS)` idiom above.
         vars_ = {}
         for m in re.finditer(
-                r"set\(\s*(\w+)\s+FEATURES\s+([\w\s]+?)\s*\)", text):
+                # `-` is legal in a cargo feature name (`style-recording`), so it
+                # has to be in the character class -- a class that excludes it
+                # truncates the feature rather than failing to match it.
+                r"set\(\s*(\w+)\s+FEATURES\s+([\w\s-]+?)\s*\)", text):
             vars_[m.group(1)] = m.group(2).split()
         for block in RE_IMPORT.findall(text):
             crate = _arg(block, "CRATE_NAME")
@@ -438,6 +602,13 @@ def parse_cmake_binaries():
         (`#include <CraneliftFFI.h>`), because CMake's FFI_OUTPUT_DIR is
         LibWasm's own binary dir.
 
+    Everything else it shares with import_rust_crate, FEATURES included, and that
+    is parsed here for the same reason: upstream's `style-replay` binary is built
+    `FEATURES style-recording` out of the same crate as libweb_rust's staticlib.
+    A parser that only read FEATURES on the staticlib side would build a
+    different binary than CMake does and say nothing -- the finding-23 shape,
+    where the two build systems agree on the target list and disagree on the ABI.
+
     So a binary crate needs both halves: a cargo_binary for the executable, and
     the same declared-header treatment the staticlib crates get. The two are
     reported separately for the same reason import_rust_crate's list is parsed
@@ -452,6 +623,12 @@ def parse_cmake_binaries():
         with open(path) as f:
             text = f.read()
         pkgdir = os.path.dirname(rel)
+        # The same `if (NOT BUILD_SHARED_LIBS)` variable form the staticlib side
+        # resolves -- see parse_cmake_crates() for why that branch is the one the
+        # Bazel overlay mirrors.
+        vars_ = {}
+        for m in re.finditer(r"set\(\s*(\w+)\s+FEATURES\s+([\w\s-]+?)\s*\)", text):
+            vars_[m.group(1)] = m.group(2).split()
         for block in RE_BINARY.findall(text):
             crate = _arg(block, "CRATE_NAME")
             manifest = _arg(block, "MANIFEST_PATH")
@@ -464,11 +641,15 @@ def parse_cmake_binaries():
             # build_rust_binary has no FFI_HEADERS argument at all, so CMake
             # declares nothing and there is nothing to compare against.
             emits_ffi = _arg(block, "FFI_OUTPUT_DIR") is not None
+            features = _multi(block, "FEATURES", _KEYS)
+            for m in re.finditer(r"\$\{(\w+)\}", block):
+                features += vars_.get(m.group(1), [])
             out.append({
                 "crate": crate,
                 "bin": binary,
                 "manifest": os.path.normpath(os.path.join(pkgdir, manifest)),
                 "output_name": _arg(block, "OUTPUT_NAME") or binary,
+                "features": sorted(set(features)),
                 "emits_ffi": emits_ffi,
             })
     return sorted(out, key=lambda c: c["crate"])
@@ -735,12 +916,19 @@ def emit_ring(crates, specs, binaries):
     print("    # cargo WORKSPACE. Each of them path-depends on")
     print("    # Libraries/RustAllocator.rs and several are path-dependencies of each")
     print("    # other, so cargo resolves the whole workspace whichever crate you ask")
-    print("    # for. Over-declaring costs a rebuild of 11 crates when any .rs changes;")
-    print("    # under-declaring silently reuses a stale archive. The trade is the right")
-    print("    # way round, and it is real debt: per-crate source sets need the")
-    print("    # path-dependency graph read out of the manifests.")
-    print("    crate_srcs = native.glob(%r, allow_empty = False) + %r"
-          % (CRATE_SRC_GLOBS, CRATE_SRC_LABELS))
+    print("    # for. Over-declaring costs a rebuild of every crate when any .rs")
+    print("    # changes; under-declaring silently reuses a stale archive. The trade is")
+    print("    # the right way round, and it is real debt: per-crate source sets need")
+    print("    # the path-dependency graph read out of the manifests.")
+    print("    #")
+    print("    # The patterns are DERIVED from Cargo.toml's member list closed over the")
+    print("    # manifests' `path =` deps, not written down: a directory written down")
+    print("    # here is an allow_empty=False glob that outlives the directory, and")
+    print("    # loading then fails before any target can say why.")
+    root_dirs = [d for d in crate_dirs() if not _in_foreign_package(d)]
+    print("    crate_srcs = native.glob(%r, exclude = %r, allow_empty = False) + %r"
+          % (crate_src_globs(), crate_src_glob_excludes(root_dirs),
+             crate_src_labels()))
     for s in specs:
         extra = CRATE_EXTRA_INPUTS.get(s["crate"], [])
         srcs = "crate_srcs"
@@ -815,6 +1003,11 @@ def emit_ring(crates, specs, binaries):
         print("        crate = %r," % b["crate"])
         print("        crates = CARGO_CRATE_FILES,")
         print("        manifest = %r," % b["manifest"])
+        if b["features"]:
+            print("        # build_rust_binary() takes FEATURES too, and this one does:")
+            print("        # the same crate builds a staticlib and this binary, and only")
+            print("        # the features distinguish what each gets.")
+            print("        crate_features = %r," % b["features"])
         if b["ffi_headers"]:
             print("        # This binary crate's build script runs cbindgen too, so the")
             print("        # header is a DECLARED output -- Bazel deletes what nothing")
@@ -833,8 +1026,11 @@ def emit_ring(crates, specs, binaries):
             print("        srcs = %s," % srcs)
         else:
             print("        # Its OWN workspace (`exclude`d from the root one), so its source")
-            print("        # set is its own subtree.")
-            print("        srcs = native.glob(%r, allow_empty = False)," % FLAPC_SRC_GLOBS)
+            print("        # set is its own subtree plus what it include_str!s from above")
+            print("        # it -- both derived, the subtree from Cargo.toml's `exclude`")
+            print("        # and the rest by scanning for include_str!.")
+            print("        srcs = native.glob(%r, exclude = %r, allow_empty = False),"
+                  % (flapc_src_globs(), crate_src_glob_excludes(_excluded_dirs())))
         print("        sysroot = \":rust_sysroot\",")
         print("    )")
         if b["ffi_headers"]:

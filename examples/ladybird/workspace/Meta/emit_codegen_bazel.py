@@ -11,7 +11,13 @@ Usage: emit_codegen_bazel.py <LibDir e.g. Libraries/LibWeb>  > codegen.bzl
 import re, os, sys, shlex
 
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FULL = ROOT + "/Build/full"
+# The reference CMake build tree the emitter reads. An env var, not a
+# hardcoded "Build/full": a repin needs a SECOND reference build side by side
+# with the old one (you cannot delete the tree you are still diffing against),
+# and CMake bakes the build dir's absolute path into build.ninja -- so
+# "just rename the directory afterwards" corrupts it. Found by doing exactly
+# that during the 71fb301a repin.
+FULL = os.environ.get("LADYBIRD_BUILD_DIR") or (ROOT + "/Build/full")
 
 def parse(lib_build_dir):
     txt = open(FULL + "/build.ninja").read()

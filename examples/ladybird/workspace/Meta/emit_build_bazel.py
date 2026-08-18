@@ -14,7 +14,14 @@ import json, os, sys, re
 from collections import defaultdict
 
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = os.path.join(ROOT, "model.cmake.full.json")
+MODEL = os.environ.get("LADYBIRD_MODEL") or os.path.join(ROOT, "model.cmake.full.json")
+# The reference build tree, RELATIVE to the checkout: the model records source
+# and include paths relative to the repo root, so every "is this a generated
+# file?" test is a string prefix on this. An env var rather than a literal
+# "Build/full" because a repin needs the new reference build to coexist with the
+# old one, and CMake bakes the build dir into build.ninja -- so renaming the
+# directory after the fact is not an option (learned the hard way at 71fb301a).
+BUILD_REL = (os.environ.get("LADYBIRD_BUILD_REL") or "Build/full").strip("/") + "/"
 VCPKG = "//Meta/vcpkg"
 # Ring 2 part 3: the Rust crates are BUILT BY BAZEL now (cargo_ring.bzl in this
 # same package), so the labels are local -- nothing points into Build/full/cargo.
@@ -246,9 +253,9 @@ def target_private_includes(t):
     emitted build look like it needed Build/full when it did not.
     """
     globalroots = {ROOT, ROOT+"/Libraries", ROOT+"/Services",
-                   ROOT+"/Build/full", ROOT+"/Build/full/Libraries",
-                   ROOT+"/Build/full/Services",
-                   ROOT+"/Build/full/vcpkg_installed/x64-linux-dynamic/include"}
+                   ROOT+"/"+BUILD_REL.rstrip("/"), ROOT+"/"+BUILD_REL+"Libraries",
+                   ROOT+"/"+BUILD_REL+"Services",
+                   ROOT+"/"+BUILD_REL+"vcpkg_installed/x64-linux-dynamic/include"}
     incs = []
     for a in t["actions"]:
         if a["mnemonic"] != "CppCompile": continue
@@ -405,21 +412,21 @@ GENERATED_BY_BAZEL = bazel_generated_root_srcs()
 def _emit_srcs(srcs):
     print("    srcs = [")
     for s in srcs:
-        rel = s[len("Build/full/"):] if s.startswith("Build/full/") else None
+        rel = s[len(BUILD_REL):] if s.startswith(BUILD_REL) else None
         if rel is not None and rel in GENERATED_BY_BAZEL:
             # Bazel generates this file; consume its genrule output.
             print(f"        {':' + rel!r},")
-        elif s.startswith("Build/full/Libraries/LibWeb/"):
-            lab = "//Libraries/LibWeb:" + s[len("Build/full/Libraries/LibWeb/"):]
+        elif s.startswith(BUILD_REL + "Libraries/LibWeb/"):
+            lab = "//Libraries/LibWeb:" + s[len(BUILD_REL + "Libraries/LibWeb/"):]
             print(f"        {lab!r},")
-        elif s.startswith("Build/full/Libraries/"):
-            lab = "//Build/full/Libraries:" + s[len("Build/full/Libraries/"):]
+        elif s.startswith(BUILD_REL + "Libraries/"):
+            lab = "//Build/full/Libraries:" + s[len(BUILD_REL + "Libraries/"):]
             print(f"        {lab!r},")
-        elif s.startswith("Build/full/Services/"):
-            lab = "//Build/full/Services:" + s[len("Build/full/Services/"):]
+        elif s.startswith(BUILD_REL + "Services/"):
+            lab = "//Build/full/Services:" + s[len(BUILD_REL + "Services/"):]
             print(f"        {lab!r},")
-        elif s.startswith("Build/full/UI/"):
-            lab = "//Build/full/UI:" + s[len("Build/full/UI/"):]
+        elif s.startswith(BUILD_REL + "UI/"):
+            lab = "//Build/full/UI:" + s[len(BUILD_REL + "UI/"):]
             print(f"        {lab!r},")
         else:
             print(f"        {s!r},")
@@ -791,7 +798,7 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
                 # with -isystem. They live as global -isystem in .bazelrc
                 # (mirroring CMake's find_package include dirs).
                 continue
-            if i.startswith("Build/full/Libraries/"):
+            if i.startswith(BUILD_REL + "Libraries/"):
                 # CMake's per-library FFI dir (FFI_OUTPUT_DIR defaults to the
                 # library's own binary dir), which is where its crate's
                 # RustFFI.h lands. Pointing this at the CMake tree is what kept
@@ -809,7 +816,7 @@ def emit_target(name, targets, libs, exes, so, ar, header=True, body_only=False,
                 # <skia/...> without depending on skia now fails to compile,
                 # which is the whole point of declaring inputs.
                 pass
-            elif i in ("Build/full/UI", "Build/full/UI/Qt"):
+            elif i in (BUILD_REL.rstrip("/") + "/UI", BUILD_REL.rstrip("/") + "/UI/Qt"):
                 # CMake's UI gendir, whose only non-autogen contents are the two
                 # SPIR-V shader headers (WebContentViewLinux{Frag,Vert}Shader.h).
                 # Bazel generates both itself and carries them on

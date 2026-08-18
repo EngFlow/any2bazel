@@ -16,9 +16,12 @@ is reproducible rather than a hand-spliced copy of this block.
 import json, os, re, sys
 
 ROOT = os.environ.get("LADYBIRD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = os.path.join(ROOT, "model.cmake.full.json")
+MODEL = os.environ.get("LADYBIRD_MODEL") or os.path.join(ROOT, "model.cmake.full.json")
 PKG_PREFIX = "Libraries/LibWeb/"
-GEN_PREFIX = "Build/full/Libraries/LibWeb/"
+# see emit_build_bazel.BUILD_REL: the reference build dir is an env var, because a
+# repin needs two reference trees side by side and build.ninja cannot be moved.
+BUILD_REL = (os.environ.get("LADYBIRD_BUILD_REL") or "Build/full").strip("/") + "/"
+GEN_PREFIX = BUILD_REL + "Libraries/LibWeb/"
 VCPKG = "//Meta/vcpkg"
 # See emit_build_bazel.py: the crates are Bazel-built now, and each crate is ONE
 # target (//:<crate>_lib) carrying its own archive and its own generated FFI
@@ -30,6 +33,14 @@ VCPKG = "//Meta/vcpkg"
 # because "none today" is a measurement, not an invariant).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from emit_build_bazel import rust_dep_labels
+# The crate directories inside THIS package, and the non-Rust build-script inputs
+# that live here, both derived by emit_cargo_bazel from Cargo.toml and the
+# reference build's depfiles. Imported rather than restated for one concrete
+# reason: this filegroup used to hardcode `CSS/Rust/**` and `Layout/Rust/**` with
+# allow_empty = False, upstream consolidated both crates into LibWeb/Rust, and the
+# glob then matched nothing -- which is a LOADING-time failure, so no target could
+# report it. The root package's glob over the same crates is one list; so is this.
+import emit_cargo_bazel
 
 GLOBAL_DEFINES = {
     "USE_VULKAN=1", "ENABLE_COMPILETIME_FORMAT_CHECK", "USE_FONTCONFIG=1",
@@ -45,7 +56,20 @@ SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan"}
 # emit_build_bazel.py's ALWAYSLINK_LIBS.
 ALWAYSLINK = True
 
-PRELUDE = '''load("@rules_cc//cc:defs.bzl", "cc_library")
+
+def prelude():
+    """The head of the BUILD file: loads, package(), codegen macros, filegroup.
+
+    A function rather than a constant because the rust_crate_srcs glob is
+    DERIVED (see the emit_cargo_bazel import above), and a constant is exactly
+    what let it name two directories that upstream had deleted.
+    """
+    pkg = PKG_PREFIX.rstrip("/")
+    globs = emit_cargo_bazel.package_crate_globs(pkg)
+    excludes = emit_cargo_bazel.crate_src_glob_excludes(
+        [g[:-len("/**")] for g in globs])
+    extra = emit_cargo_bazel.PACKAGE_EXTRA_INPUTS.get(pkg, [])
+    return '''load("@rules_cc//cc:defs.bzl", "cc_library")
 load(":codegen.bzl", "libweb_codegen", "libweb_bindings_codegen")
 load(":generated_srcs.bzl", "LIBWEB_GENERATED_SRCS", "LIBWEB_GENERATED_HDRS")
 load(":export_header.bzl", "libweb_export_header")
@@ -63,41 +87,32 @@ libweb_export_header()
 libweb_codegen()
 libweb_bindings_codegen()
 
-# The four Rust crates that live INSIDE this package (LibWeb/Rust,
-# LibWeb/CSS/Rust, LibWeb/Layout/Rust, LibWeb/ContentBlocker/Rust, plus
-# HTML/Parser/Rust), exposed so the root package's cargo_ring() can declare them
-# as cargo inputs. They are one cargo WORKSPACE with the crates at the repo root,
-# but Bazel packages cut across it: glob() is package-relative, so the root
-# package cannot see files under Libraries/LibWeb/ at all. Hence a filegroup on
-# this side of the boundary rather than a glob on that side -- the alternative
-# (making the root package own these files) would mean deleting this package.
+# The Rust crates that live INSIDE this package, exposed so the root package's
+# cargo_ring() can declare them as cargo inputs. They are one cargo WORKSPACE
+# with the crates at the repo root, but Bazel packages cut across it: glob() is
+# package-relative, so the root package cannot see files under Libraries/LibWeb/
+# at all. Hence a filegroup on this side of the boundary rather than a glob on
+# that side -- the alternative (making the root package own these files) would
+# mean deleting this package.
+#
+# The patterns are DERIVED from Cargo.toml (Meta/emit_cargo_bazel.py's
+# crate_dirs(), the same list the root package globs), not written down. They
+# used to be written down, and that broke the whole build: upstream consolidated
+# libweb_css_rust and libweb_layout_rust into libweb_rust, so `CSS/Rust/**` and
+# `Layout/Rust/**` matched nothing, and an allow_empty = False glob that matches
+# nothing fails at LOADING time -- before any target exists to blame.
 filegroup(
     name = "rust_crate_srcs",
-    srcs = glob([
-        "Rust/**",
-        "CSS/Rust/**",
-        "Layout/Rust/**",
-        "ContentBlocker/Rust/**",
-        "HTML/Parser/Rust/**",
-    ], allow_empty = False) + [
-        # Non-Rust build-script inputs that live here too: libweb_css_rust's
-        # build.rs GENERATES Rust from these CSS data files, and libweb_rust's
-        # reads the HTML name headers + Entities.json. Taken from the reference
-        # build's cargo depfiles, so the list is measured rather than predicted.
-        "CSS/Enums.json",
-        "CSS/Keywords.json",
-        "CSS/LogicalPropertyGroups.json",
-        "CSS/Properties.json",
-        "CSS/PseudoClasses.json",
-        "CSS/PseudoElementPropertyGroups.txt",
-        "CSS/PseudoElements.json",
-        "CSS/Units.json",
-        "HTML/AttributeNames.h",
-        "HTML/Parser/Entities.json",
-        "HTML/TagNames.h",
+    srcs = glob(%r, exclude = %r, allow_empty = False) + [
+        # Non-Rust build-script inputs that live here too: libweb_rust's build.rs
+        # GENERATES Rust from the CSS data files and reads the HTML name headers +
+        # Entities.json. Taken from the reference build's cargo depfiles, so the
+        # list is measured rather than predicted.
+%s
     ],
 )
-'''
+''' % (globs, excludes,
+        "\n".join("        %r," % x for x in extra))
 
 
 def global_flags():
@@ -160,9 +175,9 @@ def target_flags(t):
 
 def target_private_includes(t):
     globalroots = {ROOT, ROOT + "/Libraries", ROOT + "/Services",
-                   ROOT + "/Build/full", ROOT + "/Build/full/Libraries",
-                   ROOT + "/Build/full/Services",
-                   ROOT + "/Build/full/vcpkg_installed/x64-linux-dynamic/include"}
+                   ROOT + "/" + BUILD_REL.rstrip("/"), ROOT + "/" + BUILD_REL + "Libraries",
+                   ROOT + "/" + BUILD_REL + "Services",
+                   ROOT + "/" + BUILD_REL + "vcpkg_installed/x64-linux-dynamic/include"}
     incs = []
     for a in t["actions"]:
         if a["mnemonic"] != "CppCompile":
@@ -260,7 +275,7 @@ def main():
             copt_toks.append("-I" + i)
 
     deps.append("//:all_source_headers")
-    out = [PRELUDE]
+    out = [prelude()]
     out.append(f"# === LibWeb ({t['kind']}, {len(all_srcs)} TU: "
                f"{len(checked_in)} checked-in + {len(all_srcs)-len(checked_in)} generated) ===")
     if unknown:
