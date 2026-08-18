@@ -335,3 +335,37 @@ def test_every_file_claiming_to_be_generated_names_a_command_that_makes_it():
         # no branch writing generated_srcs.bzl at all.
         assert re.search(r'\b(print|sys\.stdout\.write|\.write\()', src), \
             "%s names %s, which writes no output" % (rel, script)
+
+
+def test_the_global_facts_are_imported_from_one_place_not_restated():
+    """Two copies of one global fact, and they had already diverged.
+
+    GLOBAL_DEFINES and SYSTEM_LIBS describe the BUILD, not a target: a define is
+    global because .bazelrc sets it for every TU, and a lib is a "system lib"
+    because no vcpkg port supplies it. Both emitters carried their own copy, and
+    by the time this was noticed they disagreed -- the 71fb301a repin added
+    glib/gio/gobject/xkbcommon to emit_build_bazel's SYSTEM_LIBS (upstream's new
+    pkg_check_modules(GIO) in UI/Qt) and this file's copy still had the old four.
+
+    Latent, because LibWeb happens not to depend on glib. The failure it was
+    holding is an UNKNOWN dep -- i.e. a dropped link input -- and "happens not
+    to" is exactly the kind of claim this whole session was spent disproving. So
+    the second copy is an import, and this asserts it stays one.
+    """
+    src = _read("Meta/emit_libweb_bazel.py")
+    for name in ("GLOBAL_DEFINES", "SYSTEM_LIBS"):
+        m = re.search(r"^%s = (.*)$" % name, src, re.M)
+        assert m, name
+        assert m.group(1).startswith("emit_build_bazel."), \
+            "%s is restated in emit_libweb_bazel instead of imported: %s" % (
+                name, m.group(1))
+    # And they really are the same objects at run time, not just textually.
+    mod, _ = _emit()
+    import sys
+    ebb = sys.modules["emit_build_bazel"]
+    assert mod.SYSTEM_LIBS is ebb.SYSTEM_LIBS
+    assert mod.GLOBAL_DEFINES is ebb.GLOBAL_DEFINES
+    # The union has to contain what the repin added, or the import is pointing at
+    # a copy that is itself stale.
+    for lib in ("gio-2.0", "gobject-2.0", "glib-2.0", "xkbcommon"):
+        assert lib in mod.SYSTEM_LIBS, lib

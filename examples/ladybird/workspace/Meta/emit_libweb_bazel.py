@@ -32,6 +32,7 @@ VCPKG = "//Meta/vcpkg"
 # about which crates those are (none of LibWeb's four today; the mechanism is here
 # because "none today" is a measurement, not an invariant).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import emit_build_bazel
 from emit_build_bazel import rust_dep_labels
 # The crate directories inside THIS package, and the non-Rust build-script inputs
 # that live here, both derived by emit_cargo_bazel from Cargo.toml and the
@@ -42,12 +43,17 @@ from emit_build_bazel import rust_dep_labels
 # report it. The root package's glob over the same crates is one list; so is this.
 import emit_cargo_bazel
 
-GLOBAL_DEFINES = {
-    "USE_VULKAN=1", "ENABLE_COMPILETIME_FORMAT_CHECK", "USE_FONTCONFIG=1",
-    "_FORTIFY_SOURCE=3", "USE_VULKAN_DMABUF_IMAGES=1", "_FILE_OFFSET_BITS=64",
-    "NDEBUG",
-}
-SYSTEM_LIBS = {"dl", "m", "pthread", "vulkan"}
+# IMPORTED, not restated. Both of these describe the BUILD, not this target: a
+# define is global because .bazelrc sets it for every TU, and a lib is a "system
+# lib" because no vcpkg port provides it. Two copies of one global fact is the
+# shape that broke this repin four times over -- and these two had ALREADY
+# diverged: the 71fb301a repin added glib/gio/gobject/xkbcommon to
+# emit_build_bazel's SYSTEM_LIBS (upstream's new pkg_check_modules(GIO)) and this
+# copy kept the old four. Harmless only because LibWeb happens not to depend on
+# glib; "happens not to" is not a property worth relying on, and the failure it
+# would produce is an UNKNOWN dep that silently drops a link input.
+GLOBAL_DEFINES = emit_build_bazel.GLOBAL_DEFINES
+SYSTEM_LIBS = emit_build_bazel.SYSTEM_LIBS
 
 # LibWeb exports extern "C" FFI that the prebuilt Rust archive consumes and also
 # consumes it back (a static-archive <-> static-archive cycle GNU ld cannot
