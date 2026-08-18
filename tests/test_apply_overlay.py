@@ -182,7 +182,7 @@ def test_effect_grep_files_exist_for_patches_upstream_may_fix_itself():
     """
     text = _text()
     assert ".effect-grep" in text, "verify must fall back to an effect check"
-    fd_leak = PATCHES / "0003-librequests-tear-down-request-when-body-is-delivered.patch"
+    fd_leak = PATCHES / "0001-librequests-tear-down-request-when-body-is-delivered.patch"
     assert fd_leak.exists()
     effect = fd_leak.with_suffix(".effect-grep")
     assert effect.exists(), \
@@ -201,7 +201,7 @@ def test_effect_grep_is_windowed_not_a_whole_file_grep():
     being too strict. The check therefore anchors on the branch condition and
     requires the call within a window of following lines.
     """
-    effect = (PATCHES / "0003-librequests-tear-down-request-when-body-is-delivered.effect-grep")
+    effect = (PATCHES / "0001-librequests-tear-down-request-when-body-is-delivered.effect-grep")
     lines = [ln for ln in effect.read_text().splitlines()
              if ln.strip() and not ln.startswith("#")]
     assert any(ln.startswith("@window ") for ln in lines), \
@@ -261,7 +261,7 @@ def test_the_documented_overlay_file_count_matches_the_overlay():
 def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete():
     """The second half of the fd leak: the fd outlives the callbacks.
 
-    0003 drops the callbacks on completion, which unpins the GC cycle -- and on my
+    0001 drops the callbacks on completion, which unpins the GC cycle -- and on my
     machine that took 143 leaked sockets to 0. On Ulf's tree it did not: he measured
     97 sockets/min STILL leaking with the upstream-equivalent teardown applied,
     every one peer=DEAD (RequestServer had already closed its end) and every one
@@ -270,17 +270,17 @@ def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete()
     The reason is ownership: the response fd is released only by ~Request (or by the
     ReadStream inside m_internal_stream_data), so ANY surviving reference to the
     Request keeps one fd per completed request alive -- dropping the callbacks is
-    not the same as closing the fd. 0004 closes it explicitly at the point the code
+    not the same as closing the fd. 0002 closes it explicitly at the point the code
     has already proven the body is complete.
 
     Measured A/B, same binary, same 200-completed-request workload:
       clean: 208 sockets, 203 peer=DEAD
       fixed:   6 sockets,   0 peer=DEAD
     """
-    patch = PATCHES / "0004-requests-release-response-fd-on-completion.patch"
+    patch = PATCHES / "0002-requests-release-response-fd-on-completion.patch"
     assert patch.exists()
     text = patch.read_text()
-    # 0004 is the NEXT PATCH IN THE SERIES, not an alternative to 0003: it is
+    # 0002 is the NEXT PATCH IN THE SERIES, not an alternative to 0001: it is
     # generated on top of it and applies only after it. I first shipped a second
     # "clean tree" variant for trees without the teardown fix, which cannot work --
     # apply_overlay.sh globs patches/*.patch and applies them all, so one of the two
@@ -290,7 +290,7 @@ def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete()
     assert not list(PATCHES.glob("*clean-tree*")), \
         "an alternative in patches/*.patch cannot coexist with the glob that applies all"
     assert "ON TOP OF the teardown fix" in text, \
-        "0004 must state that it builds on 0003 rather than replacing it"
+        "0002 must state that it builds on 0001 rather than replacing it"
     # the notifier must be deregistered before the fd is closed, or the event loop
     # is left polling a closed descriptor
     body = text[text.index("release_response_fd"):]
@@ -315,8 +315,8 @@ def test_the_patch_series_applies_as_a_series():
     """patches/*.patch must apply IN GLOB ORDER, each on top of the last.
 
     apply_overlay.sh applies every patches/*.patch by glob. That makes the directory a
-    series, not a menu -- and I broke it: 0004 needs 0003's hunk to be present, so I
-    shipped a second "clean tree" variant of 0004 for trees without the teardown fix.
+    series, not a menu -- and I broke it: 0002 needs 0001's hunk to be present, so I
+    shipped a second "clean tree" variant of 0002 for trees without the teardown fix.
     Since the loop applies ALL of them, one of the two could only ever fail. Ulf hit it
     on the first run: "tries to apply both patches at the same time".
 

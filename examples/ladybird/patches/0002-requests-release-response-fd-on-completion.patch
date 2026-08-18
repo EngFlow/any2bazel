@@ -1,7 +1,7 @@
 From: any2bazel Ladybird migration
 Subject: [PATCH] LibRequests: close the response fd on completion, not just at ~Request
 
-Applies ON TOP OF the teardown fix (patches/0003, or upstream's equivalent), which is
+Applies ON TOP OF the teardown fix (patches/0001, or upstream's equivalent), which is
 the previous patch in this series. The two edit adjacent lines in the same branch, so
 apply them in order -- apply_overlay.sh does that for you.
 

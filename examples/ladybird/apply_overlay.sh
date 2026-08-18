@@ -43,7 +43,7 @@ set -euo pipefail
 # from, and the only tree they are known to describe. A tag would be wrong here
 # for the same reason it was wrong for the HSTS table (see hsts_preload.bzl): a
 # tag is a pin to a different tree than the one measured.
-LADYBIRD_COMMIT="f9e34731b85fea1c3517941d8388566cd33277c4"
+LADYBIRD_COMMIT="71fb301a851e4a098e863a7a67e6666599e1cab7"
 LADYBIRD_REPO="https://github.com/LadybirdBrowser/ladybird.git"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

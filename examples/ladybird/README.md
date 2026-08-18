@@ -117,7 +117,7 @@ knowing, because both were mistakes I made first:
 
 ### Reproducing the tree on another machine
 
-The overlay is **not a fork**: it is a pinned upstream Ladybird commit + three patches
+The overlay is **not a fork**: it is a pinned upstream Ladybird commit + two patches
 + 45 Bazel files that sit alongside CMake's. [`apply_overlay.sh`](apply_overlay.sh) is
 that sentence made executable, because *"copy `workspace/` over a clone"* has four
 ways to be silently wrong — and every one of them was found by running it, not by
@@ -126,14 +126,17 @@ reading it:
 1. **The Ladybird commit.** The generated BUILD files name ~1,961 LibWeb compile
    inputs and 665 IDL bindings *by path*, and were generated from one tree.
    **Nothing in this repo recorded which one** until the script did
-   (`f9e34731`). Against a different tree the build fails on a moved file — or
+   (`71fb301a`). Against a different tree the build fails on a moved file — or
    worse, silently omits a new one.
-2. **The patches**, which have to be applied or the build is nondeterministic
-   (dictionaries emitted in `PYTHONHASHSEED` order), does not compile at all
-   under per-header moc, or leaks one socket fd per completed HTTP request until
-   the browser dies of `EMFILE` overnight
-   ([`0003`](patches/0003-librequests-tear-down-request-when-body-is-delivered.patch);
+2. **The patches**, which have to be applied or the browser leaks one socket fd per
+   completed HTTP request until it dies of `EMFILE` overnight
+   ([`0001`](patches/0001-librequests-tear-down-request-when-body-is-delivered.patch)
+   and [`0002`](patches/0002-requests-release-response-fd-on-completion.patch);
    see [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md)).
+   There used to be four: the `PYTHONHASHSEED` determinism fix and the
+   non-self-contained `UI/Qt/TabBar.h` are both **fixed upstream** at this pin, so
+   the repin from `f9e34731` deleted them. A patch directory that only ever grows is
+   a patch directory nobody re-checks against upstream.
 3. **The rename**: `bazelrc.txt` → `.bazelrc`. Stored under a different name so a
    `cp -r` cannot be mistaken for a working build — and a rename a human does by
    hand is a rename a human forgets.
@@ -160,11 +163,27 @@ outputs), `Meta/fetch_vcpkg_git_archives.py` reproduced **4/4** archives verifie
 against the pinned SHA512s, and `bazel build` then built the 76 vcpkg ports offline
 and linked `//:LibHTTP`.
 
-#### One thing the overlay cannot carry: vcpkg's host tools
+#### One thing the overlay cannot carry: host tools
 
 ```sh
 sudo apt install nasm autoconf automake libtool autoconf-archive libltdl-dev
+# ...and, since the 71fb301a repin, four host packages upstream newly REQUIRES:
+sudo apt install qt6-positioning-dev qt6-base-private-dev libxkbcommon-dev libglib2.0-dev
 ```
+
+The second line is what a repin costs, and every one of the four was found by a
+*configure or generate failure*, one at a time, because nothing derives this set:
+`UI/Qt/CMakeLists.txt` turned `Positioning` from `OPTIONAL_COMPONENTS` into
+`REQUIRED`, made `GuiPrivate` required on Linux (not just Apple/DirectX), and added
+`pkg_check_modules(GIO REQUIRED gio-2.0 gio-unix-2.0)` for the new
+`ExternalURLActivationToken`/`ExternalURLHandler` sources. `qt6-base-private-dev` and
+`libxkbcommon-dev` are *transitive*: `Qt6GuiPrivate` reports itself NOT FOUND until
+XKB is present, then names an `INTERFACE_INCLUDE_DIRECTORIES` path
+(`/usr/include/.../QtGui/6.10.2`) that only the private-dev package ships — a
+two-step failure where neither message mentions the package to install. That is the
+finding-39 shape again, one layer out: the preflight covers *vcpkg's* host tools, so
+Ladybird's own `find_package`/`pkg_check_modules` requirements are unchecked and cost
+one failed configure each.
 
 Not a courtesy list — the set is derived from vcpkg's own scripts into
 [`Meta/vcpkg_host_tools.tsv`](workspace/Meta/vcpkg_host_tools.tsv), and
@@ -288,7 +307,7 @@ an FFI header collision and an entire missing Rust target. See
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
 | `Meta/pin_hsts_preload.py` | Re-pins it: resolves the newest commit touching the path, downloads it, writes the hash it **measured**; `--expect-same-as` refuses to write unless the pinned bytes equal the file CMake downloaded (parity guard) |
-| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the three patches, copy the 45 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
+| `apply_overlay.sh` | Reproduces the whole tree on another machine: clone at the pinned Ladybird commit, apply the two patches, copy the 45 overlay files (with the `bazelrc.txt` → `.bazelrc` rename), run the vcpkg prefetch, then stage the one file that must come after it. `--verify` checks an existing tree — commit, bytes, patches-applied, exec bits — and changes nothing |
 | `bazelrc.txt` | → `.bazelrc`. Global copts/defines/linkopts mirrored from `Meta/CMake/compile_options.cmake` |
 | `qt_runtime.bzl` | Qt's **runtime** half: a repo rule that stages the plugins of the SDK `@qt` itself names (read out of @qt's generated `qtconf.bzl`, so plugins and libraries cannot come from different Qts), the private libraries an SDK bundles beside Qt (derived from DT_NEEDED), a generated `qt.conf` pointing the binary at them, and the Qt >= 6.9 floor `UI/Qt/CMakeLists.txt` declares. Without it Qt `dlopen`ed the HOST's plugin into Bazel's Qt — finding 40 |
 | `BUILD.bazel` | Root package: 34 libraries, the 5 executables, Qt moc/rcc genrules. **Generated** by `Meta/emit_build_bazel.py` |
@@ -335,7 +354,7 @@ Or by hand:
 
 ```sh
 git clone https://github.com/LadybirdBrowser/ladybird && cd ladybird
-git checkout f9e34731b85fea1c3517941d8388566cd33277c4   # the commit the generated
+git checkout 71fb301a851e4a098e863a7a67e6666599e1cab7   # the commit the generated
                                                         # BUILD files describe
 # 1. Drop in the overlay.
 cp -r .../examples/ladybird/workspace/. . && mv bazelrc.txt .bazelrc
@@ -774,35 +793,32 @@ Honest inventory of what stops this from being a clone-and-build.
    that says there is none. Same shape as the shim that could not fail: a control
    that is not enforced is indistinguishable from one that is not there.
 
-9. **Four upstreamable Ladybird fixes.** The first is the `sorted()` determinism
-   fix in `Meta/Generators/libweb_bindings/to_idl_value.py`, filed as
-   [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899) and
-   fixed upstream.
+9. **Two upstreamable Ladybird fixes — down from four, and that is the point of a
+   repin.** Two of the four are **fixed upstream** at this pin (`71fb301a`) and their
+   patches are deleted, which is worth stating because a patch directory is a debt
+   register that only shrinks if somebody re-reads it:
 
-   The second is a one-line `#include <UI/Qt/Tab.h>` in `UI/Qt/TabBar.h`:
-   [`patches/0002-ui-qt-tabbar-self-contained-header.patch`](patches/0002-ui-qt-tabbar-self-contained-header.patch).
-   `TabBar.h` calls `as<Tab>()` — a `dynamic_cast`, needing Tab's complete type —
-   while only forward-declaring `Tab`, and compiles under CMake purely by ordering
-   luck: AUTOMOC's unity `mocs_compilation.cpp` includes `moc_Tab.cpp` (hence
-   `Tab.h`) before `moc_TabBar.cpp`. Bazel mocs each header separately, so nothing
-   supplies the definition first. A latent upstream bug rather than a Bazel quirk —
-   any build that changes compile order (different unity bucketing, an IWYU pass)
-   hits it. Still to file upstream.
+   * The `sorted()` determinism fix in `Meta/Generators/libweb_bindings/to_idl_value.py`
+     — filed as [ladybird#10899](https://github.com/LadybirdBrowser/ladybird/issues/10899)
+     and fixed upstream **better than my patch was**: upstream sorts inside
+     `dependency_names_for`, so no caller can receive a set, whereas my patch sorted at
+     the one call site I had found. Two of my four patches were the *same* bug in that
+     one function, and I filed the second as distinct; it was not.
+   * The one-line `#include <UI/Qt/Tab.h>` in `UI/Qt/TabBar.h`. `TabBar.h` calls
+     `as<Tab>()` — a `dynamic_cast`, needing Tab's complete type — while only
+     forward-declaring `Tab`, and compiled under CMake purely by ordering luck:
+     AUTOMOC's unity `mocs_compilation.cpp` includes `moc_Tab.cpp` (hence `Tab.h`)
+     before `moc_TabBar.cpp`. Bazel mocs each header separately, so nothing supplied
+     the definition first. Upstream now includes the header.
 
-   A **third** one is now needed, in the same function as the first: the topological
-   sort in `dictionaries_in_dependency_order` iterates a *set* of dependency names,
-   so two dictionaries that do not depend on each other (`AudioConfiguration` and
-   `VideoConfiguration`, both reached from `MediaConfiguration`) emit in hash order
-   and `Bindings/MediaCapabilities.h` varies with `PYTHONHASHSEED`. A topological
-   sort constrains dependency-before-dependent; the order among independent
-   siblings must be pinned separately. Found by the harness's seed sweep, not by
-   any single run — the inherited-seed run was clean. The fix is in
-   [`patches/0001-libweb-bindings-deterministic-dictionary-order.patch`](patches/0001-libweb-bindings-deterministic-dictionary-order.patch);
-   apply it in the checkout before running the harness.
+   Both survived in `patches/` only because the old pin (`f9e34731`) predated the
+   upstream fixes — a patch keeps applying long after it stops being needed, so
+   "it still applies" is not evidence that it is still a bug.
 
-   A **fourth**, found only because the Bazel-built browser was left running
-   overnight, is a resource leak rather than a build defect:
-   [`patches/0003-librequests-tear-down-request-when-body-is-delivered.patch`](patches/0003-librequests-tear-down-request-when-body-is-delivered.patch).
+   What remains is the fd leak, in two patches that are one series. The first,
+   found only because the Bazel-built browser was left running overnight, is a
+   resource leak rather than a build defect:
+   [`patches/0001-librequests-tear-down-request-when-body-is-delivered.patch`](patches/0001-librequests-tear-down-request-when-body-is-delivered.patch).
    WebContent leaks one AF_UNIX socket fd per *completed* HTTP request — a cycle
    between the GC heap (four `GC::Root`s from `Fetching.cpp:2338`) and the
    refcount heap (`Response` holding `Requests::Request` by `RefPtr`) that neither
@@ -812,15 +828,15 @@ Honest inventory of what stops this from being a clone-and-build.
    with a live peer survives it. Both are written up with reproductions in
    [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md).
 
-   A **fifth** is the other half of the completed-request class, and it only showed
+   The **second** is the other half of the completed-request class, and it only showed
    up on a tree that was not mine:
-   [`patches/0004-requests-release-response-fd-on-completion.patch`](patches/0004-requests-release-response-fd-on-completion.patch).
-   With `0003`'s teardown applied, Ulf still measured **97 leaked sockets/min**, all
+   [`patches/0002-requests-release-response-fd-on-completion.patch`](patches/0002-requests-release-response-fd-on-completion.patch).
+   With `0001`'s teardown applied, Ulf still measured **97 leaked sockets/min**, all
    `peer=DEAD` and all sent by RequestServer — because dropping the callbacks unpins
    the GC cycle but does not *close the descriptor*: the response pipe is released
    only by `~Request`, so any other reference to the request retains one fd per
-   completed request. `0004` closes it where the body is already proven complete — the
-   next patch in the series, applied on top of `0003`; `patches/*.patch` is applied by
+   completed request. `0002` closes it where the body is already proven complete — the
+   next patch in the series, applied on top of `0001`; `patches/*.patch` is applied by
    glob in full, so an *alternative* to a patch must never live there.
    Measured A/B on 200 completed requests: **208 sockets (203 dead) → 6 (0 dead)**,
    with body delivery intact. "Collectable" and "closed" are different claims, and
@@ -838,7 +854,7 @@ Honest inventory of what stops this from being a clone-and-build.
    small internal-only method is inlined into its only caller and leaves no symbol and
    no string behind, so `.debug_str` is read too and a "missing" verdict requires a
    symbol inlining cannot erase to be visible. This is a correction — the first version
-   told Ulf `0004` was absent from a binary that contained it, and the negative control
+   told Ulf `0002` was absent from a binary that contained it, and the negative control
    did not catch it because it was vulnerable to the same optimisation. A control only
    rules out "unreadable" if it cannot vanish for the same reason as what it guards.
    Since upstream has landed its own fix,
