@@ -328,3 +328,88 @@ if __name__ == "__main__":
         t()
         print("ok", t.__name__)
     print("%d passed" % len(TESTS))
+
+
+def test_every_qt_module_the_build_links_is_preflighted_with_its_package():
+    """A Qt module the HOST lacks must be named here, not by Bazel's output base.
+
+    rules_qt's qt.local_repo DERIVES its cc_library targets by listing the host
+    Qt's lib directory (`_create_libs_symlinks`, qt_local_repo.bzl), so a module
+    the host does not have is simply never declared. What the reader then sees is:
+
+      ERROR: .../external/rules_qt++qt+qt/BUILD.bazel: no such target
+      '@@rules_qt++qt+qt//:QtPositioning': target 'QtPositioning' not declared in
+      package '' ... and referenced by '//:ladybird'
+
+    Ulf hit exactly that. It says nothing about Qt, nothing about apt, and points
+    at a generated file in an output base that the reader did not write and cannot
+    fix. Same class as finding 38 (an unpinned host tool) and as the four failed
+    configures of the 71fb301a repin: a host probe whose absence is reported as a
+    defect in your own code.
+
+    The version FLOOR check next to it was already the right idea with the wrong
+    scope -- "is the SDK new enough" but never "does the SDK have the parts we
+    link". Both are properties of the discovered SDK.
+
+    This test is the anti-drift half: _QT_MODULES is an INDEPENDENT statement of
+    what the build needs (deriving it from BUILD.bazel would only prove the
+    generator agrees with itself), so it can go stale exactly the way the qt_label
+    table did. Asserting the two agree is what catches a Qt module appearing in a
+    future repin without a preflight entry.
+    """
+    rt = _read("qt_runtime.bzl")
+    build = _read("BUILD.bazel")
+
+    # What the build actually links.
+    linked = set(re.findall(r"@qt//:(Qt\w+)", build))
+    assert linked, "no @qt//:Qt* deps in BUILD.bazel -- did the label scheme change?"
+
+    # What the preflight knows about.
+    block = rt.split("_QT_MODULES = {", 1)[1].split("}", 1)[0]
+    preflighted = dict(re.findall(r'"(Qt\w+)":\s*"([^"]+)"', block))
+    assert preflighted, "_QT_MODULES is empty or unparseable"
+
+    missing = sorted(linked - set(preflighted))
+    assert not missing, (
+        "these Qt modules are linked by BUILD.bazel but have no _QT_MODULES entry, "
+        "so a host without them gets Bazel's 'no such target' error naming a "
+        "generated BUILD file instead of the apt package: %s" % missing)
+
+    # Every entry must name a package, or the message cannot tell anyone what to do.
+    for mod, pkg in sorted(preflighted.items()):
+        assert pkg and not pkg.startswith("Qt"), \
+            "%s maps to %r, which is not a package name" % (mod, pkg)
+
+    # The regression that motivated this: Positioning became REQUIRED at 71fb301a.
+    assert preflighted.get("QtPositioning") == "qt6-positioning-dev", \
+        "QtPositioning must map to the package that ships libQt6Positioning.so"
+
+
+def test_the_module_preflight_reads_the_same_libs_dir_rules_qt_derives_from():
+    """The check must ask the question qt.local_repo will answer, not a proxy.
+
+    A repository rule cannot query another repo's targets, so "will @qt declare
+    QtPositioning?" has to be answered from the same input qt.local_repo uses:
+    QT_INSTALL_LIBS, listed for libQt<major><Module>.so*. Anything else (asking
+    for the target, probing a header, trusting the version) can disagree with what
+    rules_qt actually does, which would give a false pass or a false failure.
+
+    Verified against real Bazel both ways: a prefix with libQt6Positioning.so*
+    removed fails with the apt package named, and the same prefix with it restored
+    resolves @qt_plugins//:runtime_libs.
+    """
+    rt = _read("qt_runtime.bzl")
+    impl = rt.split("def _qt_plugins_impl", 1)[1]
+    assert "QT_INSTALL_LIBS" in impl, \
+        "the module preflight does not read QT_INSTALL_LIBS, the dir rules_qt derives from"
+    # Must be the same name-mangling as _create_lib_name: first dot-field, prefix
+    # stripped -- libQt6Positioning.so.6.10.2 is QtPositioning.
+    assert 'split(".")' in impl, \
+        "libQt6Positioning.so.6.10.2 must reduce to QtPositioning like _create_lib_name does"
+    # The failure has to be actionable: package names and the cache caveat.
+    fail_msg = impl.split("missing {n} module", 1)[1].split('))', 1)[0] \
+        if "missing {n} module" in impl else ""
+    assert "apt install" in fail_msg, "the failure does not say how to install the module"
+    assert "sync --configure" in fail_msg or "clean --expunge" in fail_msg, \
+        ("the failure does not mention that @qt is cached, so a reader who installs "
+         "the package and re-runs can get the same error and conclude it did not work")

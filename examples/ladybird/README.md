@@ -185,6 +185,41 @@ finding-39 shape again, one layer out: the preflight covers *vcpkg's* host tools
 Ladybird's own `find_package`/`pkg_check_modules` requirements are unchecked and cost
 one failed configure each.
 
+**The Qt modules are now preflighted**, because their failure mode was the worst of
+the set. `rules_qt`'s `qt.local_repo` *derives* its `cc_library` targets by listing
+the host Qt's lib directory, so a module you do not have is never declared and Bazel
+says:
+
+```
+ERROR: .../external/rules_qt++qt+qt/BUILD.bazel: no such target
+'@@rules_qt++qt+qt//:QtPositioning': target 'QtPositioning' not declared in
+package '' ... and referenced by '//:ladybird'
+```
+
+which mentions neither Qt nor apt, and points at a generated file in an output base
+that you did not write. `qt_runtime.bzl` now checks the modules `//:ladybird` links
+against that same lib directory — the input `qt.local_repo` derives from — and fails
+with the package name instead:
+
+```
+qt_plugins: the Qt at /usr (version 6.10.2) is missing 1 module(s)
+  that //:ladybird links:
+
+      QtPositioning (package: qt6-positioning-dev)
+
+  Install them and re-run; on Debian/Ubuntu:
+
+      sudo apt install qt6-positioning-dev
+  (If you installed it just now, Bazel may have the old @qt cached:
+   `bazel sync --configure` or `bazel clean --expunge` re-runs the probe.)
+```
+
+This sits next to the Qt *version* floor check, which was the right idea at the wrong
+scope: it asked "is the SDK new enough" and never "does the SDK have the parts we
+link". A test asserts the module list agrees with the `@qt//:Qt*` deps in
+`BUILD.bazel`, so a module added by a future repin cannot silently skip its
+preflight — the same drift that made `Positioning` a bug in the first place.
+
 Not a courtesy list — the set is derived from vcpkg's own scripts into
 [`Meta/vcpkg_host_tools.tsv`](workspace/Meta/vcpkg_host_tools.tsv), and
 `vcpkg_build.sh` checks all of it before building anything, printing the ports that

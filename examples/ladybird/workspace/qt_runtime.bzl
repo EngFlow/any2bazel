@@ -69,6 +69,38 @@
 # The version floor Ladybird's own UI/Qt/CMakeLists.txt declares.
 _QT_FLOOR = (6, 9)
 
+# The Qt MODULES //:ladybird links, and the Debian/Ubuntu package that ships each
+# one. Checked here because rules_qt's qt.local_repo DERIVES its cc_library targets
+# by listing the host's Qt lib directory: a module the host does not have is simply
+# not declared, and the failure is Bazel's generic missing-target error naming a
+# generated BUILD file in the output base --
+#
+#   ERROR: .../external/rules_qt++qt+qt/BUILD.bazel: no such target
+#   '@@rules_qt++qt+qt//:QtPositioning': target 'QtPositioning' not declared in
+#   package '' ... and referenced by '//:ladybird'
+#
+# -- which says nothing about Qt, nothing about apt, and points at a file the
+# reader did not write and cannot fix. Ulf hit exactly this. (Same class as
+# finding 38: a host probe whose absence is reported as a bug in your code.)
+#
+# The floor check right below this was already the right idea and had the wrong
+# scope: it asked "is the SDK new enough" and never "does the SDK have the parts we
+# link". Both are properties of the discovered SDK, so both belong here.
+#
+# Kept as a LIST OF NAMES, not derived from BUILD.bazel: the emitter writes the
+# `@qt//:Qt*` deps, so deriving this from the same source would only prove the
+# generator agrees with itself. This is the independent statement of what the build
+# needs, and the test asserts the two match -- which is what catches a NEW Qt
+# module appearing in a future repin without its preflight entry.
+_QT_MODULES = {
+    "QtCore": "qt6-base-dev",
+    "QtGui": "qt6-base-dev",
+    "QtWidgets": "qt6-base-dev",
+    # UI/Qt/CMakeLists.txt:8 -- REQUIRED on non-Apple since the 71fb301a repin
+    # (it was OPTIONAL before), for GeolocationProviderQt.cpp.
+    "QtPositioning": "qt6-positioning-dev",
+}
+
 # ---------------------------------------------------------------------------
 # The repo: @qt's plugins, as Bazel files.
 # ---------------------------------------------------------------------------
@@ -293,6 +325,47 @@ def _qt_plugins_impl(repository_ctx):
             floor = "{}.{}".format(_QT_FLOOR[0], _QT_FLOOR[1]),
             prefix = values.get("QT_INSTALL_PREFIX", "?"),
         ))
+
+    # Preflight the MODULES, for the reason spelled out at _QT_MODULES: a module the
+    # host Qt lacks is never declared by qt.local_repo, and Bazel then blames a
+    # generated BUILD file in the output base for a missing apt package.
+    #
+    # Checked against the SDK's own lib directory (the same input qt.local_repo
+    # derives its targets from) rather than by asking @qt for the target: a
+    # repository rule cannot query another repo's targets, and reading the libs is
+    # what makes the answer agree with what qt.local_repo will do.
+    libs_dir = values.get("QT_INSTALL_LIBS", "")
+    if libs_dir:
+        libs_path = repository_ctx.path(libs_dir)
+        present = {}
+        if libs_path.exists:
+            for f in libs_path.readdir():
+                b = str(f.basename)
+                # libQt6Positioning.so / .so.6 / .so.6.10.2 all mean "present";
+                # _create_lib_name in qt_local_repo.bzl takes the same first field.
+                if b.startswith("libQt{}".format(have[0])) and ".so" in b:
+                    present["Qt" + b.split(".")[0][len("libQt%d" % have[0]):]] = True
+        missing = [m for m in sorted(_QT_MODULES) if m not in present]
+        if missing:
+            fail((
+                "qt_plugins: the Qt at {prefix} (version {v}) is missing {n} module(s)\n" +
+                "  that //:ladybird links:\n\n{list}\n\n" +
+                "  Install them and re-run; on Debian/Ubuntu:\n\n      sudo apt install {pkgs}\n\n" +
+                "  Without this check Bazel reports the same problem as\n" +
+                "    no such target '@@rules_qt++qt+qt//:Qt<Module>'\n" +
+                "  naming a GENERATED BUILD file in your output base, because rules_qt's\n" +
+                "  qt.local_repo derives its cc_library targets by listing this directory --\n" +
+                "  a module you do not have is simply never declared.\n\n" +
+                "  (If you installed it just now, Bazel may have the old @qt cached:\n" +
+                "   `bazel sync --configure` or `bazel clean --expunge` re-runs the probe.)"
+            ).format(
+                prefix = values.get("QT_INSTALL_PREFIX", "?"),
+                v = version,
+                n = len(missing),
+                list = "\n".join(["      {} (package: {})".format(m, _QT_MODULES[m]) for m in missing]),
+                # No set comprehensions in Starlark; dedupe through a dict.
+                pkgs = " ".join(sorted({_QT_MODULES[m]: True for m in missing}.keys())),
+            ))
 
     root = repository_ctx.path(plugins_root)
     if not root.exists:
