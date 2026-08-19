@@ -25,7 +25,21 @@ set -euo pipefail
 
 OUT="${1:?usage: vcpkg_capture_assets.sh <out.tsv> [vcpkg args...]}"
 shift
-: > "$OUT"
+# APPEND to an existing capture rather than truncating it, and share vcpkg's
+# downloads/ across runs (pass --downloads-root at a stable path). The run takes
+# tens of minutes and reaches the network for every byte, so it WILL be
+# interrupted -- a sandbox restart, a dead mirror, a timeout. Truncating means
+# every interruption costs the whole run, which is how the first two attempts
+# died (todo c2affe6b: long jobs must be resumable and append-only). The final
+# `sort -u` dedupes, so a tuple recorded twice is free; a tuple recorded once and
+# then thrown away is another 40 minutes.
+touch "$OUT"
+echo "capture: appending to $OUT ($(wc -l < "$OUT") rows already recorded)" >&2
+
+# Where the recorder reports downloads it could not complete. A file rather than a
+# counter, because the recorder runs as a separate PROCESS per download: nothing
+# it sets in a variable can reach this script.
+FAILED=$(mktemp /tmp/vcpkg-capture-failed-XXXXXX)
 
 REC=$(mktemp /tmp/vcpkg-record-XXXXXX.sh)
 cat > "$REC" <<EOF
@@ -45,13 +59,19 @@ printf '%s\t%s\t%s\n' "\$1" "\$2" "\$3" >> "$OUT"
 # Record the tuple regardless (the SHA512 is what matters and it is
 # mirror-independent), and try the known GNU mirrors before giving up. Hit live:
 # ftpmirror.gnu.org returned 502 for ~13 minutes and wedged the capture.
-if curl -sSL --fail --max-time 120 -o "\$3" "\$1"; then exit 0; fi
+# Bound STALLS, not total transfer time. This was --max-time 120, which is a cap
+# on how long a download may legitimately take -- so it killed OpenGL-Registry at
+# 22MB of a working transfer, then reported it as "FAILED to fetch", then fell
+# through to the origin, on a repeat, forever: a capture that cannot finish and
+# blames the mirror. --speed-time/--speed-limit is the property actually wanted
+# ("no progress for 60s"), and it cannot mistake a big file for a dead one.
+if curl -sSL --fail --speed-time 60 --speed-limit 1024 -o "\$3" "\$1"; then exit 0; fi
 alt=\$(printf '%s' "\$1" | sed \
   -e 's|https://ftpmirror.gnu.org/gnu/|https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/|' \
   -e 's|https://ftp.gnu.org/pub/gnu/|https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/|')
 if [ "\$alt" != "\$1" ]; then
   echo "capture: primary failed, trying mirror \$alt" >&2
-  curl -sSL --fail --max-time 120 -o "\$3" "\$alt" && exit 0
+  curl -sSL --fail --speed-time 60 --speed-limit 1024 -o "\$3" "\$alt" && exit 0
 fi
 # Leave NO partial file behind. curl -o creates the destination before it knows
 # the transfer will fail, and vcpkg's downloads/ is keyed by name: a surviving
@@ -61,6 +81,11 @@ fi
 # renamed four unrelated distfiles in the capture. (finding 30)
 rm -f "\$3"
 echo "capture: FAILED to fetch \$1" >&2
+# Tell the DRIVER, not just the log. A failed download halts its portfile, so
+# every vcpkg_download_distfile after it in that port is never requested and so
+# never captured -- and vcpkg still exits 0 saying "All requested installations
+# completed successfully". Without this file the driver cannot know.
+printf '%s\n' "\$1" >> "$FAILED"
 exit 1
 EOF
 chmod +x "$REC"
@@ -78,8 +103,38 @@ chmod +x "$REC"
     "$@"
 
 rm -f "$REC"
-# Dedupe on (url, sha512) -- NOT the whole line. The third column is the raw
-# {dst}, which carries a pid and so differs on every retry; sorting whole lines
-# leaves the same distfile in the file several times over.
+trap 'rm -f "$FAILED"' EXIT
+
+# A capture that lost a download is INCOMPLETE, and vcpkg does not tell you so in
+# its exit code: with --only-downloads it printed "All requested installations
+# completed successfully in: 49 min" and exited 0 having FAILED to download
+# angle's gni-to-cmake.py (a transient TLS error -- this sandbox's clock was
+# briefly behind the certificate's validity window, "certificate is not yet
+# valid"). That is not a cosmetic loss: the failure HALTED angle's portfile, so
+# the FOUR vcpkg_download_distfile calls after it were never made, never
+# requested, and so never captured. The result is a pin that is missing five URLs
+# and looks complete -- the worst possible shape, since the emitted rules would
+# then fetch nothing for angle and the failure would surface much later as a
+# build error inside a port.
+#
+# The recorder logs the tuple BEFORE fetching, so a failed download is still in
+# the capture; what is lost is everything the halted portfile would have asked for
+# next. The recorder therefore also appends each failed URL to a sentinel file,
+# which is the thing checked here -- not vcpkg's exit code, which lies, and not a
+# grep of stderr, which depends on how the caller redirected it.
+#
+# Dedupe FIRST so the row count reported below is the real one. Dedupe on
+# (url, sha512) -- NOT the whole line: the third column is the raw {dst}, which
+# carries a pid and so differs on every retry, and sorting whole lines leaves the
+# same distfile in the file several times over.
 sort -u -t$'\t' -k1,2 -o "$OUT" "$OUT"
+if [ -s "$FAILED" ]; then
+    echo "capture: INCOMPLETE -- $(wc -l < "$FAILED") download(s) failed:" >&2
+    sed 's/^/capture:   /' "$FAILED" >&2
+    echo "capture: A failed download HALTS its portfile, so every later" >&2
+    echo "capture: vcpkg_download_distfile in that port was never requested and is" >&2
+    echo "capture: MISSING from $OUT. Do not emit rules from this file." >&2
+    echo "capture: Re-run; it appends and shares downloads/, so it resumes." >&2
+    exit 1
+fi
 echo "captured $(wc -l < "$OUT") distfiles -> $OUT" >&2

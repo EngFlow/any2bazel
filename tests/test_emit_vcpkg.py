@@ -658,3 +658,85 @@ def test_a_moved_pin_is_reported_as_a_stale_capture_not_a_windows_only_fetch():
         "main() must classify the dropped rows, not assert a reason for them"
     assert "static_only = sorted(set(distfiles) - set(cap))" not in body, \
         "the unclassified set-difference is back"
+
+
+def _capture_script():
+    ws = os.path.join(os.path.dirname(__file__), "..", "examples", "ladybird",
+                      "workspace")
+    with open(os.path.join(ws, "Meta", "vcpkg_capture_assets.sh")) as f:
+        return f.read()
+
+
+def test_a_failed_download_makes_the_capture_fail_because_vcpkg_will_not():
+    """vcpkg exits 0 on a capture that lost downloads. Ask me how I know.
+
+    The 71fb301a re-capture printed "All requested installations completed
+    successfully in: 49 min", exited 0, and wrote 72 rows -- while angle's
+    `gni-to-cmake.py` had FAILED to download (a transient TLS error: this
+    sandbox's clock was briefly behind the certificate's validity window,
+    "certificate is not yet valid"). Diffing against the committed capture showed
+    72 rows where the old pin had 76: FIVE URLs gone, four of them WebKit files
+    nothing had reported on at all.
+
+    That is the mechanism worth remembering: a failed download HALTS its portfile,
+    so the four `vcpkg_download_distfile` calls after it in angle were never made,
+    never requested, and so never captured. The recorder logs each tuple BEFORE
+    fetching, so the one that failed is present and the four that were never asked
+    for are simply absent -- a pin that is missing five URLs and looks complete.
+    Emitting from it would produce rules that fetch nothing for angle, failing
+    much later inside a port build.
+
+    So the capture must judge itself, and it cannot do that from vcpkg's exit
+    code. Verified against a fake vcpkg that calls the recorder with an
+    unreachable URL and then exits 0 like the real one: the script exits 1 and
+    names the URL.
+    """
+    sh = _capture_script()
+    # The recorder must report failures to the DRIVER. A variable cannot: the
+    # recorder is a separate process per download.
+    rec = sh.split("cat > \"$REC\"", 1)[1].split("chmod +x", 1)[0]
+    assert re.search(r'printf .*>> "\$FAILED"', rec), \
+        "the recorder does not report a failed download to the driver"
+    # And the driver must refuse to bless the result.
+    tail = sh.split("chmod +x", 1)[1]
+    assert 'if [ -s "$FAILED" ]' in tail, \
+        "the driver never checks whether any download failed"
+    assert re.search(r'if \[ -s "\$FAILED" \][\s\S]{0,800}?exit 1', tail), \
+        "a capture with failed downloads still exits 0"
+    # The message has to say the non-obvious part, or a reader re-runs the emitter
+    # on the incomplete file.
+    assert "HALTS its portfile" in tail, \
+        "the message does not explain that later downloads in that port are missing"
+
+
+def test_the_capture_bounds_stalls_not_transfer_size():
+    """`--max-time` capped how long a download may legitimately TAKE.
+
+    It killed OpenGL-Registry at 22MB of a perfectly healthy transfer, reported it
+    as "FAILED to fetch", fell through to the origin, and did it again on every
+    re-run -- a capture that could not finish, blaming the mirror. The property
+    actually wanted is "no progress for a while", which cannot mistake a big file
+    for a dead one.
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert "--max-time" not in code, \
+        ("--max-time bounds total transfer time, so it fails big-but-healthy "
+         "downloads; use --speed-time/--speed-limit")
+    assert "--speed-time" in code and "--speed-limit" in code, \
+        "no stall timeout at all: a dead mirror hangs the capture forever"
+
+
+def test_the_capture_is_resumable():
+    """A ~50-minute network-bound job that truncates its output on start.
+
+    Every interruption -- sandbox restart, dead mirror, timeout -- cost the whole
+    run (todo c2affe6b). Appending plus the final dedupe makes a re-run resume
+    instead: a tuple recorded twice is free.
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert ': > "$OUT"' not in code, "the capture truncates its own output on start"
+    assert 'touch "$OUT"' in code, "the capture does not append to an existing run"
+    assert re.search(r"sort -u -t\$'\\t' -k1,2 -o \"\$OUT\" \"\$OUT\"", code), \
+        "without the dedupe, appending duplicates rows"
