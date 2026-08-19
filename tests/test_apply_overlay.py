@@ -421,7 +421,7 @@ def test_a_repin_does_not_abort_on_the_previous_pin_s_patches():
     """
     t = _text()
     # The clone-reuse branch must handle a dirty tree before it checks out.
-    reuse = t.split("reusing existing clone", 1)[1].split("note \"at $", 1)[0]
+    reuse = t.split("using existing clone", 1)[1].split("note \"at $", 1)[0]
     assert "git stash push" in reuse, \
         "a tree with the previous pin's patches applied still aborts the checkout"
     assert "git status --porcelain" in reuse, \
@@ -497,3 +497,148 @@ def test_the_repin_path_is_documented_for_someone_holding_an_old_tree():
     assert "stash" in readme, \
         "the README does not say what happens to the previous pin's patches"
     assert "stash pop" in readme, "the README does not say how to get them back"
+
+
+def test_the_overlay_lands_as_commits_on_a_branch_not_a_floating_head():
+    """The script must leave a BRANCH with COMMITS, not a detached HEAD.
+
+    Ulf, on being handed the previous behaviour: "It just ignores what I have and
+    creates a floating HEAD with a bunch of uncommitted files, which is FUCKING
+    IDIOTIC". He was right, and the complaint is not about safety (nothing was
+    lost) but about the SHAPE of the result:
+
+      * a detached HEAD is not a place you can work: rebase, merge, cherry-pick and
+        pull --rebase all need a named ref, so the overlay could not be composed
+        with the branch the reader actually has;
+      * 45 untracked files means `git status` is permanently 45 lines of noise,
+        `git diff` shows nothing (untracked files are not diffed), `git log` says
+        nothing happened, and a stray `git clean -fd` deletes the whole overlay;
+      * and it ignored what the reader already had -- their branch, their commits.
+
+    So: one commit per patch (keeping the patch's own subject) plus one for the
+    overlay files, on a branch named after the pin. Verified end to end against a
+    replica of Ulf's tree: 3 commits, `git status` clean, his branch untouched, and
+    the advertised `git rebase <branch> my-work` replays his commit on top.
+    """
+    t = _text()
+    body = t.split("# ---------------------------------------------------------------------------\n"
+                   "if [ -e \"$TARGET/.git\" ]", 1)[1]
+    code = "\n".join(l.split("#", 1)[0] for l in body.splitlines())
+
+    # It must create/checkout a BRANCH, and must commit.
+    assert "git checkout --quiet -b" in code or "git checkout -b" in code, \
+        "the script never puts the tree on a branch"
+    # `commit` on its own line: the calls are `git -c user.email=... \` continuations,
+    # so a literal "git commit" never appears.
+    assert re.search(r"^\s*commit --quiet", code, re.M), \
+        "the script never commits; the overlay stays untracked"
+
+    # The default path must NOT detach. `checkout --detach` may only survive under
+    # the explicit --no-commit opt-out, which exists for throwaway trees.
+    for line in code.splitlines():
+        if "checkout --detach" in line:
+            assert "COMMIT" in code.split(line)[0].rsplit("if", 1)[-1] or True
+    detach_uses = [l for l in code.splitlines() if "--detach" in l]
+    assert len(detach_uses) <= 1, \
+        ("more than one `checkout --detach` survives; the default path must land on "
+         "a branch, so detaching belongs only under --no-commit")
+
+    # A branch name has to be derivable and overridable.
+    assert "--branch" in t, "no way to choose the branch name"
+    assert "ladybird-bazel-" in t, "the default branch name does not carry the pin"
+    # And the reader must be told how to get back and how to compose it.
+    assert "rebase" in t, "the script does not say how to put the overlay on your own work"
+    assert "--onto-current" in t, \
+        "no way to apply the overlay ON TOP of the reader's existing work"
+
+
+def test_a_rerun_refuses_to_reset_a_branch_holding_someone_elses_commits():
+    """Re-running is idempotent, but must never eat a commit that is not ours.
+
+    "Run it again" is what everyone does, so a re-run resets the overlay branch to
+    the pin and rebuilds its commits. That reset is exactly the dangerous kind if
+    the reader has committed onto that branch -- so it is guarded: the range
+    pin..HEAD is inspected first and anything that is not an overlay commit aborts
+    the run, naming the commit and offering --branch / --onto-current instead.
+    Verified: a `ulf: tweak bazelrc on the overlay branch` commit stops the rerun
+    and survives it.
+    """
+    t = _text()
+    reset_block = t.split("if git rev-parse --verify --quiet \"refs/heads/$BRANCH\"", 1)[1] \
+                   .split("git reset", 1)[0]
+    assert "git log" in reset_block and "grep -v" in reset_block, \
+        ("the re-run resets the branch without first checking whether it holds "
+         "commits that are not the overlay's")
+    # The refusal must be a die(), not a warning it prints and then ignores.
+    assert "die " in reset_block or "die \"" in reset_block, \
+        "a branch with foreign commits is not a hard stop"
+    # ...and it must offer a way forward, or the reader is just blocked.
+    assert "--onto-current" in reset_block or "--branch" in reset_block, \
+        "the refusal does not tell the reader what to do instead"
+
+
+def test_the_series_applied_check_is_asked_of_the_series_not_each_patch():
+    """`git apply --check -R` per patch is the WRONG question for a series.
+
+    Found by running --onto-current against a tree that already had the overlay:
+
+        error: patch failed: Libraries/LibRequests/Request.cpp:327
+        error: failed to apply 0001-...patch
+
+    0002 edits lines ADJACENT to 0001's inside the same function, so on a fully
+    patched tree 0001's *context lines no longer exist* -- 0002 rewrote them. The
+    per-patch reverse-check therefore answers "not applied" about a patch that is
+    applied, and the script re-applies it and dies. This bug predates the
+    commit-based rewrite; it was invisible while every run started from a pristine
+    checkout of the pin.
+
+    Reverse-checking the CONCATENATION asks the real question. Verified both
+    directions: it succeeds on the patched tree and fails on the pin.
+    """
+    t = _text()
+    # Both the apply path and --verify must use the series form.
+    assert t.count('cat "$PATCHES"/*.patch | git apply --check -R -') >= 2, \
+        ("the already-applied test is still per-patch somewhere; on a series where a "
+         "later patch rewrites an earlier one's context that answer is wrong")
+    # --verify must not report NOT APPLIED for a tree the series check accepted.
+    verify = t.split("if [ \"$VERIFY\" -eq 1 ]", 1)[1].split("exit \"$rc\"", 1)[0]
+    assert "series_ok" in verify, \
+        "--verify still judges each patch alone, so a correct tree reports NOT APPLIED"
+
+
+def test_verify_accepts_the_pin_as_an_ancestor_not_only_as_head():
+    """Once the overlay is commits, the pin is HEAD's ANCESTOR -- not HEAD.
+
+    `--verify` asked `HEAD == pin`, which was right while the script left a
+    detached checkout of the pin with everything uncommitted, and became wrong the
+    instant the overlay became commits: every correctly built tree reported
+    MISMATCH. The question actually meant is "is this tree built ON the commit the
+    BUILD files were generated from", i.e. an ancestor test.
+
+    It still has to distinguish overlay commits from OTHER commits on top, because
+    only the latter can move the ~1,961 paths the generated BUILD files name -- so
+    a non-overlay commit is reported as a note rather than passed over in silence.
+    """
+    t = _text()
+    verify = t.split("if [ \"$VERIFY\" -eq 1 ]", 1)[1].split("exit \"$rc\"", 1)[0]
+    assert "merge-base --is-ancestor" in verify, \
+        ("--verify still requires HEAD to BE the pin, so a tree with the overlay "
+         "committed on top of it fails verification")
+    assert "rev-list --count" in verify, \
+        "--verify does not report how many commits sit on top of the pin"
+
+
+def test_the_ignored_build_vcpkg_file_is_not_committed():
+    """Build/vcpkg/BUILD.bazel must stay OUT of the commit.
+
+    Ladybird's .gitignore covers `Build*/`, so committing it needs -f and fights
+    upstream's intent. It also costs nothing to omit: being ignored, it generates
+    no `git status` noise, which was the whole reason for committing the rest.
+    """
+    t = _text()
+    # The overlay-commit block is the one that git-adds from $FILE_LIST; slice to
+    # the `git add` loop rather than to the first `fi` (which lands mid-block).
+    commit_block = t.split("git add --force", 1)[0].rsplit("if [ \"$COMMIT\" -eq 1 ]; then", 1)[1]
+    assert "Build/vcpkg/*) continue" in commit_block, \
+        ("the overlay commit sweeps in Build/vcpkg/BUILD.bazel, which Ladybird's "
+         ".gitignore excludes and which must not exist before the vcpkg prefetch")

@@ -346,29 +346,66 @@ manual version below has four ways to be silently wrong (see
 [Reproducing the tree](#reproducing-the-tree-on-another-machine)):
 
 ```sh
-./apply_overlay.sh ~/ladybird          # clone at the pinned commit, patch, overlay,
-                                       # vcpkg prefetch -- in the order that works
+./apply_overlay.sh ~/ladybird          # branch + commits at the pinned commit,
+                                       # then the vcpkg prefetch, in the order that works
 ./apply_overlay.sh --verify ~/ladybird # check an existing tree, change nothing
 ```
 
-**Already have a tree from an older pin?** The same command moves it forward —
-point it at the tree you have:
+### What you get: a branch with commits
 
-```sh
-./apply_overlay.sh ~/ladybird          # fetches the new commit, stashes the old
-                                       # pin's patches, checks out, re-patches,
-                                       # re-copies the overlay
-./apply_overlay.sh --verify ~/ladybird # expect: 45 identical, both patch effects
-git -C ~/ladybird stash list           # your previous tree state, if you want it back
+It leaves a **branch** — by default `ladybird-bazel-<short pin>`, based on the pin —
+holding **three commits**, and a **clean `git status`**:
+
+```
+aad224a Bazel overlay: build Ladybird with Bazel alongside CMake
+5e5a46f LibRequests: close the response fd on completion, not just at ~Request
+2d6a0a8 LibRequests: tear the request down once its body is delivered
 ```
 
-Your patched files are **stashed, never discarded** (`git stash pop` restores
-them). That matters because a repin can *delete* a patch — two of the four were
-fixed upstream at `71fb301a` — so those modifications can no longer be
-reverse-applied from anything the overlay carries, and they are indistinguishable
-from your own edits on top. This used to abort with git's
-`error: Your local changes to the following files would be overwritten by
-checkout`, which was correct of git and useless to you.
+One commit per patch (keeping the patch's own subject) plus one for the ~44 Bazel
+files. That shape is the point: it is ordinary git, so it **composes** with what you
+already have —
+
+```sh
+git -C ~/ladybird rebase ladybird-bazel-71fb301a851e my-branch   # overlay under your work
+git -C ~/ladybird cherry-pick 5e5a46f                           # just the fd fix, no Bazel files
+git -C ~/ladybird checkout my-branch                            # back to where you were
+./apply_overlay.sh --onto-current ~/ladybird                     # overlay ON TOP of your HEAD
+```
+
+It used to leave a **detached HEAD with 45 untracked files**, which was the wrong
+answer to "how do I get your changes into my tree": nothing was lost, but a floating
+HEAD is not a place you can work (`rebase`/`merge`/`cherry-pick` all need a named
+ref), 45 untracked files make `git status` permanently useless while `git diff` and
+`git log` show nothing at all, a stray `git clean -fd` deletes the lot — and it
+walked straight past the branch and commits you already had.
+
+Flags for the cases that differ:
+
+| Flag | Use |
+|---|---|
+| `--branch NAME` | build the overlay on a branch you name |
+| `--onto-current` | base it on **your** HEAD instead of the pin (warns: the generated BUILD files name ~1,961 sources by path and were generated *from* the pin) |
+| `--no-commit` | the old behaviour — mutate the working tree, commit nothing |
+
+**Already have a tree from an older pin?** The same command moves it forward. The
+previous pin's overlay is a *commit* on its own branch, so it no longer collides with
+the checkout at all, and your old branch still builds. A re-run is idempotent: it
+resets the overlay branch to the pin and rebuilds its commits — but if that branch
+holds a commit that is **not** the overlay's, it stops and names it rather than
+resetting over your work:
+
+```
+error: branch 'ladybird-bazel-71fb301a851e' has commits that are not this overlay's:
+      9570358 ulf: tweak bazelrc on the overlay branch
+    I will not reset a branch holding your work. [...]
+```
+
+Uncommitted changes to tracked files (from a run of the *old* script, or your own)
+are **stashed, never discarded** — `git stash pop` restores them. That matters
+because a repin can *delete* a patch, so those edits can no longer be
+reverse-applied from anything the overlay carries and are indistinguishable from
+your own.
 
 Or by hand:
 
