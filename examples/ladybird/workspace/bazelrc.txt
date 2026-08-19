@@ -92,6 +92,22 @@ build --linkopt=-L/usr/lib/x86_64-linux-gnu
 # Qt6 does not appear here: it comes from rules_qt as a real Bazel dep, and the
 # vcpkg include dirs ride on //Meta/vcpkg:<port> (finding 33).
 build --action_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include:/usr/include/gio-unix-2.0:/usr/include/blkid:/usr/include/libmount:/usr/include/sysprof-6
+# ...and the SAME value as a --repo_env, which is not redundant. --action_env
+# makes the compiler FIND the header; Bazel then rejects it anyway:
+#
+#   Compiling UI/Qt/ExternalURLHandler.cpp failed: absolute path inclusion(s)
+#   found in rule '//:ladybird': ... includes the following non-builtin files
+#   with absolute paths: '/usr/lib/.../glib-2.0/include/glibconfig.h'
+#
+# -- a correctness check, and a fair one: a header outside the execution root
+# that no toolchain declares is an undeclared input, so Bazel cannot know when
+# it changed. rules_cc computes the builtin include dirs by running `cc -E -v`
+# in a REPOSITORY rule, and CPLUS_INCLUDE_PATH appears in that output -- so
+# passing it as --repo_env is what puts these roots in
+# cxx_builtin_include_directories, i.e. declares them to the toolchain rather
+# than sneaking past the check. Only glibconfig.h needed it: every other root
+# here is under /usr/include, which gcc already reports as builtin.
+build --repo_env=CPLUS_INCLUDE_PATH=/usr/include/libdrm:/usr/include/glib-2.0:/usr/lib/x86_64-linux-gnu/glib-2.0/include:/usr/include/gio-unix-2.0:/usr/include/blkid:/usr/include/libmount:/usr/include/sysprof-6
 
 # --- exec (host) configuration ---------------------------------------------
 # Every flag above is a --cxxopt/--copt/--linkopt, which Bazel applies only to
