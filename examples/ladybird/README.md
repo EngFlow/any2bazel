@@ -531,6 +531,17 @@ three test pages. Re-verified at 71fb301a against `Build/full71` with no
 `libexec/` staged at all: `--headless=text` identical, `--headless=layout-tree`
 identical (119 lines), `about:version` identical.
 
+Re-verified once more after the vcpkg pin was **re-captured** at this commit — the
+change that moves `sdl3` from the old pin's 3.4.12 to the 3.2.28 `vcpkg.json` asks
+for, so all 77 ports rebuilt from the new distfile set. `bazel build` of all six
+binaries RC=0, Bazel's own tree carries `libSDL3.so.0.2.28` and
+`sdl3_3.2.28_x64-linux-dynamic.list` where it used to carry 3.4.12, and both
+`--headless=text` and `--headless=layout-tree` are byte-identical to the CMake
+reference (same md5, 8 and 65 lines). Checked the way [gap 11](#known-gaps) says to:
+the reference output was regenerated from `Build/full71/bin/Ladybird` on the same
+page in the same session rather than compared against a remembered line count, and
+the six running binaries were confirmed to be the ones just built.
+
 ## Known gaps
 
 Honest inventory of what stops this from being a clone-and-build.
