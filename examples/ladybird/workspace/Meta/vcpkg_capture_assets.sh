@@ -137,11 +137,29 @@ if [ -n "${CAPTURE_ONLY_DOWNLOADS:-}" ]; then
     echo "capture: URLs only; the result will be reported as not emittable." >&2
     set -- --only-downloads "$@"
 fi
+# --binarysource=clear is MANDATORY for a capture, and it is the third way this
+# script silently lost rows. vcpkg's binary cache is keyed by each port's ABI
+# hash; on a hit it unpacks the archive and NEVER RUNS THE PORTFILE, so the port
+# asks for none of its downloads and contributes nothing to the capture. Unlike a
+# failed fetch or a halt, this leaves no trace at all: no error, no halt, exit 0.
+#
+# Measured, because I did not believe it was this bad: two runs of a zlib-only
+# manifest against a warm ~/.cache/vcpkg/archives, second run with a fresh install
+# root. Run 1 built zlib and captured 3 rows. Run 2 printed "Restored 3
+# package(s)", "All requested installations completed successfully in: 1.54 ms",
+# exited 0 -- and captured ZERO. The old capture had no --binarysource at all, so
+# it inherited whatever cache the machine had; that is enough on its own to
+# explain a re-capture that cannot reproduce the committed rows.
+#
+# It goes BEFORE "$@" so a caller can still override it deliberately (last flag
+# wins), and the floor check below is what catches it if they do.
+#
 # `set -euo pipefail` is on, so the pipeline's status is vcpkg's when vcpkg fails
 # and tee's only when tee does -- without pipefail the tee would swallow a vcpkg
 # failure outright.
 "${VCPKG_ROOT:?set VCPKG_ROOT}/vcpkg" install \
     --x-asset-sources="clear;x-script,$REC {url} {sha512} {dst}" \
+    --binarysource=clear \
     "$@" 2>&1 | tee "$VCPKG_LOG"
 
 # A halted portfile loses its later downloads exactly like a failed fetch does,
@@ -167,6 +185,32 @@ awk '
   tolower($0) ~ /halting portfile/ && port \
     { print "port " port " halted before finishing its portfile" }
 ' "$VCPKG_LOG" | sort -u >> "$FAILED"
+
+# The two ways a port can skip its portfile ENTIRELY, and so contribute nothing
+# while looking fine. Both are silent -- no error, no halt, exit 0 -- so the log
+# is again the only witness.
+#
+#   "Restored N package(s) from <cache>"  -- a binary-cache hit unpacks an archive
+#       instead of running the portfile. Guarded above with --binarysource=clear,
+#       but a caller can override it, so verify the OUTCOME rather than trusting
+#       the flag.
+#   "The following packages are already installed"  -- an install root that
+#       already has the port. Nothing is rebuilt, nothing is downloaded. This is
+#       why a capture wants a FRESH --x-install-root: the 71fb301a capture's
+#       second run had 7 ports already installed and could not have captured any
+#       of their distfiles.
+if grep -q "^Restored [0-9]* package" "$VCPKG_LOG"; then
+    grep -o "^Restored [0-9]* package(s) from [^ ]*" "$VCPKG_LOG" \
+        | sed 's/$/ -- a cache hit never runs the portfile, so those downloads were never requested/' \
+        >> "$FAILED"
+fi
+if grep -q "The following packages are already installed" "$VCPKG_LOG"; then
+    n=$(sed -n '/The following packages are already installed/,/^The following packages will be/p' \
+        "$VCPKG_LOG" | grep -c "^ *[*]* *[a-z0-9]" || true)
+    echo "$n package(s) were ALREADY INSTALLED -- their portfiles did not run," \
+         "so their downloads were never requested; use a fresh --x-install-root" \
+        >> "$FAILED"
+fi
 
 rm -f "$REC"
 # Keep $VCPKG_LOG until the capture is blessed: if it is INCOMPLETE the log is the
@@ -200,10 +244,11 @@ sort -u -t$'\t' -k1,2 -o "$OUT" "$OUT"
 if [ -s "$FAILED" ]; then
     echo "capture: INCOMPLETE -- $(wc -l < "$FAILED") loss(es):" >&2
     sed 's/^/capture:   /' "$FAILED" >&2
-    echo "capture: A failed download, and a portfile halted for any other reason," >&2
-    echo "capture: both HALT the portfile, so every later vcpkg_download_distfile" >&2
-    echo "capture: in that port was never requested and is MISSING from $OUT." >&2
-    echo "capture: Do not emit rules from this file." >&2
+    echo "capture: Every one of these means some vcpkg_download_distfile was never" >&2
+    echo "capture: REQUESTED, and only requested downloads can be captured: a failed" >&2
+    echo "capture: fetch and a refused step both halt the rest of their portfile, and" >&2
+    echo "capture: a cache hit or an already-installed port skips the portfile whole." >&2
+    echo "capture: So $OUT is missing rows and looks complete. Do not emit from it." >&2
     echo "capture: Re-run; it appends and shares downloads/, so it resumes." >&2
     echo "capture: A halt on EVERY port means CAPTURE_ONLY_DOWNLOADS was set --" >&2
     echo "capture: that mode cannot produce a complete capture; drop it." >&2

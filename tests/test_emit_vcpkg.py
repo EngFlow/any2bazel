@@ -701,13 +701,13 @@ def test_a_failed_download_makes_the_capture_fail_because_vcpkg_will_not():
     tail = sh.split("chmod +x", 1)[1]
     assert 'if [ -s "$FAILED" ]' in tail, \
         "the driver never checks whether any download failed"
-    assert re.search(r'if \[ -s "\$FAILED" \][\s\S]{0,800}?exit 1', tail), \
-        "a capture with failed downloads still exits 0"
+    block = tail.split('if [ -s "$FAILED" ]', 1)[1].split("\nfi", 1)[0]
+    assert "exit 1" in block, "a capture with failed downloads still exits 0"
     # The message has to say the non-obvious part, or a reader re-runs the emitter
     # on the incomplete file.
-    assert re.search(r"HALTS? the portfile|HALTS its portfile", tail), \
+    assert re.search(r"halt the rest of their portfile|HALTS its portfile", tail), \
         "the message does not explain that later downloads in that port are missing"
-    assert "never requested" in tail and "MISSING" in tail, \
+    assert "never" in tail and "REQUESTED" in tail and "missing rows" in tail, \
         "the message does not say the capture is missing rows"
 
 
@@ -821,3 +821,56 @@ def test_the_capture_does_not_let_tee_swallow_a_vcpkg_failure():
     code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
     assert re.search(r"^set -euo pipefail", code, re.M) or "PIPESTATUS" in code, \
         "vcpkg's output is piped into tee with neither pipefail nor a PIPESTATUS check"
+
+
+def test_the_capture_turns_the_binary_cache_off():
+    """The third and worst way this script lost rows: a port that never ran.
+
+    vcpkg's binary cache is keyed by each port's ABI hash; on a hit it unpacks the
+    archive and does NOT run the portfile, so the port requests none of its
+    downloads. Unlike a failed fetch or a halt this is completely silent: no error,
+    no halt, exit 0, "All requested installations completed successfully".
+
+    Measured with a zlib-only manifest against a warm ~/.cache/vcpkg/archives: the
+    first run built zlib and captured 3 rows; the second, with a fresh install root,
+    printed "Restored 3 package(s)" and captured ZERO while exiting 0. The capture
+    had no --binarysource at all, so it inherited whatever cache the machine
+    happened to have -- enough on its own to explain a re-capture that cannot
+    reproduce the committed rows. vcpkg_build.sh already passed
+    --binarysource=clear for the adjacent reason (a restore proves nothing about
+    building from source); the capture never did.
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert "--binarysource=clear" in code, \
+        ("the capture does not disable the binary cache: a restored port skips its "
+         "portfile and contributes no rows, silently")
+    # Before "$@", so a caller can still override deliberately -- and the outcome
+    # check below is what catches them if they do.
+    install = code.split("/vcpkg\" install", 1)[1].split("\n\n", 1)[0]
+    assert install.index("--binarysource=clear") < install.index('"$@"'), \
+        "--binarysource=clear after \"$@\" would override the caller instead of defaulting"
+
+
+def test_a_port_that_skipped_its_portfile_fails_the_capture():
+    """Belt and braces for the flag above: check the OUTCOME, not the intent.
+
+    Two lines in vcpkg's output mean a port contributed nothing:
+    "Restored N package(s) from <cache>" (cache hit) and "The following packages
+    are already installed" (a reused install root -- the 71fb301a capture's second
+    run had 7 of those). Both are invisible in the exit code, so both are read off
+    the teed log and land in $FAILED.
+
+    Verified with fake vcpkgs printing each line and exiting 0: the script exits 1,
+    and the already-installed case reports the COUNT (2 of the 2 listed).
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert re.search(r'grep -q "\^Restored \[0-9\]\* package" "\$VCPKG_LOG"', code), \
+        "a binary-cache restore is not detected, so an overridden --binarysource is silent"
+    assert "The following packages are already installed" in code, \
+        "a reused install root is not detected: those ports' downloads are missing"
+    for marker in ("^Restored [0-9]* package", "already installed"):
+        seg = code.split(marker, 1)[1].split("\nif ")[0]
+        assert '>> "$FAILED"' in seg, \
+            f"a skipped portfile detected via {marker!r} never reaches $FAILED"
