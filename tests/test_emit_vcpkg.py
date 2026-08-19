@@ -705,8 +705,10 @@ def test_a_failed_download_makes_the_capture_fail_because_vcpkg_will_not():
         "a capture with failed downloads still exits 0"
     # The message has to say the non-obvious part, or a reader re-runs the emitter
     # on the incomplete file.
-    assert "HALTS its portfile" in tail, \
+    assert re.search(r"HALTS? the portfile|HALTS its portfile", tail), \
         "the message does not explain that later downloads in that port are missing"
+    assert "never requested" in tail and "MISSING" in tail, \
+        "the message does not say the capture is missing rows"
 
 
 def test_the_capture_bounds_stalls_not_transfer_size():
@@ -740,3 +742,82 @@ def test_the_capture_is_resumable():
     assert 'touch "$OUT"' in code, "the capture does not append to an existing run"
     assert re.search(r"sort -u -t\$'\\t' -k1,2 -o \"\$OUT\" \"\$OUT\"", code), \
         "without the dedupe, appending duplicates rows"
+
+
+def test_download_only_mode_cannot_produce_a_complete_capture():
+    """`--only-downloads` was the DEFAULT, with a comment claiming it sufficed.
+
+    The claim ("it is enough because the asset hook fires during resolution") was
+    invented, not measured -- the fourth instance this repin of generated prose
+    restating a hand-copied fact. What actually happens: Download Mode makes vcpkg
+    refuse to EXECUTE anything, and a portfile that stops executing stops
+    downloading. angle downloads gni-to-cmake.py (portfile.cmake:79), sets up a
+    python venv to run it (:86, x_vcpkg_get_python_packages), and only THEN
+    downloads four WebKit files (:123 :129 :144 :151). In Download Mode :86 halts,
+    so those four URLs are unreachable by construction -- measured: the halt is at
+    `angle/portfile.cmake:86` in the download-only re-capture, which wrote 72 rows
+    where the committed capture has 76.
+
+    So the committed 76-row capture cannot have been made in that mode, and the
+    fast mode must not be the default. It stays available (opt-in) for refreshing
+    known-reachable URLs, and the halt check refuses to bless its output.
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    # Opt-in, not default: the flag may only be passed under the env switch.
+    assert "--only-downloads" in code, "the fast mode is gone entirely"
+    for line in code.splitlines():
+        if "--only-downloads" in line:
+            break
+    guard = code.split("--only-downloads")[0].splitlines()[-6:]
+    assert any("CAPTURE_ONLY_DOWNLOADS" in l for l in guard), \
+        ("--only-downloads is passed unconditionally again; it CANNOT reach the "
+         "downloads behind an executed portfile step (angle's four WebKit files)")
+
+
+def test_a_halted_portfile_fails_the_capture_and_names_the_port():
+    """The other way a capture silently loses URLs, with no failed download.
+
+    A halt loses every download after it, exactly like a failed fetch -- and vcpkg
+    exits 0 for it too ("Downloaded sources for angle", then "All requested
+    installations completed successfully"). There is no exit code and no
+    asset-script callback for a step never reached, so the only witness is vcpkg's
+    stdout; hence the tee into a log the driver greps.
+
+    It must name the PORT. The halt message itself names a shared helper
+    (vcpkg_execute_required_process.cmake:23, identical for every port) and the
+    portfile in the call stack is a versioned path under bt/versioning_ -- neither
+    is actionable. The port comes from the "Installing N/M <port>:<triplet>@<ver>"
+    line above the halt.
+
+    Verified against the fake vcpkg that prints a halt and exits 0: the script
+    exits 1 with "port angle halted before finishing its portfile".
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert "tee" in code and "VCPKG_LOG" in code, \
+        "vcpkg's output is not kept, so a halt cannot be detected at all"
+    assert re.search(r"halting portfile", code, re.I), \
+        "nothing looks for a halted portfile"
+    assert 'tolower($0)' in code, \
+        ("the halt must be matched case-insensitively: vcpkg spells it both "
+         "'Halting portfile execution.' and 'Download failed, halting portfile.'")
+    assert re.search(r"Installing \[0-9\]\+", code), \
+        "the halt is not attributed to a port via the 'Installing N/M <port>' line"
+    # The halt has to land in the same sentinel the exit-1 check reads.
+    halt = code.split("halting portfile")[1]
+    assert '>> "$FAILED"' in halt.split("rm -f")[0], \
+        "a detected halt does not reach $FAILED, so the capture still exits 0"
+
+
+def test_the_capture_does_not_let_tee_swallow_a_vcpkg_failure():
+    """Piping vcpkg into tee moves the pipeline's exit status to tee's.
+
+    Added when the log was introduced: without pipefail, `vcpkg install | tee log`
+    reports tee's success and a hard vcpkg failure becomes a capture that "worked".
+    Verified with a fake vcpkg that exits 3 -- the script exits 3.
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert re.search(r"^set -euo pipefail", code, re.M) or "PIPESTATUS" in code, \
+        "vcpkg's output is piped into tee with neither pipefail nor a PIPESTATUS check"
