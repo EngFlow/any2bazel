@@ -365,8 +365,13 @@ def test_every_qt_module_the_build_links_is_preflighted_with_its_package():
     assert linked, "no @qt//:Qt* deps in BUILD.bazel -- did the label scheme change?"
 
     # What the preflight knows about.
-    block = rt.split("_QT_MODULES = {", 1)[1].split("}", 1)[0]
-    preflighted = dict(re.findall(r'"(Qt\w+)":\s*"([^"]+)"', block))
+    block = rt.split("_QT_MODULES = {", 1)[1].split("\n}", 1)[0]
+    # (module -> (deb package, aqt module)): BOTH forms, because which one is
+    # correct advice depends on the SDK -- see the venv case below.
+    preflighted = dict(re.findall(r'"(Qt\w+)":\s*\("([^"]+)",\s*"([^"]+)"\)',
+                                  block.replace("\n", " ")) and
+                       [(m, (d, a)) for m, d, a in
+                        re.findall(r'"(Qt\w+)":\s*\("([^"]+)",\s*"([^"]+)"\)', block)])
     assert preflighted, "_QT_MODULES is empty or unparseable"
 
     missing = sorted(linked - set(preflighted))
@@ -376,13 +381,16 @@ def test_every_qt_module_the_build_links_is_preflighted_with_its_package():
         "generated BUILD file instead of the apt package: %s" % missing)
 
     # Every entry must name a package, or the message cannot tell anyone what to do.
-    for mod, pkg in sorted(preflighted.items()):
-        assert pkg and not pkg.startswith("Qt"), \
-            "%s maps to %r, which is not a package name" % (mod, pkg)
+    for mod, (deb, aqt) in sorted(preflighted.items()):
+        assert deb and not deb.startswith("Qt"), \
+            "%s maps to %r, which is not a package name" % (mod, deb)
+        assert aqt and not aqt.startswith("Qt"), \
+            "%s has no aqt module name (%r); a venv/aqt SDK cannot be told what " \
+            "to install" % (mod, aqt)
 
     # The regression that motivated this: Positioning became REQUIRED at 71fb301a.
-    assert preflighted.get("QtPositioning") == "qt6-positioning-dev", \
-        "QtPositioning must map to the package that ships libQt6Positioning.so"
+    assert preflighted.get("QtPositioning") == ("qt6-positioning-dev", "qtpositioning"), \
+        "QtPositioning must name both the deb and the aqt module"
 
 
 def test_the_module_preflight_reads_the_same_libs_dir_rules_qt_derives_from():
@@ -407,9 +415,18 @@ def test_the_module_preflight_reads_the_same_libs_dir_rules_qt_derives_from():
     assert 'split(".")' in impl, \
         "libQt6Positioning.so.6.10.2 must reduce to QtPositioning like _create_lib_name does"
     # The failure has to be actionable: package names and the cache caveat.
-    fail_msg = impl.split("missing {n} module", 1)[1].split('))', 1)[0] \
-        if "missing {n} module" in impl else ""
-    assert "apt install" in fail_msg, "the failure does not say how to install the module"
-    assert "sync --configure" in fail_msg or "clean --expunge" in fail_msg, \
+    # The install advice lives in _install_hint; the surrounding fail() carries the
+    # context. Both are part of what the reader sees.
+    hint = rt.split("def _install_hint", 1)[1].split("\ndef ", 1)[0]
+    assert "apt install" in hint, "no distro instruction for a distro Qt"
+    assert "aqt" in hint, "no self-contained-SDK instruction for a venv/aqt Qt"
+    assert "CANNOT fix it" in hint, \
+        ("a self-contained SDK is not told that apt cannot help: apt installs into "
+         "/usr/lib, which that SDK never reads, so following the advice changes "
+         "nothing and the reader concludes the message was wrong")
+    assert "sync --configure" in impl or "clean --expunge" in impl, \
         ("the failure does not mention that @qt is cached, so a reader who installs "
          "the package and re-runs can get the same error and conclude it did not work")
+    # The SDK must be NAMED, or a reader with two Qts cannot tell which one failed.
+    assert "QT_INSTALL_PREFIX" in impl and "libs" in impl, \
+        "the failure does not name the prefix/lib dir it probed"

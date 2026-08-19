@@ -220,6 +220,33 @@ link". A test asserts the module list agrees with the `@qt//:Qt*` deps in
 `BUILD.bazel`, so a module added by a future repin cannot silently skip its
 preflight — the same drift that made `Positioning` a bug in the first place.
 
+**The advice depends on which Qt you have**, and getting that wrong is worse than
+saying nothing. For a distro Qt the message says `apt install`; for a
+**self-contained SDK** (aqt, a venv, the official installer) it says the opposite,
+because `apt` installs into `/usr/lib/...` where that SDK never looks — you would
+install the package, get the identical error, and reasonably conclude the message was
+wrong. So the check reports the prefix and lib directory it probed, then names the
+`aqt --modules` form instead.
+
+### Your Qt SDK path is yours
+
+`MODULE.bazel`'s `qt.local_repo(paths = ...)` is the one line in the overlay that is a
+fact about **your machine** rather than about Ladybird at the pin — and the copy phase
+used to overwrite it. If you build against Qt 6.9.2 in a venv while your system Qt is
+6.4.2, that re-apply did not merely change a setting: it moved you *below* Ladybird's
+6.9 floor, turning a working tree into a failing one, with the failure surfacing later
+and elsewhere. Now it is resolved rather than imposed (first wins, and the script says
+which rule won):
+
+1. `--qt-prefix DIR`
+2. the `paths` line already in your `MODULE.bazel` — **so a re-apply preserves it**
+3. the `qmake` first on your `PATH` (activating a venv is how you say which Qt you mean)
+4. `/usr/lib/qt6`, the historical default
+
+`--verify` treats that line as expected-to-differ for the same reason, and if the
+chosen Qt is readable the script prints its version and warns immediately when it is
+below 6.9.
+
 Not a courtesy list — the set is derived from vcpkg's own scripts into
 [`Meta/vcpkg_host_tools.tsv`](workspace/Meta/vcpkg_host_tools.tsv), and
 `vcpkg_build.sh` checks all of it before building anything, printing the ports that

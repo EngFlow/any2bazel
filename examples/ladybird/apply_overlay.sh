@@ -62,6 +62,22 @@
 # detached and `git status` is clean when it finishes. To put the overlay on top
 # of work you already have instead, use --onto-current.
 #
+#   --qt-prefix DIR  the Qt SDK to build against. MODULE.bazel's qt.local_repo
+#                    `paths` line is the ONE line in the overlay that is a fact
+#                    about your machine, and copying the overlay over it is how a
+#                    re-apply used to silently repoint a working build at the
+#                    system Qt. Ulf builds against Qt 6.9.2 in a VENV while his
+#                    system Qt is 6.4.2, i.e. the hardcoded /usr/lib/qt6 is not
+#                    merely different for him, it is BELOW Ladybird's 6.9 floor --
+#                    so the re-apply turned a working tree into a failing one.
+#                    Resolution order (first wins), all reported:
+#                      1. --qt-prefix DIR
+#                      2. the `paths` line already in the target's MODULE.bazel
+#                      3. the qmake first on PATH (a venv/aqt SDK puts its own
+#                         there, which is exactly the right answer for one)
+#                      4. /usr/lib/qt6, the historical default
+#                    --verify treats that line as expected-to-differ for the same
+#                    reason: it is yours, not ours.
 #   --branch NAME    the branch to build (default: ladybird-bazel-<short pin>)
 #   --onto-current   base it on your current HEAD, not on the pinned commit --
 #                    i.e. apply the overlay ON TOP of your own work. The pin
@@ -97,8 +113,11 @@ PREFETCH=1
 COMMIT=1
 ONTO_CURRENT=0
 BRANCH=""
+QT_PREFIX=""
+# The value baked into workspace/MODULE.bazel, i.e. what a plain copy would impose.
+QT_DEFAULT="/usr/lib/qt6"
 USAGE="usage: $(basename "$0") [--verify] [--no-prefetch] [--branch NAME]
-       [--onto-current] [--no-commit] <ladybird-tree>"
+       [--onto-current] [--no-commit] [--qt-prefix DIR] <ladybird-tree>"
 while [ $# -gt 1 ]; do
     case "${1:-}" in
         --verify) VERIFY=1; shift ;;
@@ -107,6 +126,8 @@ while [ $# -gt 1 ]; do
         --onto-current) ONTO_CURRENT=1; shift ;;
         --branch) BRANCH="${2:-}"; [ -n "$BRANCH" ] || die "$USAGE"; shift 2 ;;
         --branch=*) BRANCH="${1#--branch=}"; shift ;;
+        --qt-prefix) QT_PREFIX="${2:-}"; [ -n "$QT_PREFIX" ] || die "$USAGE"; shift 2 ;;
+        --qt-prefix=*) QT_PREFIX="${1#--qt-prefix=}"; shift ;;
         -h|--help) echo "$USAGE"; exit 0 ;;
         -*) die "unknown flag: $1
 $USAGE" ;;
@@ -154,7 +175,80 @@ target_path() {
 }
 
 # ---------------------------------------------------------------------------
+# The Qt prefix: the one line in the overlay that is a fact about YOUR machine.
+#
+# Everything else here is a fact about Ladybird at the pin, identical on every
+# host. `qt.local_repo(paths = {"linux-x86_64": ...})` is not: it names an SDK, and
+# copying the overlay over it silently replaced a working answer with the answer
+# from the capturing machine. Ulf: "We're using Qt (6.9.2) from a VENV, and system
+# Qt is 6.4.2" -- so the copy did not just change his configuration, it moved him
+# BELOW Ladybird's 6.9 floor, turning a working tree into a failing one on re-apply.
+_qt_line_path() { grep -nE '^\s*paths = \{"linux-x86_64":' "$1" 2>/dev/null | head -1; }
+
+# The prefix currently configured in a tree's MODULE.bazel, if any.
+qt_prefix_in_tree() {
+    [ -f "$1/MODULE.bazel" ] || return 1
+    sed -n 's|^[[:space:]]*paths = {"linux-x86_64": "\([^"]*\)".*|\1|p' \
+        "$1/MODULE.bazel" 2>/dev/null | head -1
+}
+
+# The SDK whose qmake is first on PATH. For a venv/aqt Qt that is precisely the
+# right answer -- activating the venv is how you say which Qt you mean -- and it is
+# how rules_qt would find it if `paths` were not hardcoded.
+qt_prefix_from_qmake() {
+    command -v qmake6 >/dev/null 2>&1 && q=qmake6 || q=qmake
+    command -v "$q" >/dev/null 2>&1 || return 1
+    p="$("$q" -query QT_INSTALL_PREFIX 2>/dev/null)" || return 1
+    [ -n "$p" ] && [ -d "$p" ] && echo "$p"
+}
+
+qt_version_at() {
+    for q in "$1/bin/qmake6" "$1/bin/qmake"; do
+        [ -x "$q" ] && "$q" -query QT_VERSION 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Resolve, in the documented order, and SAY which rule won: a silent default is
+# what made this a bug in the first place.
+#
+# Sets the GLOBALS QT_RESOLVED/QT_SOURCE rather than echoing: called through
+# `$(...)` the assignment to QT_SOURCE would happen in a subshell and be lost --
+# which it was, printing "(from )" on the first run of this code.
+resolve_qt_prefix() {
+    local tree="$1" from
+    if [ -n "$QT_PREFIX" ]; then
+        QT_RESOLVED="$QT_PREFIX"; QT_SOURCE="--qt-prefix"; return
+    fi
+    if from="$(qt_prefix_in_tree "$tree")" && [ -n "$from" ]; then
+        QT_RESOLVED="$from"; QT_SOURCE="the paths line already in your MODULE.bazel"; return
+    fi
+    if from="$(qt_prefix_from_qmake)" && [ -n "$from" ]; then
+        QT_RESOLVED="$from"; QT_SOURCE="the qmake first on your PATH"; return
+    fi
+    QT_RESOLVED="$QT_DEFAULT"; QT_SOURCE="the overlay's default"
+}
+
+# Rewrite the copied MODULE.bazel's paths line in place.
+set_qt_prefix_in() {
+    local file="$1" prefix="$2"
+    grep -qE '^\s*paths = \{"linux-x86_64":' "$file" \
+        || die "MODULE.bazel has no qt.local_repo \`paths\` line to point at your Qt.
+    The overlay's shape changed; --qt-prefix cannot be applied. (File left alone.)"
+    # | as the sed delimiter: a path contains / and must not need escaping.
+    sed -i "s|^\([[:space:]]*\)paths = {\"linux-x86_64\": \"[^\"]*\"|\1paths = {\"linux-x86_64\": \"$prefix\"|" "$file"
+}
+
+# ---------------------------------------------------------------------------
 overlay_files > /dev/null   # populate $FILE_LIST once, for both modes
+
+# Resolved BEFORE the copy phase, because rule 2 reads the value in the target's
+# MODULE.bazel and the copy is about to overwrite it.
+QT_SOURCE=""
+QT_RESOLVED=""
+if [ "$VERIFY" -eq 0 ]; then
+    resolve_qt_prefix "$TARGET"
+fi
 
 if [ "$VERIFY" -eq 1 ]; then
     [ -d "$TARGET" ] || die "$TARGET does not exist"
@@ -206,6 +300,29 @@ if [ "$VERIFY" -eq 1 ]; then
             esac
             echo "MISSING $t" >&2; missing=$((missing + 1))
         elif ! cmp -s "$WORKSPACE/$f" "$t"; then
+            # MODULE.bazel's qt.local_repo `paths` line is EXPECTED to differ: it
+            # names the reader's Qt SDK, which is a fact about their machine and not
+            # part of the overlay. Reporting it as DIFFERS told people to overwrite
+            # their own correct configuration -- and following that advice is how a
+            # venv Qt 6.9.2 got replaced by a system Qt 6.4.2, below Ladybird's
+            # floor. So: compare with that ONE line normalised, and if the rest is
+            # identical, report the prefix instead of a failure.
+            if [ "$f" = "MODULE.bazel" ]; then
+                a="$(mktemp)"; b="$(mktemp)"
+                sed 's|^\([[:space:]]*\)paths = {"linux-x86_64": "[^"]*"|\1paths = {"linux-x86_64": "@@QT@@"|' \
+                    "$WORKSPACE/$f" > "$a"
+                sed 's|^\([[:space:]]*\)paths = {"linux-x86_64": "[^"]*"|\1paths = {"linux-x86_64": "@@QT@@"|' \
+                    "$t" > "$b"
+                if cmp -s "$a" "$b"; then
+                    have_qt="$(qt_prefix_in_tree "$(dirname "$t")" || true)"
+                    [ -n "$have_qt" ] || have_qt="$(sed -n 's|^[[:space:]]*paths = {"linux-x86_64": "\([^"]*\)".*|\1|p' "$t" | head -1)"
+                    note "MODULE.bazel matches except the Qt SDK path (yours: ${have_qt:-?}) -- expected"
+                    same=$((same + 1))
+                    rm -f "$a" "$b"
+                    continue
+                fi
+                rm -f "$a" "$b"
+            fi
             echo "DIFFERS $t" >&2; differ=$((differ + 1))
         else
             same=$((same + 1))
@@ -488,6 +605,29 @@ while IFS= read -r f; do
     n=$((n + 1))
 done < "$FILE_LIST"
 note "$n files copied (bazelrc.txt -> .bazelrc), $deferred deferred until vcpkg exists"
+
+# The Qt prefix, restored/set AFTER the copy overwrote MODULE.bazel. Resolved
+# before the copy so rule 2 can read the value the copy is about to destroy.
+if [ -n "$QT_RESOLVED" ]; then
+    set_qt_prefix_in "$TARGET/MODULE.bazel" "$QT_RESOLVED"
+    if [ "$QT_RESOLVED" = "$QT_DEFAULT" ]; then
+        note "Qt SDK: $QT_RESOLVED (from $QT_SOURCE)"
+    else
+        note "Qt SDK: $QT_RESOLVED (from $QT_SOURCE) -- NOT the overlay's"
+        note "  $QT_DEFAULT default; your choice was preserved, not overwritten."
+    fi
+    if v="$(qt_version_at "$QT_RESOLVED")" && [ -n "$v" ]; then
+        note "  that Qt reports version $v"
+        case "$v" in
+            6.[0-8].*|[0-5].*)
+                note "  WARNING: Ladybird requires Qt >= 6.9 (UI/Qt/CMakeLists.txt)."
+                note "  The build will stop in qt_runtime.bzl naming this prefix." ;;
+        esac
+    else
+        note "  NOTE: no qmake under $QT_RESOLVED/bin -- if that is wrong, pass"
+        note "  --qt-prefix DIR (rules_qt runs \`qmake -query\` there)."
+    fi
+fi
 
 # ...and committed, so they are tracked files in a commit rather than 45 lines of
 # untracked noise in `git status`. -f is needed for .bazelrc only if a future

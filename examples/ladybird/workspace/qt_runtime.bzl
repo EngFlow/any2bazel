@@ -92,13 +92,22 @@ _QT_FLOOR = (6, 9)
 # generator agrees with itself. This is the independent statement of what the build
 # needs, and the test asserts the two match -- which is what catches a NEW Qt
 # module appearing in a future repin without its preflight entry.
+#
+# Each entry names the Debian package AND the aqt module, because WHICH ONE IS THE
+# RIGHT ADVICE DEPENDS ON THE SDK, and getting that wrong is worse than saying
+# nothing. Ulf builds against Qt 6.9.2 in a venv while his system Qt is 6.4.2: for
+# him `apt install qt6-positioning-dev` drops libQt6Positioning.so into
+# /usr/lib/x86_64-linux-gnu, which is NOT the lib directory the discovered SDK
+# reports, so the module stays missing, the error is unchanged, and the reader
+# reasonably concludes the advice was wrong -- because it was. The message picks the
+# form that matches the SDK it actually found (see _install_hint).
 _QT_MODULES = {
-    "QtCore": "qt6-base-dev",
-    "QtGui": "qt6-base-dev",
-    "QtWidgets": "qt6-base-dev",
+    "QtCore": ("qt6-base-dev", "qtbase"),
+    "QtGui": ("qt6-base-dev", "qtbase"),
+    "QtWidgets": ("qt6-base-dev", "qtbase"),
     # UI/Qt/CMakeLists.txt:8 -- REQUIRED on non-Apple since the 71fb301a repin
     # (it was OPTIONAL before), for GeolocationProviderQt.cpp.
-    "QtPositioning": "qt6-positioning-dev",
+    "QtPositioning": ("qt6-positioning-dev", "qtpositioning"),
 }
 
 # ---------------------------------------------------------------------------
@@ -278,6 +287,55 @@ def _sdk_private_libs(repository_ctx, libs_root):
         out.append(needed[soname])
     return out
 
+def _is_system_qt(libs_dir):
+    """Is the discovered SDK the DISTRO's Qt, or a self-contained one?
+
+    Decides which install instruction can possibly work. A distro Qt's modules are
+    apt packages; a self-contained SDK (aqt/venv/official installer, or a Nix or
+    Homebrew prefix) has its own lib directory, and apt would install into
+    /usr/lib/... where that SDK never looks.
+
+    Keyed on the LIB DIRECTORY, never on the prefix string. Two reasons, and the
+    second one is a test catching me: `qmake -query` can report a prefix like /usr
+    while the libraries live elsewhere, so the lib dir is the thing both
+    qt.local_repo and the module probe actually read -- AND a list of "prefixes that
+    mean distro" would be another hardcoded host path, the exact thing this file
+    exists to remove (test_plugins_come_from_the_same_sdk_as_the_libraries forbids
+    absolute /usr literals outside _SYSTEM_LIB_DIRS, and rightly failed on my first
+    version of this).
+
+    _SYSTEM_LIB_DIRS is already the list of "directories that are the loader's
+    default search path", derived for the private-library staging; a Qt whose libs
+    are in one of them is a distro Qt by the same definition.
+    """
+    return libs_dir.rstrip("/") in _SYSTEM_LIB_DIRS
+
+def _install_hint(missing, libs_dir):
+    """The instruction that fits the SDK we found -- not a guess between two.
+
+    Both forms are shown when the SDK is self-contained, because we cannot know
+    HOW it was built (aqt, the official installer, Nix, a distro-Qt venv that only
+    wraps the tools), and a reader who is told only "apt install" will do it, see
+    no change, and lose trust in the message. Naming the lib directory we probed is
+    what lets them check the claim themselves.
+    """
+    debs = sorted({_QT_MODULES[m][0]: True for m in missing}.keys())
+    aqts = sorted({_QT_MODULES[m][1]: True for m in missing}.keys())
+    if _is_system_qt(libs_dir):
+        return ("  This looks like your DISTRIBUTION's Qt, so on Debian/Ubuntu:\n\n" +
+                "      sudo apt install {debs}\n").format(debs = " ".join(debs))
+    return (
+        "  This is a SELF-CONTAINED Qt (its libraries live in {libs}, not in a\n" +
+        "  system directory), so `apt install` CANNOT fix it: apt installs into\n" +
+        "  /usr/lib/..., which this SDK never looks in, and you would get this same\n" +
+        "  error again. Add the module to THIS SDK instead. With aqt:\n\n" +
+        "      aqtinstall ... --modules {aqts}\n" +
+        "      # or: aqt install-qt linux desktop <version> --modules {aqts}\n\n" +
+        "  With the official online installer, tick the module under your Qt version.\n" +
+        "  Alternatively point qt.local_repo's `paths` in MODULE.bazel at a Qt that\n" +
+        "  has the module -- but see the note below: it must be ONE Qt, not a mix.\n"
+    ).format(libs = libs_dir or "?", aqts = " ".join(aqts))
+
 def _version_tuple(version):
     parts = version.split(".")
     nums = []
@@ -347,24 +405,32 @@ def _qt_plugins_impl(repository_ctx):
                     present["Qt" + b.split(".")[0][len("libQt%d" % have[0]):]] = True
         missing = [m for m in sorted(_QT_MODULES) if m not in present]
         if missing:
+            prefix = values.get("QT_INSTALL_PREFIX", "?")
             fail((
-                "qt_plugins: the Qt at {prefix} (version {v}) is missing {n} module(s)\n" +
-                "  that //:ladybird links:\n\n{list}\n\n" +
-                "  Install them and re-run; on Debian/Ubuntu:\n\n      sudo apt install {pkgs}\n\n" +
+                "qt_plugins: the Qt this build discovered is missing {n} module(s)\n" +
+                "  that //:ladybird links.\n\n" +
+                "  Qt {v}\n    prefix: {prefix}\n    libraries: {libs}\n" +
+                "  (that is the SDK `qmake -query` reported, i.e. whatever\n" +
+                "   qt.local_repo's `paths` in MODULE.bazel points at)\n\n" +
+                "  Missing:\n\n{list}\n\n" +
+                "{hint}\n" +
                 "  Without this check Bazel reports the same problem as\n" +
                 "    no such target '@@rules_qt++qt+qt//:Qt<Module>'\n" +
                 "  naming a GENERATED BUILD file in your output base, because rules_qt's\n" +
-                "  qt.local_repo derives its cc_library targets by listing this directory --\n" +
-                "  a module you do not have is simply never declared.\n\n" +
+                "  qt.local_repo derives its cc_library targets by listing the library\n" +
+                "  directory above -- a module you do not have is simply never declared.\n\n" +
+                "  Do NOT satisfy this by installing the module for a DIFFERENT Qt than the\n" +
+                "  one named above: the plugins are taken from this same SDK, and mixing two\n" +
+                "  Qt builds in one process is the crash this file's header is about.\n\n" +
                 "  (If you installed it just now, Bazel may have the old @qt cached:\n" +
                 "   `bazel sync --configure` or `bazel clean --expunge` re-runs the probe.)"
             ).format(
-                prefix = values.get("QT_INSTALL_PREFIX", "?"),
+                prefix = prefix,
+                libs = libs_dir,
                 v = version,
                 n = len(missing),
-                list = "\n".join(["      {} (package: {})".format(m, _QT_MODULES[m]) for m in missing]),
-                # No set comprehensions in Starlark; dedupe through a dict.
-                pkgs = " ".join(sorted({_QT_MODULES[m]: True for m in missing}.keys())),
+                list = "\n".join(["      " + m for m in missing]),
+                hint = _install_hint(missing, libs_dir),
             ))
 
     root = repository_ctx.path(plugins_root)

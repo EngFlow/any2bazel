@@ -84,7 +84,13 @@ def test_file_list_is_derived_not_hand_maintained():
     # file (they explain why the list is derived, citing vcpkg_git_archives.bzl as
     # the cautionary case), so strip comments before looking -- a test that cannot
     # tell prose from code makes documenting the reason impossible.
-    code = "\n".join(l.split("#", 1)[0] for l in text.splitlines())
+    # Diagnostics are prose for the same reason comments are: a `note "the build
+    # will stop in qt_runtime.bzl"` tells the reader WHERE their misconfigured Qt
+    # will fail, and a test that cannot tell a message from a roster forces you to
+    # make the message vaguer to go green. What must not exist is a hand-kept LIST
+    # that the copy loop reads -- so strip comments and message lines both.
+    code = "\n".join(l.split("#", 1)[0] for l in text.splitlines()
+                     if not re.match(r'\s*(note|echo|die)\b', l))
     listed = re.findall(r'\b[\w.]+\.bzl\b', code)
     assert not listed, "found hand-listed overlay files in code: %r" % (listed,)
 
@@ -642,3 +648,71 @@ def test_the_ignored_build_vcpkg_file_is_not_committed():
     assert "Build/vcpkg/*) continue" in commit_block, \
         ("the overlay commit sweeps in Build/vcpkg/BUILD.bazel, which Ladybird's "
          ".gitignore excludes and which must not exist before the vcpkg prefetch")
+
+
+def test_the_qt_sdk_path_is_preserved_across_a_reapply():
+    """MODULE.bazel's Qt path is the reader's, and a re-apply must not clobber it.
+
+    Ulf: "We're using Qt (6.9.2) from a VENV, and system Qt is 6.4.2." The overlay
+    hardcodes `paths = {"linux-x86_64": "/usr/lib/qt6"}` and the copy phase
+    overwrites MODULE.bazel, so a re-apply silently repointed his build from a
+    working 6.9.2 at a system 6.4.2 -- which is BELOW Ladybird's 6.9 floor, i.e.
+    the re-apply turned a working tree into a failing one, and the failure surfaced
+    later and elsewhere.
+
+    Every other line in the overlay is a fact about Ladybird at the pin, identical
+    on every host. This one names an SDK on YOUR machine, so it is resolved rather
+    than imposed: --qt-prefix, else the line already in your MODULE.bazel, else the
+    qmake first on your PATH (which is how a venv says which Qt it means), else the
+    historical default. Verified: two consecutive runs, the second with no flags,
+    leave /tmp/venvqt in place.
+    """
+    t = _text()
+    assert "--qt-prefix" in t, "no way to name the Qt SDK"
+    # Rule 2 is the one that makes a re-apply safe: read the target's own value.
+    assert "qt_prefix_in_tree" in t, \
+        "the script does not read the Qt path already configured in the target tree"
+    # Rule 3: a venv/aqt SDK puts its qmake on PATH; that is the right default for it.
+    assert "qmake" in t and "QT_INSTALL_PREFIX" in t, \
+        "the script cannot discover a Qt from qmake, so a venv SDK must be typed by hand"
+    # It must be applied AFTER the copy, or the copy overwrites it again.
+    copy_idx = t.index("copying the overlay")
+    set_idx = t.index("set_qt_prefix_in \"$TARGET/MODULE.bazel\"")
+    assert set_idx > copy_idx, \
+        "the Qt path is written before the overlay copy, which then overwrites it"
+    # And the reader must be TOLD which rule won -- a silent default is the bug.
+    assert "from $QT_SOURCE" in t or "QT_SOURCE" in t, \
+        "the script does not report where the Qt prefix came from"
+
+
+def test_verify_treats_the_qt_sdk_path_as_expected_to_differ():
+    """--verify must not report the reader's own Qt path as a defect.
+
+    Reporting `DIFFERS MODULE.bazel` told people to overwrite their correct
+    configuration with the overlay's -- and doing that is exactly how a venv Qt
+    6.9.2 became a system Qt 6.4.2. So the comparison normalises that one line and,
+    when the rest matches, reports the configured prefix instead of a failure.
+    """
+    t = _text()
+    verify = t.split("if [ \"$VERIFY\" -eq 1 ]", 1)[1].split("exit \"$rc\"", 1)[0]
+    assert "MODULE.bazel" in verify, "--verify has no special case for MODULE.bazel"
+    assert "@@QT@@" in verify, \
+        "--verify does not normalise the Qt path line before comparing"
+    # It must still catch a REAL difference in that file.
+    assert "DIFFERS" in verify, "--verify no longer reports differing files at all"
+
+
+def test_a_qt_below_the_floor_is_reported_at_apply_time():
+    """A too-old Qt must be named when it is chosen, not deep in a build.
+
+    The 6.9 floor is enforced in qt_runtime.bzl (where Bazel can fail the build),
+    but by then the reader is several minutes into `bazel build` and the message
+    names a repository rule. If the prefix is resolvable at apply time, its version
+    is cheap to read, so the script says so immediately -- verified against a fake
+    6.4.2 SDK, which is the version Ulf's system Qt actually is.
+    """
+    t = _text()
+    assert "qt_version_at" in t, "the script never reads the chosen Qt's version"
+    assert "6.9" in t, "the floor is not mentioned where the SDK is chosen"
+    assert re.search(r"6\.\[0-8\]\.\*", t), \
+        "no check that the chosen Qt is below the 6.9 floor"
