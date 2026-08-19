@@ -556,3 +556,90 @@ ls -l /proc/$P/fd | awk '{print $NF}' | sed 's/\[[0-9]*\]//' | sort | uniq -c | 
 
 Everything above is either a counted fd, a labelled GC root, or an A/B against a rebuilt
 binary.
+
+---
+
+## Resolved upstream: PR #11041 fixes all three classes, including the one we could not reach
+
+Ulf handed over `upload/11041.patch` — three commits by sideshowbarker, in review upstream.
+All three **apply cleanly at our pin `71fb301a`** (`git apply --check`, RC 0). Read against
+this document they close the investigation, and the mapping is worth stating precisely
+because two of the three are things we had and one is the thing we had been unable to
+build.
+
+| upstream | what it does | our state |
+|---|---|---|
+| 1/3 `LibRequests+LibWeb: Release response pipes when requests complete` | `defer_teardown()` at the user-finish callback | same call site as our `0001`, but **ordered differently — theirs is correct and ours has a latent bug**, see below |
+| 2/3 `LibWeb: Release response pipes when fetches are canceled` | `abort()`/`terminate()` never told the network layer; both now release the request | a class we **never diagnosed** |
+| 3/3 `LibWeb: Tear down a navigation parked for content sniffing` | a navigation with headers but not enough bytes to sniff has no document, so `Document::abort()` has no controller to stop and only the arrival callback releases the request — which never runs | **exactly the open lead** (`6a311f55`) |
+
+Four things I want on the record.
+
+**Patch 1 is not quite "the same fix as ours" — I nearly wrote that, and it is wrong in a
+way that matters.** Both add `defer_teardown()` inside the same `if` in
+`set_up_internal_stream_data`, but on opposite sides of the `user_on_finish(...)` call:
+
+```cpp
+m_internal_stream_data->user_finish_called = true;
+defer_teardown();                 // upstream: BEFORE
+user_on_finish(...);
+                                  // ours (0001): AFTER
+```
+
+Upstream's order is the safe one, and their commit message states the reason: *"the deferred
+task also keeps the Request alive if the callback drops the last ref."* `defer_teardown()`
+captures `NonnullRefPtr(*this)` **inside** the deferred lambda, so calling it *first* pins
+the `Request` across `user_on_finish`. Ours runs after the callback returns — and
+`user_on_finish` is the fetch completion path, which is exactly where the last reference can
+go away (a `Response` holds its `Request` by `RefPtr` at `Responses.h:226`; drop the
+response in the finish handler and the `Request` dies). Then our `defer_teardown()` runs on
+a half-destroyed object, or is never reached at all. It has never fired for me, because on
+my workloads something always outlived the callback — which is precisely the kind of latent
+ordering bug that shows up as a rare crash on someone else's machine, not as a leak on mine.
+That alone settles which version the overlay should carry: **theirs**.
+
+**Patch 3 is the hypothesis I had, and had failed to reproduce.** The open lead in this
+document was "a navigation whose delivery is paused and never resumed never reaches
+`user_finish_called`, so the completion path is never taken", and the reason it stayed open
+is that I built two workloads for it (330 abandoned dribbling navigations with site
+isolation + memory cache; 300 cache hits) and **both came out flat**. Upstream's reproducer
+is more specific than either: an **iframe removed** while its response has headers but
+fewer bytes than the sniff threshold, i.e. the leak needs the navigable *destroyed* while
+parked, not merely the navigation abandoned. My workloads abandoned navigations without
+destroying the navigable, so they exercised everything except the condition that matters. A
+falsified workload was evidence about my workload, not about the hypothesis — and I came
+close to treating it as the latter.
+
+**Patch 2 is a class my instrument could not have found.** `fd_census.py` ranks by growth
+and splits `peer=DEAD`/`ALIVE`, which is what identified the completed-request class; but
+`abort()`/`terminate()` leaking one fd per cycle looks identical in that view to any other
+retained peer=DEAD socket. Nothing in the census points at the *cancel* path specifically,
+and I never asked whether the two entry points that mark a fetch cancelled actually tell
+the network layer. That is a reading-the-code finding, and no amount of my census data
+would have produced it.
+
+**Our `0002` (`release_response_fd`) has no upstream counterpart, and that is a signal.**
+Upstream fixes the leak by making sure the teardown *is reached* on each of the three paths;
+our `0002` closes the fd defensively at a point where "EOF or every reported byte
+delivered" is already proven, on the theory that some other reference to the `Request`
+survives (`Response::m_request_server_request`, copied by `clone()`). If upstream's three
+patches take Ulf's rate to zero, that theory is unnecessary — the fd was never being
+retained by a surviving reference, it was that nothing had run the teardown at all. The
+honest reading is that `0002` was a workaround for a missing call site, and it worked on my
+box because my box only ever hit the class `0001` already covered.
+
+### What this changes in the overlay
+
+Our two patches become **pin artefacts** the moment #11041 lands, exactly like
+`0001-libweb-bindings-deterministic-dictionary-order` did (todo `643ea99e`): they apply
+only because our pin predates the fix. Both already carry `.effect-grep` files, so
+`apply_overlay.sh --verify` accepts upstream's equivalent fix in place of our exact bytes —
+which is the mechanism built for precisely this, and it means a repin past #11041 does not
+break verification. The action on that repin is to **delete both patches**, drop them from
+the README's patch table, and re-run the census to confirm the rate is zero with upstream's
+version rather than ours.
+
+Not done here: #11041 is unmerged, so nothing is deleted yet. What I would *not* do is
+carry our `0002` forward alongside upstream's three — two mechanisms closing the same fd,
+one of them justified by a theory the other one falsifies, is how the next reader gets
+misled.

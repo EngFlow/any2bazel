@@ -1,0 +1,460 @@
+From 63817a66757e4005383cd7c4e9508fa188e823fc Mon Sep 17 00:00:00 2001
+From: sideshowbarker <mike@w3.org>
+Date: Fri, 7 Aug 2026 09:44:33 -0700
+Subject: [PATCH 1/3] LibRequests+LibWeb: Release response pipes when requests
+ complete
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Pages issuing fetches in a tight loop accumulate one open Unix
+socket per completed fetch in their WebContent process. The WPT scroll-
+to-text-fragment/redirects.html test polls that way, and drove a local
+WebContent process to ~21,900 socket/fileport attachments — at which
+point the process crashed after receiving the next response pipe failed.
+In a local repro driving about 1,500 fetches per second, WebContent grew
+from 5,541 to 63,543 Unix-socket descriptors in 43 seconds.
+
+Cause: Requests::Request tears down its stream state only when a request
+is stopped or transferred. On ordinary completion, the ReadStream with
+the response-pipe descriptor, its notifier, and the internal buffers all
+stay alive until the Request object is destroyed – and a fetch Response
+holds a reference to its Request until GC. The scarce resource is file
+descriptors — but GC pressure is measured in heap bytes. So, a tight
+fetch loop retires thousands of completed requests without GC ever
+having a reason to run — and so, the descriptor table fills up.
+
+Fix: Schedule the existing deferred teardown at the moment a request
+delivers its user-finish callback (the single point every request passes
+through on ordinary completion) — for buffered and unbuffered modes and
+for network errors alike. That’s only reached once all response data has
+been delivered. So streaming consumers and paused document loads are un-
+affected — and stopped/transferred requests keep their existing teardown
+paths. The teardown must stay deferred: It’s scheduled from inside the
+callback chain it destroys, and the deferred task also keeps the Request
+alive if the callback drops the last ref. With this change, the repro
+holds steady at 0–2 open response pipes at an unchanged request rate.
+---
+ Libraries/LibRequests/Request.cpp             | 20 +++++++++++
+ Libraries/LibRequests/Request.h               |  9 +++--
+ Libraries/LibWeb/Internals/Internals.cpp      |  6 ++++
+ Libraries/LibWeb/Internals/Internals.h        |  1 +
+ Libraries/LibWeb/Internals/Internals.idl      |  1 +
+ ...sponse-pipes-released-after-completion.txt |  1 +
+ ...ponse-pipes-released-after-completion.html | 33 +++++++++++++++++++
+ 7 files changed, 66 insertions(+), 5 deletions(-)
+ create mode 100644 Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt
+ create mode 100644 Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html
+
+diff --git a/Libraries/LibRequests/Request.cpp b/Libraries/LibRequests/Request.cpp
+index 6262425a5bad5..16234917a4927 100644
+--- a/Libraries/LibRequests/Request.cpp
++++ b/Libraries/LibRequests/Request.cpp
+@@ -35,6 +35,25 @@ static Optional<Core::ImmutableBytes> map_body_file(int fd, u64 offset, u64 size
+     return payload.release_value();
+ }
+ 
++static size_t s_live_read_stream_count = 0;
++
++size_t ReadStream::live_count()
++{
++    return s_live_read_stream_count;
++}
++
++ReadStream::ReadStream(NonnullOwnPtr<Stream> stream, NonnullRefPtr<Core::Notifier> notifier)
++    : m_stream(move(stream))
++    , m_notifier(move(notifier))
++{
++    ++s_live_read_stream_count;
++}
++
++ReadStream::~ReadStream()
++{
++    --s_live_read_stream_count;
++}
++
+ ErrorOr<NonnullOwnPtr<ReadStream>> ReadStream::create(int reader_fd)
+ {
+ #if defined(AK_OS_WINDOWS)
+@@ -326,6 +345,7 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+         auto has_received_all_reported_bytes = m_internal_stream_data->request_done && m_internal_stream_data->delivered_size >= m_internal_stream_data->total_size;
+         if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
+             m_internal_stream_data->user_finish_called = true;
++            defer_teardown();
+             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
+         }
+     };
+diff --git a/Libraries/LibRequests/Request.h b/Libraries/LibRequests/Request.h
+index b4046fa8d114a..69cdf0d6d0398 100644
+--- a/Libraries/LibRequests/Request.h
++++ b/Libraries/LibRequests/Request.h
+@@ -55,6 +55,9 @@ class ResponseData {
+ class ReadStream {
+ public:
+     static ErrorOr<NonnullOwnPtr<ReadStream>> create(int reader_fd);
++    ~ReadStream();
++
++    static size_t live_count();
+ 
+     NonnullRefPtr<Core::Notifier> const& notifier() const { return m_notifier; }
+ 
+@@ -63,11 +66,7 @@ class ReadStream {
+     ErrorOr<Bytes> read_some(Bytes bytes) { return m_stream->read_some(bytes); }
+ 
+ private:
+-    ReadStream(NonnullOwnPtr<Stream> stream, NonnullRefPtr<Core::Notifier> notifier)
+-        : m_stream(move(stream))
+-        , m_notifier(move(notifier))
+-    {
+-    }
++    ReadStream(NonnullOwnPtr<Stream> stream, NonnullRefPtr<Core::Notifier> notifier);
+ 
+     NonnullOwnPtr<Stream> m_stream;
+     NonnullRefPtr<Core::Notifier> m_notifier;
+diff --git a/Libraries/LibWeb/Internals/Internals.cpp b/Libraries/LibWeb/Internals/Internals.cpp
+index d221019b6e8de..65cb4a9150f3d 100644
+--- a/Libraries/LibWeb/Internals/Internals.cpp
++++ b/Libraries/LibWeb/Internals/Internals.cpp
+@@ -22,6 +22,7 @@
+ #include <LibJS/Runtime/Object.h>
+ #include <LibJS/Runtime/Reference.h>
+ #include <LibJS/Runtime/VM.h>
++#include <LibRequests/Request.h>
+ #include <LibURL/Parser.h>
+ #include <LibWeb/ARIA/AriaData.h>
+ #include <LibWeb/ARIA/StateAndProperties.h>
+@@ -614,6 +615,11 @@ void Internals::simulate_request_server_connection_loss()
+     page().client().page_did_lose_request_server_connection();
+ }
+ 
++WebIDL::UnsignedLongLong Internals::open_response_pipe_count()
++{
++    return Requests::ReadStream::live_count();
++}
++
+ WebIDL::ExceptionOr<void> Internals::set_content_blockers(Utf16String const& patterns_source)
+ {
+     Utf16StringBuilder patterns_builder;
+diff --git a/Libraries/LibWeb/Internals/Internals.h b/Libraries/LibWeb/Internals/Internals.h
+index b2df9d5c9e051..cd0a9bbf4a2dc 100644
+--- a/Libraries/LibWeb/Internals/Internals.h
++++ b/Libraries/LibWeb/Internals/Internals.h
+@@ -106,6 +106,7 @@ class WEB_API Internals final : public InternalsBase {
+ 
+     bool set_http_memory_cache_enabled(bool enabled);
+     void simulate_request_server_connection_loss();
++    WebIDL::UnsignedLongLong open_response_pipe_count();
+     WebIDL::ExceptionOr<void> set_content_blockers(Utf16String const& patterns);
+     void set_content_blocking_enabled(bool enabled);
+     WebIDL::UnsignedLongLong partial_layout_count();
+diff --git a/Libraries/LibWeb/Internals/Internals.idl b/Libraries/LibWeb/Internals/Internals.idl
+index e2634eadcac82..107b11fd08160 100644
+--- a/Libraries/LibWeb/Internals/Internals.idl
++++ b/Libraries/LibWeb/Internals/Internals.idl
+@@ -85,6 +85,7 @@ interface Internals {
+ 
+     boolean setHttpMemoryCacheEnabled(boolean enabled);
+     undefined simulateRequestServerConnectionLoss();
++    unsigned long long openResponsePipeCount();
+     undefined setContentBlockers(Utf16DOMString patterns);
+     undefined setContentBlockingEnabled(boolean enabled);
+     unsigned long long partialLayoutCount();
+diff --git a/Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt b/Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt
+new file mode 100644
+index 0000000000000..836a4a872c4d4
+--- /dev/null
++++ b/Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt
+@@ -0,0 +1 @@
++open response pipes after fetches: 0
+diff --git a/Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html b/Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html
+new file mode 100644
+index 0000000000000..29c66bcf3cd40
+--- /dev/null
++++ b/Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<script src="../include.js"></script>
++<script>
++    // Each HTTP request receives its response body through a RequestServer pipe that pins an open file descriptor in
++    // this process. Completed requests must release their pipes promptly, rather than holding them until GC — since a
++   //  page that fetches in a tight loop can // otherwise starve the process of file descriptors. See #11033.
++    asyncTest(async done => {
++        const server = httpTestServer();
++        const url = await server.createEcho("GET", "/response-pipe-release", {
++            status: 200,
++            headers: {
++                "Access-Control-Allow-Origin": "*",
++                "Cache-Control": "no-store",
++            },
++            body: "pong",
++        });
++
++        for (let i = 0; i < 8; ++i) {
++            const response = await fetch(`${url}?i=${i}`, { cache: "no-store" });
++            await response.text();
++        }
++
++        // Pipe teardown runs on a deferred task — so give the event loop a few turns.
++        let pipeCount = internals.openResponsePipeCount();
++        for (let attempt = 0; attempt < 100 && pipeCount !== 0; ++attempt) {
++            await timeout(10);
++            pipeCount = internals.openResponsePipeCount();
++        }
++
++        println(`open response pipes after fetches: ${pipeCount}`);
++        done();
++    });
++</script>
+
+From 2ae78115aecaae054532d8a8ba93fecb4c8a9a3c Mon Sep 17 00:00:00 2001
+From: sideshowbarker <mike@w3.org>
+Date: Mon, 17 Aug 2026 07:04:13 +0900
+Subject: [PATCH 2/3] LibWeb: Release response pipes when fetches are canceled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Aborting or terminating a fetch left its response pipe open for
+the lifetime of the process. A page that starts and cancels requests in
+a loop (an EventSource closed and reopened, a fetch or XHR aborted while
+the response is still hanging) leaked one file descriptor per cycle —
+until it ran out of them.
+
+Cause: abort() and terminate() only set the controller state. The one
+path that releases the request, stop_request(), is reached only from
+stop_fetch() — which returns early once the state is already “aborted”
+or “terminated”. So the two entry points that mark a fetch as canceled
+were the two that never told the network layer — and RequestServer holds
+a request alive until it either finishes or is stopped.
+
+Fix: Release the request from abort() and terminate() too — through a
+helper that stop_request() now shares.
+
+One caller relied on terminate() leaving the request alone. When a
+navigation response becomes a download, the request is handed to the UI
+process and the fetch is then terminated. That path now drops its handle
+to the request before terminating — so a download already under way
+isn’t stopped. RequestServer reports the transfer back to the
+WebContent process — and that’s what closes the reader end of the pipe.
+---
+ .../LibWeb/Fetch/Infrastructure/FetchController.cpp | 13 +++++++++++++
+ .../LibWeb/Fetch/Infrastructure/FetchController.h   |  5 +++++
+ Libraries/LibWeb/HTML/LocalNavigable.cpp            |  7 ++++++-
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp
+index 5e41472a1eb3b..6ba3de7c24e8c 100644
+--- a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp
++++ b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp
+@@ -104,6 +104,10 @@ void FetchController::abort(JS::Realm& realm, Optional<JS::Value> error)
+             : serialized_value_or_error.value();
+     };
+     m_serialized_abort_reason = structured_serialize(error.value(), fallback_error_value);
++
++    // AD-HOC: stop_fetch() returns early once the state is "aborted". So, this is the last chance to release the
++    //         network request. Without it the response pipe stays open for good.
++    stop_pending_request();
+ }
+ 
+ // https://fetch.spec.whatwg.org/#fetch-controller-terminate
+@@ -111,6 +115,10 @@ void FetchController::terminate()
+ {
+     // To terminate a fetch controller controller, set controller’s state to "terminated".
+     m_state = State::Terminated;
++
++    // AD-HOC: As in abort() above — stop_fetch() won’t release the request once the state is "terminated" — so,
++    //         release it here.
++    stop_pending_request();
+ }
+ 
+ void FetchController::stop_fetch()
+@@ -143,6 +151,11 @@ void FetchController::stop_fetch()
+ void FetchController::stop_request()
+ {
+     VERIFY(m_state == State::Stopped);
++    stop_pending_request();
++}
++
++void FetchController::stop_pending_request()
++{
+     if (m_pending_request) {
+         m_pending_request->stop();
+         m_pending_request = nullptr;
+diff --git a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h
+index fb27df8f53e55..480a764277c0d 100644
+--- a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h
++++ b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h
+@@ -86,6 +86,11 @@ class WEB_API FetchController : public JS::Cell {
+     //    Null or a fetch timing info.
+     GC::Ptr<FetchTimingInfo> m_full_timing_info;
+ 
++    // Releases the network request behind this controller. Every way a fetch stops early has to reach this: The
++    // response pipe is a socket pair, and RequestServer holds the request alive until it either finishes or is stopped.
++    // So, a request that's abandoned without being stopped would keep its descriptor for the lifetime of the process.
++    void stop_pending_request();
++
+     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
+     // report timing steps (default null)
+     //    Null or an algorithm accepting a global object.
+diff --git a/Libraries/LibWeb/HTML/LocalNavigable.cpp b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+index ff47e30dfa7c2..ee28f176bc547 100644
+--- a/Libraries/LibWeb/HTML/LocalNavigable.cpp
++++ b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+@@ -540,8 +540,13 @@ static bool handle_navigation_response_as_download(GC::Ref<NavigationParams> nav
+             return true;
+         }
+ 
+-        if (navigation_params->fetch_controller)
++        if (navigation_params->fetch_controller) {
++            // AD-HOC: The request now belongs to the UI process (it adopted it above). So, before terminating, drop our
++            //         handle to it. Otherwise, fetch termination would stop a download already under way. RequestServer
++            //         reports the transfer back to us; that's what tears down this process's end of the pipe.
++            navigation_params->fetch_controller->set_pending_request(nullptr);
+             navigation_params->fetch_controller->terminate();
++        }
+ 
+         return true;
+     }
+
+From 8636af4103410833243e5eb987d64e8baf076b1a Mon Sep 17 00:00:00 2001
+From: sideshowbarker <mike@w3.org>
+Date: Mon, 17 Aug 2026 07:28:12 +0900
+Subject: [PATCH 3/3] LibWeb: Tear down a navigation parked for content
+ sniffing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Removing an iframe whose response headers had arrived but whose
+body hadn’t arrived left the network request open for the lifetime of
+the process. A page that adds and removes such iframes in a loop leaked
+one file descriptor per iframe.
+
+Cause: If a navigation has a response but not yet enough bytes to sniff
+its content type, it gets parked in wait_for_sniff_bytes. It has no
+document at that point — so, Document::abort() has no fetch controller
+to stop, and the only code that releases the request is the arrival
+callback. That callback does handle a destroyed navigable — but it runs
+only once bytes arrive. So, a server that sends headers and then stops
+leaves nothing at all around to release the request.
+
+Fix: Register a teardown on the navigable before parking — and run it if
+the navigable is destroyed first. The teardown calls the same helper the
+arrival callback already uses — and destroying a navigable is where the
+rest of its in-flight navigation state is released.
+
+A navigation superseded before its populate task runs leaked the same
+way, for the same reason: That guard returned without releasing
+anything. It now releases the response as the guard above it does.
+---
+ Libraries/LibWeb/HTML/LocalNavigable.cpp | 50 +++++++++++++++++++++++-
+ Libraries/LibWeb/HTML/LocalNavigable.h   |  6 +++
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/Libraries/LibWeb/HTML/LocalNavigable.cpp b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+index ee28f176bc547..c908afbcee8df 100644
+--- a/Libraries/LibWeb/HTML/LocalNavigable.cpp
++++ b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+@@ -681,6 +681,40 @@ void LocalNavigable::set_has_been_destroyed()
+     m_has_been_destroyed = true;
+     resolve_all_pending_async_scroll_operations();
+     cancel_user_scroll_settlement();
++    run_pending_navigation_teardown();
++}
++
++void LocalNavigable::set_pending_navigation_teardown(GC::Ptr<GC::Function<void()>> teardown)
++{
++    // A navigation parking here while another is already parked supersedes it. So, tear the older one down — rather
++    // than dropping it and leaving its request open.
++    run_pending_navigation_teardown();
++
++    // Destruction has already run, so nothing would ever run this one. Tear it down now — instead of storing it forever.
++    if (m_has_been_destroyed) {
++        if (teardown)
++            teardown->function()();
++        return;
++    }
++
++    m_pending_navigation_teardown = teardown;
++}
++
++void LocalNavigable::clear_pending_navigation_teardown(GC::Ptr<GC::Function<void()>> expected)
++{
++    // Only the navigation that registered this teardown may clear it. A navigation whose sniff-byte callback
++    // arrives after a newer one has parked would otherwise clear the newer teardown — and leave that
++    // newer request with nothing to release it.
++    if (m_pending_navigation_teardown != expected)
++        return;
++
++    m_pending_navigation_teardown = nullptr;
++}
++
++void LocalNavigable::run_pending_navigation_teardown()
++{
++    if (auto teardown = exchange(m_pending_navigation_teardown, nullptr))
++        teardown->function()();
+ }
+ 
+ void LocalNavigable::remove_from_all_local_navigables()
+@@ -711,6 +745,7 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
+     visitor.visit(m_active_document);
+     visitor.visit(m_input_method_composition_node);
+     visitor.visit(m_container);
++    visitor.visit(m_pending_navigation_teardown);
+     m_event_handler.visit_edges(visitor);
+ 
+     for (auto& navigation_params : m_pending_navigations) {
+@@ -2190,6 +2225,9 @@ void LocalNavigable::populate_session_history_entry_document(
+ 
+             // 1. If navigable's ongoing navigation no longer equals navigationId, then run completionSteps and abort these steps.
+             if (navigation_id.has_value() && ongoing_navigation() != navigation_id) {
++                // AD-HOC: Nothing downstream will consume this response, and no document exists yet to abort — so,
++                //         release its request here, as the active-window guard above does.
++                stop_or_resume_response_body_delivery(navigation_params);
+                 if (completion_steps) {
+                     completion_steps->function()(nullptr);
+                 }
+@@ -2303,8 +2341,18 @@ void LocalNavigable::populate_session_history_entry_document(
+                 if (!sniff_bytes.has_value()) {
+                     // Async path: bytes not yet available, wait for them
+                     nav_params->response->resume_body_delivery_up_to(Fetch::Infrastructure::MAX_SNIFF_BYTES);
++
++                    // AD-HOC: The callback below runs only once bytes arrive — which never happens if the server sends
++                    //         headers and then stops. Hand the navigable a teardown — so that destroying it releases
++                    //         the request, instead of leaving the pipe open.
++                    auto teardown = GC::create_function(heap(), [navigation_params] {
++                        stop_or_resume_response_body_delivery(navigation_params);
++                    });
++                    nav_params->navigable->set_pending_navigation_teardown(teardown);
++
+                     body->wait_for_sniff_bytes(GC::create_function(heap(),
+-                        [output, nav_params, navigation_params, completion_steps, source_snapshot_params](ReadonlyBytes sniff_bytes) {
++                        [output, nav_params, navigation_params, completion_steps, source_snapshot_params, teardown](ReadonlyBytes sniff_bytes) {
++                            nav_params->navigable->clear_pending_navigation_teardown(teardown);
+                             // AD-HOC: The document may have been destroyed between when the fetch started and when the
+                             //         bytes arrived.
+                             if (nav_params->navigable->active_browsing_context()) {
+diff --git a/Libraries/LibWeb/HTML/LocalNavigable.h b/Libraries/LibWeb/HTML/LocalNavigable.h
+index 8ebc9e99660ae..879da0f94f09c 100644
+--- a/Libraries/LibWeb/HTML/LocalNavigable.h
++++ b/Libraries/LibWeb/HTML/LocalNavigable.h
+@@ -95,6 +95,10 @@ class WEB_API LocalNavigable : public Navigable {
+     void set_navigation_load_event_guard(DOM::Document& parent_doc);
+     void clear_navigation_load_event_guard();
+ 
++    void set_pending_navigation_teardown(GC::Ptr<GC::Function<void()>>);
++    void clear_pending_navigation_teardown(GC::Ptr<GC::Function<void()>> expected);
++    void run_pending_navigation_teardown();
++
+     RefPtr<SessionHistoryEntry> active_session_history_entry() const;
+     void set_active_session_history_entry(RefPtr<SessionHistoryEntry>);
+     RefPtr<SessionHistoryEntry> current_session_history_entry() const;
+@@ -406,6 +410,8 @@ class WEB_API LocalNavigable : public Navigable {
+     // AD-HOC: Guards the parent document's load event delay count during cross-document navigation.
+     Optional<DOM::DocumentLoadEventDelayer> m_navigation_load_event_guard;
+ 
++    GC::Ptr<GC::Function<void()>> m_pending_navigation_teardown;
++
+     // Implied link between navigable and its container.
+     GC::Ptr<NavigableContainer> m_container;
+ 
