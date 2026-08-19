@@ -444,27 +444,41 @@ for s in 0 1 7 42; do python3 Meta/bazel_parity_harness.py --seed $s; done
 The emitters locate the checkout via `$LADYBIRD_ROOT`, defaulting to the parent
 of `Meta/` — so they work from any checkout path.
 
-Running the UI currently needs manual staging, which is itself a gap (see
-below):
+Running the UI currently needs the RESOURCE root staged by hand, which is itself
+a gap (see below). It needs nothing else: the staging step for the helper
+binaries was removed, because it was worse than the gap it papered over.
 
 Every path below is **derived, not written down**, because two of them used to be
 stated as literal `k8-fastbuild` paths and one was simply wrong: the vcpkg tree is
 built in the **exec** configuration (`vcpkg_lib` pins `cfg = "exec"`), so it is
-under `k8-fastbuild-exec` and `bazel-bin/vcpkg_installed` does not exist. The two
-staging roots are also NOT the same directory, which is easy to get backwards:
-helper binaries go in `<bindir>/libexec`, but the resource root is
-`<bindir>/../share/Lagom` -- `LibWebView/Utilities.cpp`'s `find_prefix()` takes the
-PARENT of the binary's directory and appends `share/Lagom`. Ask the build for all
-three rather than spelling any of them out:
+under `k8-fastbuild-exec` and `bazel-bin/vcpkg_installed` does not exist. The
+resource root is `<bindir>/../share/Lagom`, not `<bindir>/share/Lagom` --
+`LibWebView/Utilities.cpp`'s `find_prefix()` takes the PARENT of the binary's
+directory and appends `share/Lagom`. Ask the build for the paths rather than
+spelling any of them out:
+
+**Do NOT stage the services into a `libexec/` directory.** They are already
+siblings of `ladybird` in `bazel-bin`, and `LibWebView/Utilities.cpp`'s
+`get_paths_for_helper_process()` searches `<prefix>/libexec/<name>` **before**
+`<prefix>/bin/<name>` -- so a `libexec` copy WINS over the fresh build, and only
+the copy is ever run. This
+recipe used to stage one, and after the 71fb301a repin the stale August copies
+in `bazel-out/k8-fastbuild/libexec/` (from the OLD pin) were what actually
+launched: the new UI talked to old-pin services, whose IPC message IDs had
+shifted, and every message failed to parse with `Endpoint magic number
+mismatch` / `Can't read past the end of the stream memory` while all 20
+generated `*Endpoint.h` were byte-identical to CMake's. Verified by removal: with
+no `libexec/` at all, `--headless=text` and `--headless=layout-tree` are
+byte-identical to the CMake reference. A staging step that shadows the build
+output is a cache with no invalidation.
 
 ```sh
 export XDG_RUNTIME_DIR=/tmp/xdg-lb && mkdir -p $XDG_RUNTIME_DIR && chmod 700 $XDG_RUNTIME_DIR
 BIN=$(bazel info bazel-bin)                       # target config: where ladybird is
-mkdir -p "$BIN/libexec"
-for b in WebContent RequestServer ImageDecoder Compositor WebWorker; do cp -f bazel-bin/$b "$BIN/libexec/"; done
-# cranelift-compiler is found as a sibling of the spawning binary (Ladybird's own
-# lookup chain), so it needs no path baked in -- only to be there.
-cp -f bazel-bin/cranelift-compiler "$BIN/libexec/"
+# The services + cranelift-compiler need NO staging: they are siblings of
+# ladybird in $BIN, which is the second entry in Ladybird's own lookup chain.
+# If a libexec/ exists from an older recipe, it shadows them -- delete it.
+rm -rf "$BIN/libexec" "$(dirname "$BIN")/libexec"
 # The resource root, assembled from the CLONE and from Bazel's own vcpkg tree.
 # This line used to read `ln -sfn "$PWD/Build/full/share/Lagom" ...` -- i.e. the
 # recipe for running the Bazel build pointed at CMake's build tree, a seventh
@@ -475,6 +489,10 @@ cp -f bazel-bin/cranelift-compiler "$BIN/libexec/"
 # $(dirname $BIN), not $BIN: find_prefix() resolves the resource root against the
 # PARENT of the directory holding the binary.
 L="$(dirname "$BIN")/share/Lagom"
+# rm -f the SHARE dir too, not just Lagom: an older recipe left `share` as a
+# SYMLINK into CMake's Build/full, so after that tree moved, `mkdir -p` failed
+# with a "File exists"-shaped error on a path that does not exist.
+rm -f "$(dirname "$BIN")/share"
 chmod -R u+w "$L" 2>/dev/null; rm -rf "$L"; mkdir -p "$L/ladybird/pdfjs/web"
 cp -r Base/res/. "$L/"
 # ASK for the tree rather than guessing its configuration directory.
@@ -490,7 +508,9 @@ mv "$L/ladybird/pdfjs/pdfjs-ladybird-transport.mjs" "$L/ladybird/pdfjs/web/"
 The assembled tree is byte-identical to CMake's `Build/full/share/Lagom`
 (`diff -rq`, 0 differences), and with it a fresh clone renders `--headless=text`
 and `--headless=layout-tree` byte-identically to the CMake reference on all
-three test pages.
+three test pages. Re-verified at 71fb301a against `Build/full71` with no
+`libexec/` staged at all: `--headless=text` identical, `--headless=layout-tree`
+identical (119 lines), `about:version` identical.
 
 ## Known gaps
 
@@ -728,6 +748,27 @@ Honest inventory of what stops this from being a clone-and-build.
    `bazel info` / `bazel cquery --output=files`. Qt's plugins USED to belong on
    this list and no longer do: they are `data` of `//:ladybird` (`qt_runtime.bzl`),
    which is what that "real Bazel setup" looks like for one of the three things.
+
+   **The helper binaries no longer belong on this list either, and removing them
+   fixed a bug the staging step CAUSED.** The block used to `cp` the five
+   services into `$BIN/libexec/` — which was never needed (they are already
+   siblings of `ladybird` in `bazel-bin`, the second entry in
+   `get_paths_for_helper_process()`'s chain) and was actively wrong, because
+   `<prefix>/libexec/<name>` is searched **first**. That made the staged copy
+   shadow the build output: a directory Bazel does not own, that no `bazel clean`
+   removes and no rebuild refreshes. After the 71fb301a repin the fresh UI kept
+   launching WebContent binaries staged six weeks earlier from the *previous*
+   pin; upstream had inserted IPC messages, so message ids past the insertion
+   point had shifted and every message failed to decode — ~14,000 lines of
+   `Endpoint magic number mismatch` / `Can't read past the end of the stream
+   memory` from a build whose 20 generated `*Endpoint.h` were byte-identical to
+   CMake's. **Every check aimed at the code generator correctly said the build
+   was fine; the artifact that ran was not built by the build.** Fixed by
+   deleting the step and clearing any `libexec/` an older recipe left, guarded by
+   `tests/test_run_recipe.py`. The general shape: a convenience copy of a build
+   output, placed where the program looks first, is a cache with no
+   invalidation — and it fails as a *miscompile*, in the one direction the
+   parity checks cannot see.
 6. **`rules_qt` is not on the BCR.** `MODULE.bazel` uses an `archive_override`
    pointing at kklochkov/rules_qt v2.0.1's release tarball (stock upstream, no
    patches). The BCR's `rules_qt` module is Vertexwahn's unrelated `rules_qt6`.
