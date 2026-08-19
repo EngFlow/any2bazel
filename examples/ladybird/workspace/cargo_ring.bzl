@@ -278,11 +278,10 @@ def cargo_ring():
     #   flapc              a pure build TOOL -- Bazel runs it in a genrule to
     #                      produce the interpreter assembly. Its workspace is
     #                      `exclude`d from the root one and has its own lock
-    #                      with exactly 3 packages (flapc, in-tree
-    #                      bytecode_def, and smallvec from crates.io pinned
-    #                      =1.15.1 -- the same version AND checksum the big
-    #                      workspace pins, so it is the same fetch rule, not a
-    #                      second one).
+    #                      with 2 packages: flapc 0.1.0 (in-tree), smallvec 1.15.1
+    #                      smallvec is also pinned at the same version AND
+    #                      checksum as the big workspace, so it is the same
+    #                      fetch rule, not a second one.
     #   cranelift-compiler a RUNTIME tool -- LibWasm spawns it to AOT-compile
     #                      WebAssembly, and its build script ALSO emits the
     #                      CraneliftFFI.h that LibWasm's CraneliftBridge.cpp

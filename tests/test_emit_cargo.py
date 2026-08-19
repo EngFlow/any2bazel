@@ -897,3 +897,68 @@ def test_every_extension_created_repo_is_named_in_module_bazel():
 # not reach. `python3 tests/run_all.py` enumerates the module instead, so a test's
 # POSITION in the file cannot decide whether it runs; it also fails if a file
 # defines no tests at all. Run a single file with `run_all.py <name-substring>`.
+
+
+def test_the_flap_lock_is_described_from_the_lock_not_from_memory():
+    """The comment the emitter PRINTS must be read out of the lock file.
+
+    This one shipped wrong. The generated cargo_ring.bzl carried, in prose,
+    "its own lock with exactly 3 packages (flapc, in-tree bytecode_def, and
+    smallvec from crates.io pinned =1.15.1)" -- four hand-copied facts. Upstream's
+    a32d9c9f ("LibJS: Derive bytecodes from Flap handlers") deleted the
+    bytecode_def crate, so a generated file, whose header says AUTO-GENERATED,
+    confidently documented a package that no longer exists. Nothing failed: prose
+    has no compiler.
+
+    Same class as the SYSTEM_LIBS divergence and the three-of-six glib include
+    roots -- and the same rule: if a fact is worth stating in generated output, it
+    is worth READING from the input. The fixture's flap lock has 2 packages, so a
+    re-hardcoded "3" fails here rather than six weeks later on Ulf's machine.
+    """
+    import contextlib
+    import io
+    mod = _load(_fixture())
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.emit_ring(mod.all_registry_crates(), mod.crate_specs(),
+                      mod.binary_specs())
+    ring = buf.getvalue()
+    # The described package count must match the fixture's lock, not the real one.
+    assert re.search(r"with 2 packages:", ring), \
+        "the flap lock's package count is not derived from the lock"
+    assert "flapc 0.1.0 (in-tree)" in ring, \
+        "the in-tree member is not identified from the absence of a checksum"
+    assert "smallvec 1.15.1" in ring, "the registry crate is not named from the lock"
+    # And the crate upstream deleted must not be resurrected by a hardcoded string.
+    assert "bytecode_def" not in ring, \
+        "a deleted crate is still named in the generated output"
+
+
+def test_no_generated_cargo_file_names_a_crate_it_does_not_declare():
+    """The general form, against the CHECKED-IN artifacts — and no checkout.
+
+    The test above guards the mechanism on a fixture; this guards the artifact.
+    It cannot compare against the real Cargo.locks, because those live in the
+    Ladybird checkout and not in this overlay -- a test that needs a 5,958-file
+    clone is a test that does not run. But the bug is visible WITHOUT the locks:
+    `bytecode_def` appeared in cargo_ring.bzl only ever inside a comment, never as
+    a `crate =` / `name =` / label. A crate the file talks about but never
+    declares is either dead prose or a missing rule, and both are worth failing
+    on -- the version of this check that needed the locks would have been skipped
+    in CI exactly when it mattered.
+    """
+    for rel in ("cargo_ring.bzl", "cargo_crates.bzl", "cargo_index.bzl"):
+        text = _read(rel)
+        # The structural positions: what the file actually DECLARES.
+        declared = set(re.findall(r"(?:name|crate|bin) = '([^']+)'", text))
+        declared |= set(re.findall(r"crate_([a-z0-9_]+)_\d", text))
+        declared |= set(re.findall(r"//:([A-Za-z0-9_.-]+)", text))
+        # A dict key is a declaration too (cargo_index.bzl keys its per-crate
+        # tables by crate name).
+        declared |= set(re.findall(r"^\s*'([^']+)':", text, re.M))
+        for name in set(re.findall(
+                r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)*_rust|bytecode_def)\b", text)):
+            assert any(name in d for d in declared) or name in declared, \
+                (f"{rel} mentions crate {name!r} in prose but never declares it "
+                 "-- either dead text about a crate upstream deleted, or a rule "
+                 "that is missing")
