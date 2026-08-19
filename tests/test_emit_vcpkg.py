@@ -923,3 +923,57 @@ def test_a_captured_row_the_manifest_does_not_pin_is_reported_as_a_leak():
         body = f.read().split("def main(", 1)[1]
     assert "classify_capture_only(" in body, "main() never checks for leaked rows"
     assert "LEAKED CAPTURE ROWS" in body, "a leak is found but not reported"
+
+
+def test_the_capture_requires_a_row_for_every_download_vcpkg_resolved():
+    """The check that does not depend on my having enumerated the loss modes.
+
+    Three separate ways of losing rows turned up in one session (a halt, a cache
+    hit, an already-installed port), each found by hitting it and each guarded
+    individually above. That is a losing pattern: the fourth was already waiting --
+    "-- Using cached gni-to-cmake.py", i.e. a file already in --downloads-root makes
+    vcpkg skip the asset script entirely, so the recorder never sees it and there is
+    no row. Which means the RESUME rule (share downloads/ across runs, so a
+    50-minute job restarts cheaply) is itself a way to produce an incomplete
+    capture. The two are in direct tension and the earlier comment claimed only the
+    upside.
+
+    So compare against something the script does not control: vcpkg announces every
+    download it resolves, either as "Trying to download <name> using asset cache
+    script" or "-- Using cached <name>". Require a captured row per announcement and
+    the enumeration stops mattering.
+
+    Two subtleties, both derived rather than listed:
+      * an ABSOLUTE path in "-- Using cached /path/x.tar.gz" is vcpkg_from_git
+        pre-placing its own archive (libyuv, skia's two), which bypasses asset
+        caching by design and is pinned by vcpkg_git_archives.bzl instead. Relative
+        name = asset download, absolute = git.
+      * the comparison is on the {dst} basename, so it must undo the two manglings
+        the recorder is deliberately dumb about (".<pid>.part", and the 8-hex
+        disambiguator vcpkg splices in).
+
+    Validated against all three real logs: the cold 72-row run and the warm resume
+    both come out complete, and the angle-only run reports its four already-cached
+    files as missing when checked against the angle-only tsv but clean against the
+    accumulated capture -- which is the correct answer in both cases.
+    """
+    sh = _capture_script()
+    code = "\n".join(l.split("#", 1)[0] for l in sh.splitlines())
+    assert "Trying to download" in code and "Using cached" in code, \
+        ("the capture does not compare itself against what vcpkg said it resolved, "
+         "so a download that was never REQUESTED is silently absent")
+    # The git case must be excluded by DERIVING it (absolute path), not by naming ports.
+    assert re.search(r"Using cached \\\(\[\^/\]", code), \
+        ("-- Using cached with an absolute path is vcpkg_from_git bypassing the asset "
+         "cache; requiring a row for it would fail every capture")
+    for port in ("libyuv", "skia", "angle"):
+        assert port not in code, \
+            f"{port} is hardcoded in the capture script; derive the git case instead"
+    # Both manglings must be undone or every row looks missing.
+    assert ".part" in code, "the .<pid>.part suffix is not stripped before comparing"
+    assert re.search(r"-\[0-9a-f\]\{8\}", code), \
+        "vcpkg's 8-hex disambiguated name is not folded back before comparing"
+    # And the shortfall must reach the sentinel.
+    tail = code.split("Trying to download", 1)[1]
+    assert re.search(r'comm -23[\s\S]{0,400}?>> "\$FAILED"', tail), \
+        "a download with no captured row never reaches $FAILED"
