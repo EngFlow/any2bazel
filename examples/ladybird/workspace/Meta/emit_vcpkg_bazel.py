@@ -880,6 +880,42 @@ def classify_static_only(distfiles, capture):
     return platform_only, stale
 
 
+def classify_capture_only(distfiles, capture):
+    """Captured rows the DERIVATION contradicts: the mirror of the above.
+
+    classify_static_only looks one way only -- derived-but-not-captured -- and so
+    cannot see a row the capture has too MANY of. That happened immediately: the
+    71fb301a re-capture needed a supplementary run for angle alone (the one port
+    whose downloads a Download Mode halt had eaten), and a one-port manifest
+    resolves its own dependencies from the vcpkg BASELINE rather than from
+    Ladybird's vcpkg.json overrides. So it pulled zlib 1.3.2 where Ladybird pins
+    1.3.1, and the capture came back with BOTH.
+
+    I dropped that row by hand and then noticed I was doing the very thing this
+    session has been about: a hand-fix nothing checks, which the next capture
+    silently repeats. It is derivable -- the versions-db derivation knows the
+    pinned version, and a captured row in the same URL family at a version the
+    derivation does not pin is a row from the wrong resolution.
+
+    Note the asymmetry with classify_static_only: there the CAPTURE wins, because
+    only vcpkg can expand a portfile's variables. Here the capture is a superset,
+    and the extra row is not a fetch this build makes -- so it is a leak, not a
+    pin. Reported, not dropped silently, because "vcpkg asked for it" is exactly
+    what makes it plausible enough to keep.
+
+    Returns [(capture_sha, derived_sha)] -- the leaked row and the row it shadows.
+    """
+    fams = {}
+    for sha, (url, _name, _port, _src) in distfiles.items():
+        fams.setdefault(_url_family(url), []).append(sha)
+    leaked = []
+    for sha in sorted(set(capture) - set(distfiles)):
+        same = fams.get(_url_family(capture[sha][0]))
+        if same:
+            leaked.append((sha, sorted(same)[0]))
+    return leaked
+
+
 def observed_git_archives(downloads_dir, distfiles):
     """The archives in a completed run's downloads/ that the asset cache never saw.
 
@@ -1134,6 +1170,7 @@ def main():
         # asked for on this platform" is how sdl3 3.2.28 got silently replaced by
         # a captured 3.4.12 for a whole pin.
         platform_only, stale = classify_static_only(distfiles, cap)
+        leaked = classify_capture_only(distfiles, cap)
         sys.stderr.write("capture: %d distfiles (static parse had %d)\n"
                          % (len(cap), len(distfiles)))
         if platform_only:
@@ -1155,6 +1192,23 @@ def main():
                 sys.stderr.write("    %-12s pinned %s\n" % (distfiles[sha][2],
                                                             distfiles[sha][1]))
                 sys.stderr.write("    %-12s captured %s\n" % ("", cap[cap_sha][1]))
+        if leaked:
+            sys.stderr.write(
+                "  LEAKED CAPTURE ROWS: %d row(s) at a version this manifest does "
+                "not pin.\n"
+                "  The capture has BOTH versions of these, so a run in it resolved "
+                "against a\n"
+                "  different manifest -- a one-port supplementary capture takes its "
+                "deps from the\n"
+                "  vcpkg BASELINE, not from Ladybird's vcpkg.json overrides. The "
+                "emitted rules\n"
+                "  below therefore fetch a distfile no port in this build asks for. "
+                "Delete the\n"
+                "  captured row, or re-capture with the real manifest.\n" % len(leaked))
+            for cap_sha, sha in leaked:
+                sys.stderr.write("    %-12s captured %s\n" % (distfiles[sha][2],
+                                                              cap[cap_sha][1]))
+                sys.stderr.write("    %-12s pinned   %s\n" % ("", distfiles[sha][1]))
         distfiles, unexpanded = cap, []
         # vcpkg's OWN tools are unioned in from their COMMITTED pin, not replaced
         # and not re-derived: they are a different class from port distfiles, and

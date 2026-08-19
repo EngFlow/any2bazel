@@ -302,7 +302,7 @@ an FFI header collision and an entire missing Rust target. See
 | `vcpkg.bzl`, `Meta/vcpkg_build.sh` | `vcpkg_tree`: builds the whole dep tree as an ordinary Bazel action with `x-block-origin`, so it reaches the network zero times. Deliberately not a `repository_rule` |
 | `Meta/vcpkg_tool_assets.tsv` | vcpkg's OWN host tools (cmake, ninja) — url + sha512 + the filename vcpkg looks for. **Separate from the asset capture on purpose:** `vcpkg_find_acquire_program` probes the host first, so a tool the capturing machine already had is never downloaded and never captured (that is how ninja went unpinned; finding 38). Regenerate with `emit_vcpkg_bazel.py --capture-tools` |
 | `Meta/vcpkg_host_tools.tsv` | The tools that must come **from the host**, because vcpkg has no Linux download for them at all — `nasm` (6 ports) and the autotools set. The third class of input, and the one that cannot be pinned: `vcpkg_find_acquire_program(NASM)` has URLs only inside `if(CMAKE_HOST_WIN32)`, and `vcpkg-make` demands `autoconf`/`automake`/`libtool` via bare `find_program` + `FATAL_ERROR`. So this file does not close the gap, it **names** it — and `vcpkg_build.sh` checks the whole list before building anything, so a machine missing three tools is told all three in one second instead of one per 20-minute build (finding 39). Regenerate with `emit_vcpkg_bazel.py --host-tools` |
-| `Meta/vcpkg_capture_assets.sh` | Records the 76-distfile pin, by *being* vcpkg's asset cache. The one run allowed to fetch |
+| `Meta/vcpkg_capture_assets.sh` | Records the 76-distfile pin, by *being* vcpkg's asset cache. The one run allowed to fetch. Does a **full build** (~50 min) and passes `--binarysource=clear`, because only a port that actually runs its portfile requests its downloads: a Download-Mode halt, a cache hit, an already-installed port and a warm `downloads/` each lose rows *while vcpkg exits 0* (see Known gaps 13). The script judges its own completeness — vcpkg's exit code cannot |
 | `Meta/fetch_vcpkg_git_archives.py` | Produces the 4 `vcpkg_from_git` tarballs **without CMake**: takes the list from the committed pin, resolves each clone URL out of the portfiles, then `git clone` + `git -c core.autocrlf=false archive <ref>` and **verifies against the pinned SHA512**. 4/4 byte-identical |
 | `Meta/vcpkg_capture_git_archives.sh` | Regenerates that pin with `vcpkg install --only-downloads` (~6 min, no compilation, no CMake) — vcpkg as the instrument, since which git externals are used is decided by feature-conditional CMake code, not by portfile text |
 | `hsts_preload.bzl` | Chromium's HSTS preload table as one `http_file`, pinned to a **commit** + sha256 — the downstream pin for the one input upstream CMake fetches from `main`. **Generated** by `Meta/pin_hsts_preload.py` |
@@ -983,13 +983,25 @@ Honest inventory of what stops this from being a clone-and-build.
    platform". At this pin `vcpkg.json` moved `sdl3` to 3.2.28, the versions-db
    derivation resolves that correctly, and the message reported the correct
    current pin being discarded in favour of a stale captured 3.4.12 as a
-   Windows-only fetch. The checked-in `vcpkg_distfiles.bzl` fetches 3.4.12 to this
-   day. The classification needs no new input — a dropped row whose *URL family*
-   the capture also has is the same project at another version, i.e. a stale
-   capture — and the emitter now says so; re-capturing is filed. **A replace-wins
-   rule whose message asserts the reason for the replacement instead of checking
-   it will eventually be confidently wrong**, and that sentence describes every
-   item in this list.
+   Windows-only fetch. The classification needs no new input — a dropped row whose
+   *URL family* the capture also has is the same project at another version, i.e. a
+   stale capture — and the emitter now says so. The capture has since been re-taken
+   at this pin and `sdl3` **is** 3.2.28 in `vcpkg_distfiles.bzl`; of the 76 rows,
+   75 reproduced the previous capture's `(url, sha512)` byte-for-byte and the one
+   difference is the intended pin move. **A replace-wins rule whose message asserts
+   the reason for the replacement instead of checking it will eventually be
+   confidently wrong**, and that sentence describes every item in this list.
+
+   The check was one-directional, which cost a hand-fix within the hour of writing
+   it: it compared derived-against-captured only, so a capture with an **extra** row
+   was invisible. Re-capturing needed a supplementary run for `angle` alone, and a
+   one-port manifest resolves its dependencies from the vcpkg *baseline* rather than
+   from Ladybird's `vcpkg.json` overrides — so it fetched zlib 1.3.2 where Ladybird
+   pins 1.3.1, and the merged capture carried both. I deleted the row by hand,
+   which is precisely the move this list is about, and it is equally derivable: a
+   *captured* row in the same URL family at a version the derivation does not pin
+   came from the wrong resolution. `classify_capture_only` reports it as a LEAKED
+   CAPTURE ROW.
 
 10. **Two upstreamable Ladybird fixes — down from four, and that is the point of a
    repin.** Two of the four are **fixed upstream** at this pin (`71fb301a`) and their
@@ -1060,3 +1072,43 @@ Honest inventory of what stops this from being a clone-and-build.
    carry only until upstream fixes it has an `.effect-grep` beside it, and verify
    falls back to asking whether the *effect* is present before reporting the patch
    missing.
+
+11. **A capture can only see the downloads vcpkg actually *requests*, and four
+   different things stop it requesting them — each while vcpkg exits 0.** This is
+   the same class as gap 10 but on the input side, and it is worse, because the
+   failure is a *pin that looks complete*. `Meta/vcpkg_capture_assets.sh` records
+   every `(url, sha512, dst)` by being vcpkg's asset cache, so a download nobody
+   asks for leaves no trace at all:
+
+   - a **failed fetch** halts the rest of its portfile — the four WebKit files
+     `angle` downloads *after* its python venv step were lost this way, and vcpkg
+     reported "All requested installations completed successfully in: 49 min";
+   - **`--only-downloads`** halts every portfile at its first executed step, which
+     is *before* those same four files (`portfile.cmake:86` vs 123–153). It was the
+     script's default, under a comment of mine claiming it "is enough because the
+     asset hook fires during resolution" — a sentence written from intuition. The
+     committed 76-row capture cannot have been produced that way, and the fast mode
+     is now opt-in via `CAPTURE_ONLY_DOWNLOADS=1`;
+   - a **binary-cache hit** unpacks an archive and never runs the portfile at all.
+     Measured on a zlib-only manifest against a warm cache: first run 3 rows,
+     second run **0 rows** and exit 0 in 1.54 ms. `--binarysource=clear` is now
+     mandatory here (`vcpkg_build.sh` had always passed it, for the adjacent
+     reason);
+   - an **already-installed port** or a **warm `downloads/`** likewise skips the
+     request (`-- Using cached gni-to-cmake.py` → no row) — and the warm downloads
+     dir is exactly what the *resume* rule asks you to share between runs, so the
+     property that makes a 50-minute job restartable is the property that makes its
+     output incomplete.
+
+   So the script judges its own completeness, since vcpkg's exit code will not:
+   every loss lands in one sentinel that refuses to bless the file. The check that
+   does not depend on my having enumerated the list above is derived from vcpkg's
+   own log — every download it resolves is announced, so require a captured row for
+   each announcement, treating an absolute path in `-- Using cached <x>` as the
+   `vcpkg_from_git` case that legitimately bypasses the asset cache. What cannot be
+   done is *triage*: 58 of 77 ports halt harmlessly in download-only mode (at
+   `vcpkg_cmake_configure`, after every download), and nothing in the log
+   distinguishes those from `angle`'s mid-sequence halt, because only the portfile
+   knows whether a download follows. **Any halt therefore fails the capture** — the
+   alternative is a rule that is right about 57 ports and wrong about the one that
+   matters.

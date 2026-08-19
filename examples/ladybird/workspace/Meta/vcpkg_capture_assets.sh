@@ -204,6 +204,40 @@ if grep -q "^Restored [0-9]* package" "$VCPKG_LOG"; then
         | sed 's/$/ -- a cache hit never runs the portfile, so those downloads were never requested/' \
         >> "$FAILED"
 fi
+# And the check that does not depend on my enumerating the loss modes: ask vcpkg
+# what it NEEDED and require a row for each. Every download it resolves is
+# announced in one of two ways --
+#
+#   "Trying to download <name> using asset cache script"  -- it called the
+#       recorder, so there must be a row (unless the fetch failed, which $FAILED
+#       already covers).
+#   "-- Using cached <name>"                              -- the file was ALREADY
+#       in --downloads-root, so vcpkg skipped the asset script entirely and the
+#       recorder never saw it. FOURTH loss mode, and it contradicts the resume
+#       advice above: sharing downloads/ across runs is what makes a re-run cheap,
+#       and it is also what makes a re-run's capture incomplete. Measured on the
+#       angle re-capture: "-- Using cached gni-to-cmake.py" produced no row.
+#
+# An ABSOLUTE path in the second form is different and must NOT be required: that
+# is vcpkg_from_git pre-placing its own archive (libyuv and skia's two, here),
+# which bypasses asset caching entirely and is pinned by vcpkg_git_archives.bzl
+# instead. Derived, not listed: relative name = asset download, absolute = git.
+#
+# Compare on the {dst} basename, undoing the two manglings the recorder is
+# deliberately dumb about: the ".<pid>.part" suffix, and the 8-hex disambiguator
+# vcpkg splices in when a wrong-hash file is already present.
+{ sed -n 's/^Trying to download \(.*\) using asset cache script$/\1/p' "$VCPKG_LOG"
+  sed -n 's|^-- Using cached \([^/].*\)$|\1|p' "$VCPKG_LOG"
+} | sort -u > "$VCPKG_LOG.need"
+{ cut -f3 "$OUT" | sed 's|.*/||; s|\.[0-9]\{1,\}\.part$||'
+  cut -f3 "$OUT" | sed 's|.*/||; s|\.[0-9]\{1,\}\.part$||' \
+    | sed -E 's/-[0-9a-f]{8}(\.[^.]+(\.[^.]+)?)$/\1/'
+} | sort -u > "$VCPKG_LOG.have"
+comm -23 "$VCPKG_LOG.need" "$VCPKG_LOG.have" \
+    | sed 's/$/ -- vcpkg resolved this download but no row was captured (already in downloads\/?)/' \
+    >> "$FAILED"
+rm -f "$VCPKG_LOG.need" "$VCPKG_LOG.have"
+
 if grep -q "The following packages are already installed" "$VCPKG_LOG"; then
     n=$(sed -n '/The following packages are already installed/,/^The following packages will be/p' \
         "$VCPKG_LOG" | grep -c "^ *[*]* *[a-z0-9]" || true)

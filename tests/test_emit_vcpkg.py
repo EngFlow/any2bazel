@@ -874,3 +874,52 @@ def test_a_port_that_skipped_its_portfile_fails_the_capture():
         seg = code.split(marker, 1)[1].split("\nif ")[0]
         assert '>> "$FAILED"' in seg, \
             f"a skipped portfile detected via {marker!r} never reaches $FAILED"
+
+
+def test_a_captured_row_the_manifest_does_not_pin_is_reported_as_a_leak():
+    """classify_static_only looks one way, so a capture with too MANY rows is invisible.
+
+    This bit within the hour. The 71fb301a re-capture needed a supplementary run for
+    angle alone -- the one port whose later downloads a Download Mode halt had eaten
+    -- and a one-port manifest resolves its dependencies from the vcpkg BASELINE, not
+    from Ladybird's vcpkg.json overrides. It pulled zlib 1.3.2 where Ladybird pins
+    1.3.1, so the merged capture had both, and vcpkg_distfiles.bzl would have carried
+    an http_file for a distfile no port in the build fetches.
+
+    I dropped the row by hand, then recognised the shape: a hand-fix nothing checks
+    is what the next capture silently repeats -- the thing this whole session has been
+    about. It is derivable, because the versions-db derivation knows the pinned
+    version: a captured row in the same URL family at a version the derivation does
+    not pin came from the wrong resolution.
+
+    Verified on the real 77-row merged capture: exactly one leak, zlib 1.3.2 vs the
+    pinned 1.3.1, and the 76-row file it became is clean.
+    """
+    cap = {
+        # The leak: same family as a derived row, different version.
+        "a" * 128: ("https://github.com/madler/zlib/archive/v1.3.2.tar.gz",
+                    "madler-zlib-v1.3.2.tar.gz", "zlib", "capture"),
+        "b" * 128: ("https://github.com/madler/zlib/archive/v1.3.1.tar.gz",
+                    "madler-zlib-v1.3.1.tar.gz", "zlib", "capture"),
+        # Captured but not derived AND no derived sibling: an expanded ${VAR} the
+        # static parse cannot see. NOT a leak -- this is why the capture exists.
+        "c" * 128: ("https://github.com/WebKit/WebKit/raw/0742/Source/cmake/DetectSSE2.cmake",
+                    "DetectSSE2.cmake", "angle", "capture"),
+    }
+    derived = {
+        "b" * 128: ("https://github.com/madler/zlib/archive/v1.3.1.tar.gz",
+                    "madler-zlib-v1.3.1.tar.gz", "zlib", "versions-db"),
+    }
+    leaked = emit.classify_capture_only(derived, cap)
+    assert leaked == [("a" * 128, "b" * 128)], leaked
+
+    # The unexpanded-variable rows are the whole reason the capture replaces the
+    # static parse; reporting them as leaks would make the check useless.
+    assert not any(cap_sha == "c" * 128 for cap_sha, _ in leaked), \
+        "a capture-only row with no derived sibling is not a leak, it is the point"
+
+    # And main() must actually call it, or the classifier is decorative.
+    with open(_EMIT) as f:
+        body = f.read().split("def main(", 1)[1]
+    assert "classify_capture_only(" in body, "main() never checks for leaked rows"
+    assert "LEAKED CAPTURE ROWS" in body, "a leak is found but not reported"

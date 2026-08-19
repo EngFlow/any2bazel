@@ -115,7 +115,7 @@ use_repo(
     'vcpkg_libpng_1_6_58_apng_patch_gz_95a6f5bb7148',
     'vcpkg_libproxy_libproxy_0_4_18_tar_gz_1148d688a9f0',
     'vcpkg_libpsl_public_suffix_list_0ed17e_dat_7969c40b0600',
-    'vcpkg_libsdl_org_SDL_release_3_4_12_tar_gz_fc0a55ca01c3',
+    'vcpkg_libsdl_org_SDL_release_3_2_28_tar_gz_9e188c992caa',
     'vcpkg_libtiff_libtiff_v4_7_2_tar_gz_c4dcde3c79e5',
     'vcpkg_libtom_libtommath_v1_3_0_tar_gz_3dbd7053a670',
     'vcpkg_libunistring_1_2_tar_xz_5fbb5a0a864d',

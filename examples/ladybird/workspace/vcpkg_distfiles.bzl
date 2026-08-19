@@ -283,10 +283,10 @@ def vcpkg_distfiles():
         integrity = 'sha512-eWnECwYAuvJ4avDmUDtCgtSHtmA0GMQfKMOznpzZMgrGbA0uj7+it5TkYfJoQ+NHnWDsJKxcCZD+jwxr+u7mnQ==',  # captured
     )
     http_file(
-        name = 'vcpkg_libsdl_org_SDL_release_3_4_12_tar_gz_fc0a55ca01c3',
-        urls = ['https://github.com/libsdl-org/SDL/archive/release-3.4.12.tar.gz'],
-        downloaded_file_path = 'libsdl-org-SDL-release-3.4.12.tar.gz',
-        integrity = 'sha512-/ApVygHDL2E7nNjGz/rRfuCFXuVC8D+kVWMgQ8maCiWVmVV6RsfGNgMkRCYOZEdoZ9mvQ6HaaJg3+ZwilCzYYw==',  # captured
+        name = 'vcpkg_libsdl_org_SDL_release_3_2_28_tar_gz_9e188c992caa',
+        urls = ['https://github.com/libsdl-org/SDL/archive/release-3.2.28.tar.gz'],
+        downloaded_file_path = 'libsdl-org-SDL-release-3.2.28.tar.gz',
+        integrity = 'sha512-nhiMmSyqf3/wMHifeSYAfSJy9RtMOqf8lPWPaCOBC95xzhSZkMeO7kfyZHHfKnuH1PwliBwzntICax5ZBSvOOQ==',  # captured
     )
     http_file(
         name = 'vcpkg_libtiff_libtiff_v4_7_2_tar_gz_c4dcde3c79e5',
