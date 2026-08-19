@@ -35,8 +35,15 @@
 #   ./apply_overlay.sh /path/to/ladybird           # branch + commits (see below)
 #   ./apply_overlay.sh --verify /path/to/existing  # check a tree, change nothing
 #
-# Then, per the README's "Reproducing": two prefetches (Meta/ladybird.py vcpkg,
-# Meta/fetch_vcpkg_git_archives.py) and `bazel build`.
+# Both prefetches run here (Meta/ladybird.py vcpkg, then
+# Meta/fetch_vcpkg_git_archives.py); after this, `bazel build` is the next command.
+# The second one used to be PRINTED rather than run, which cost Ulf a 20-minute
+# build: everything the script does succeeded, so the obvious next step was
+# `bazel build`, and it failed inside the vcpkg action with "no git-sourced
+# externals at ./Meta/CMake/vcpkg/git-archives". A setup script that stops one
+# required step short of a working build has not set anything up -- the closing
+# message is not a substitute for doing it (finding 35 again: an instruction the
+# reader must remember is a step the script decided not to take).
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS LEAVES BEHIND: a BRANCH, with COMMITS. It used to leave a detached
@@ -400,6 +407,40 @@ if [ "$VERIFY" -eq 1 ]; then
         echo "PATCH NOT APPLIED: $name" >&2; rc=1
     done
 
+    # The four vcpkg_from_git tarballs. NOT overlay files (they are 200MB of git
+    # archive output, and they are .gitignored), so the file loop above cannot see
+    # them -- but their absence is a guaranteed build failure, which is exactly what
+    # --verify exists to find without a build. Ulf's tree passed --verify and then
+    # failed the build on this.
+    #
+    # Checked by NAME against the committed pin, not by count: a directory with
+    # three of the four in it is the interesting broken case, and `ls | wc -l` calls
+    # it fine. Hashes are not re-verified here (that is minutes of sha512 over
+    # ~200MB, and the fetcher already verified them at write time); --verify is the
+    # cheap check you run often.
+    archives_dir="Meta/CMake/vcpkg/git-archives"
+    want_archives="$(sed -n "s|^[[:space:]]*'\([^']*\.tar\.gz\)':.*|\1|p" \
+                     "$WORKSPACE/vcpkg_git_archives.bzl")"
+    if [ -z "$want_archives" ]; then
+        echo "MALFORMED: no archives parsed out of vcpkg_git_archives.bzl" >&2; rc=1
+    else
+        missing_archives=0
+        for a in $want_archives; do
+            [ -f "$archives_dir/$a" ] || { echo "MISSING $archives_dir/$a" >&2
+                missing_archives=$((missing_archives + 1)); }
+        done
+        if [ "$missing_archives" -gt 0 ]; then
+            echo "  $missing_archives of $(echo "$want_archives" | wc -w) vcpkg_from_git archives are absent." >&2
+            echo "  vcpkg_from_git bypasses the asset cache (it runs \`git fetch\`), so these" >&2
+            echo "  cannot be http_file'd; the build stages them from that directory and" >&2
+            echo "  fails without them. Fetch them (pure git, ~80s, verified against the pin):" >&2
+            echo "      cd $TARGET && python3 Meta/fetch_vcpkg_git_archives.py" >&2
+            rc=1
+        else
+            note "vcpkg_from_git archives: $(echo "$want_archives" | wc -w)/$(echo "$want_archives" | wc -w) present"
+        fi
+    fi
+
     # Executable bits are tree state git carries and a `cp` does not always: the
     # vcpkg/cargo build scripts are run as actions, so a lost +x fails at action
     # time, deep in a build, with a confusing message.
@@ -718,12 +759,38 @@ else
 WARN
 fi
 
+# Phase 3: the SECOND prefetch -- the four vcpkg_from_git tarballs.
+#
+# This has to run here, not in the closing message, because there is no build
+# without it. `vcpkg_from_git` shells out to `git fetch`, which no asset source
+# intercepts, so these four cannot be http_file'd like the other 76 distfiles; but
+# vcpkg DOES honour a pre-placed downloads/<PORT>-<REF>.tar.gz, which is what they
+# become. Meta/vcpkg_build.sh hard-fails in four seconds when they are absent (it
+# used to fail ~20 minutes in, inside skia's portfile, naming a googlesource URL) --
+# and that fast, clear failure was still a failure Ulf hit on a tree this script
+# had just reported as done. The instruction was in the closing message. He, quite
+# reasonably, ran `bazel build`.
+#
+# It needs the vcpkg checkout (it resolves each clone URL out of the portfiles), so
+# it must come after phase 2 -- that ordering is the reason it was a message in the
+# first place, and ordering is a thing a script can express.
+if [ -d "$TARGET/Build/vcpkg/.git" ] && [ "$PREFETCH" -eq 1 ]; then
+    note "fetching the 4 vcpkg_from_git tarballs (~80s, verified against the pin)"
+    python3 Meta/fetch_vcpkg_git_archives.py \
+        || die "the git-archive prefetch failed. It is pure git (clone + git archive,
+    checked against the SHA512s in vcpkg_git_archives.bzl), so this is a network
+    or a pin problem, not a build problem. Re-run just this step with:
+        cd $TARGET && python3 Meta/fetch_vcpkg_git_archives.py"
+elif [ "$PREFETCH" -eq 0 ]; then
+    note "SKIPPING the git-archive prefetch (--no-prefetch)"
+    note "  \`bazel build\` will fail without it: python3 Meta/fetch_vcpkg_git_archives.py"
+fi
+
 cat <<EOF
 
-==> done. One prefetch remains (it needs no CMake):
+==> done. Both prefetches have run; the next command is the build:
 
     cd $TARGET
-    python3 Meta/fetch_vcpkg_git_archives.py    # the 4 vcpkg_from_git tarballs (~80s)
     bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder \\
                 //:Compositor //:WebWorker
 

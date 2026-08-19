@@ -89,9 +89,17 @@ def test_file_list_is_derived_not_hand_maintained():
     # will fail, and a test that cannot tell a message from a roster forces you to
     # make the message vaguer to go green. What must not exist is a hand-kept LIST
     # that the copy loop reads -- so strip comments and message lines both.
-    code = "\n".join(l.split("#", 1)[0] for l in text.splitlines()
-                     if not re.match(r'\s*(note|echo|die)\b', l))
-    listed = re.findall(r'\b[\w.]+\.bzl\b', code)
+    code = [l.split("#", 1)[0] for l in text.splitlines()
+            if not re.match(r'\s*(note|echo|die)\b', l)]
+    # A .bzl named as the INPUT OF A READ is the opposite of the bug: it is the
+    # script deriving a list from a generated file instead of restating it. The
+    # git-archive check parses vcpkg_git_archives.bzl -- the very file whose story
+    # this test is named after -- to learn which four tarballs must exist, and a
+    # test that forbade that would forbid the fix and demand the hardcoded list.
+    # So the ban is on ENUMERATION: a .bzl name that is not being read.
+    readers = re.compile(r'\b(sed|grep|awk|cat|read|source|\.)\b')
+    listed = [l.strip() for l in code
+              if re.search(r'\b[\w.]+\.bzl\b', l) and not readers.search(l)]
     assert not listed, "found hand-listed overlay files in code: %r" % (listed,)
 
 
@@ -716,3 +724,87 @@ def test_a_qt_below_the_floor_is_reported_at_apply_time():
     assert "6.9" in t, "the floor is not mentioned where the SDK is chosen"
     assert re.search(r"6\.\[0-8\]\.\*", t), \
         "no check that the chosen Qt is below the 6.9 floor"
+
+
+def test_every_required_prefetch_is_RUN_not_merely_printed():
+    """A step the build cannot do without must be executed, not documented.
+
+    The concrete failure: the script ran `Meta/ladybird.py vcpkg` itself but only
+    PRINTED `Meta/fetch_vcpkg_git_archives.py` in its closing message. So the
+    script reported success, the obvious next command was `bazel build`, and that
+    died inside the vcpkg action with "no git-sourced externals at
+    ./Meta/CMake/vcpkg/git-archives". Ulf hit exactly this. The four tarballs are
+    not optional and not derivable from anything else in the tree -- vcpkg_from_git
+    shells out to `git fetch`, which no asset source intercepts -- so a tree without
+    them cannot build, and a setup script that leaves the tree unable to build has
+    not finished.
+
+    Asserted structurally: each prefetch appears on a line that RUNS it (a `python3`
+    invocation outside a heredoc/message), not only inside the closing `cat <<EOF`.
+    """
+    t = _text()
+    prefetches = ("Meta/ladybird.py vcpkg", "Meta/fetch_vcpkg_git_archives.py")
+    # Everything the script executes, with the here-docs (its messages) removed:
+    # a command inside `cat <<EOF ... EOF` is prose, and prose was the bug.
+    code, in_heredoc = [], False
+    for line in t.splitlines():
+        if re.search(r"<<-?'?\w*EOF'?|<<'WARN'", line):
+            in_heredoc = True
+            continue
+        if in_heredoc:
+            if re.match(r"^(EOF|WARN)\s*$", line):
+                in_heredoc = False
+            continue
+        if re.match(r'\s*(note|echo)\b', line):
+            continue
+        code.append(line.split("#", 1)[0])
+    code = "\n".join(code)
+    for p in prefetches:
+        assert p in code, (
+            f"{p} is never RUN by the script (only mentioned in a message?) -- a "
+            "prefetch the build requires must be executed, or the script hands back "
+            "a tree that cannot build")
+
+    # And --verify must catch their absence WITHOUT a build, which is its whole
+    # purpose: Ulf's tree passed --verify and then failed the build on this.
+    verify = t.split("if [ \"$VERIFY\" -eq 1 ]", 1)[1].split("exit \"$rc\"", 1)[0]
+    assert "git-archives" in verify, \
+        "--verify does not check the vcpkg_from_git tarballs, whose absence is a " \
+        "guaranteed build failure"
+    # By NAME against the pin, not by counting files: three of four present is the
+    # interesting broken case and `ls | wc -l` calls it fine.
+    assert "vcpkg_git_archives.bzl" in verify, \
+        "--verify must take the expected archive names from the committed pin"
+    assert "fetch_vcpkg_git_archives.py" in verify, \
+        "--verify reports the missing archives without naming the command that fetches them"
+
+
+def test_the_git_archive_prefetch_runs_after_the_vcpkg_checkout_exists():
+    """Ordering is the reason it was a message; ordering is expressible in a script.
+
+    fetch_vcpkg_git_archives.py resolves each clone URL out of the portfiles in
+    Build/vcpkg, so it needs the checkout the FIRST prefetch creates. Running it
+    earlier fails with "no vcpkg checkout at ...".
+    """
+    t = _text()
+    # Positions of the INVOCATIONS, i.e. lines that begin with the command. Plain
+    # `t.index()` finds the first MENTION, which is inside --verify's diagnostic
+    # ("fetch them with: ..."), several hundred lines above either invocation --
+    # so it compared a message against a command and failed on correct code.
+    def invoked_at(cmd):
+        for i, line in enumerate(t.splitlines()):
+            if line.strip().startswith(cmd):
+                return i
+        raise AssertionError("never invoked: " + cmd)
+
+    first = invoked_at("python3 Meta/ladybird.py vcpkg")
+    second = invoked_at("python3 Meta/fetch_vcpkg_git_archives.py")
+    assert first < second, \
+        "the git-archive prefetch must come after the vcpkg checkout it reads portfiles from"
+    # And it must be guarded on the checkout actually being there, rather than
+    # running unconditionally and failing with the fetcher's own error.
+    tail = t[t.index("# Phase 3:"):]
+    assert '-d "$TARGET/Build/vcpkg/.git"' in tail, \
+        "the git-archive prefetch is not guarded on the vcpkg checkout existing"
+    assert "--no-prefetch" in tail or 'PREFETCH" -eq 1' in tail, \
+        "--no-prefetch must skip the git-archive prefetch too, or the flag lies"

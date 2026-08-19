@@ -82,7 +82,17 @@ stayed invisible here for months.
 | the four `git archive` tarballs | **vcpkg itself**, while building skia and angle |
 | ~~the HSTS preload table~~ | **Bazel**, now: `@hsts_preload_json//file`, pinned in `hsts_preload.bzl` |
 
-**Without ever running CMake — the actual answer, and it needs no CMake at all:**
+**`apply_overlay.sh` runs both of these for you** — it did not always, and that
+gap cost a 20-minute build: the script ran step 1 and *printed* step 2 in its closing
+message, so the obvious next command was `bazel build`, which failed inside the vcpkg
+action with `no git-sourced externals at ./Meta/CMake/vcpkg/git-archives`. A setup
+script that stops one required step short of a working build has not set anything up,
+and a closing message is not a substitute for doing the work. `--verify` now checks the
+four tarballs by name against the committed pin too, since their absence is a
+guaranteed build failure and finding that without a build is exactly what `--verify`
+is for.
+
+**By hand, without ever running CMake — and it needs no CMake at all:**
 
 ```sh
 python3 Meta/ladybird.py vcpkg               # 1. the checkout + .git (~70s). No CMake:
@@ -409,7 +419,7 @@ manual version below has four ways to be silently wrong (see
 
 ```sh
 ./apply_overlay.sh ~/ladybird          # branch + commits at the pinned commit,
-                                       # then the vcpkg prefetch, in the order that works
+                                       # then BOTH prefetches, in the order that works
 ./apply_overlay.sh --verify ~/ladybird # check an existing tree, change nothing
 ```
 
