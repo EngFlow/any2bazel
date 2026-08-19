@@ -351,6 +351,25 @@ manual version below has four ways to be silently wrong (see
 ./apply_overlay.sh --verify ~/ladybird # check an existing tree, change nothing
 ```
 
+**Already have a tree from an older pin?** The same command moves it forward —
+point it at the tree you have:
+
+```sh
+./apply_overlay.sh ~/ladybird          # fetches the new commit, stashes the old
+                                       # pin's patches, checks out, re-patches,
+                                       # re-copies the overlay
+./apply_overlay.sh --verify ~/ladybird # expect: 45 identical, both patch effects
+git -C ~/ladybird stash list           # your previous tree state, if you want it back
+```
+
+Your patched files are **stashed, never discarded** (`git stash pop` restores
+them). That matters because a repin can *delete* a patch — two of the four were
+fixed upstream at `71fb301a` — so those modifications can no longer be
+reverse-applied from anything the overlay carries, and they are indistinguishable
+from your own edits on top. This used to abort with git's
+`error: Your local changes to the following files would be overwritten by
+checkout`, which was correct of git and useless to you.
+
 Or by hand:
 
 ```sh

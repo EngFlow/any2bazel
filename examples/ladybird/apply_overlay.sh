@@ -211,6 +211,38 @@ if [ -e "$TARGET/.git" ]; then
     cd "$TARGET"
     git rev-parse --verify "$LADYBIRD_COMMIT^{commit}" >/dev/null 2>&1 \
         || git fetch --no-tags origin "$LADYBIRD_COMMIT"
+    # A tree that already HAS the overlay is the normal case for a REPIN, and it
+    # is the case this script used to fail on. Its patches are applied, so
+    # tracked files are modified, so `git checkout --detach` refuses:
+    #
+    #   error: Your local changes to the following files would be overwritten by
+    #   checkout: Meta/Generators/libweb_bindings/to_idl_value.py, UI/Qt/TabBar.h
+    #
+    # -- which is git being careful, but it left the reader to work out that the
+    # modifications are OUR patches, that a repin may have deleted the patch that
+    # made them (two of the four were fixed upstream at 71fb301a, so their bytes
+    # cannot be reverse-applied from anything this overlay still carries), and
+    # which of their own edits are mixed in. So handle it here, once.
+    #
+    # STASH rather than `checkout --` / `reset --hard`: the modifications might not
+    # all be ours. A patch we no longer carry is indistinguishable from the
+    # reader's own debugging edit, and a script that silently discards the second
+    # kind is a script nobody should run on a tree they care about. A stash is
+    # recoverable and its name says who made it.
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        note "this tree has local changes to tracked files (expected: the patches"
+        note "from a previous pin). Stashing them -- NOTHING is discarded:"
+        git status --porcelain --untracked-files=no | sed 's/^/      /'
+        # No --include-untracked: the untracked files are the OVERLAY, which the
+        # copy below overwrites anyway, and stashing them would hide the staged
+        # Build/vcpkg state the prefetch ordering depends on.
+        git stash push --quiet \
+            -m "apply_overlay.sh: pre-$LADYBIRD_COMMIT tree state" \
+            || die "could not stash local changes; commit or stash them yourself,
+    then re-run. (This tree is left exactly as it was.)"
+        note "stashed as: $(git stash list | head -1)"
+        note "  recover with: git -C $TARGET stash pop"
+    fi
     git checkout --detach "$LADYBIRD_COMMIT"
 else
     note "cloning Ladybird (full history: vcpkg needs it, see README)"
@@ -261,6 +293,38 @@ done < "$FILE_LIST"
 note "$n files copied (bazelrc.txt -> .bazelrc), $deferred deferred until vcpkg exists"
 
 # Phase 2: the vcpkg prefetch, then the deferred files.
+#
+# Deferring the copy is not sufficient on a REPIN. The trap at the top of this
+# file is that the DIRECTORY Build/vcpkg existing (with no .git in it) makes
+# upstream's bootstrap skip the clone -- and on a tree that already has an older
+# overlay, Build/vcpkg/BUILD.bazel is ALREADY THERE, put there by the previous
+# run. So phase 1 not creating it changes nothing, and the prefetch dies exactly
+# as documented:
+#
+#   fatal: unable to read tree (40f3c709...)
+#   subprocess.CalledProcessError: ['git','checkout','40f3c709...'] status 128
+#
+# (it walks up to Ladybird's repo, gets Ladybird's HEAD, and tries to check
+# vcpkg's baseline out of it). Found by running the repin against a replica of
+# Ulf's tree; the deferral logic had only ever been tested on a fresh clone.
+#
+# So: if there is no .git, the directory is not a checkout, and anything in it is
+# ours to move out of the way. Only the overlay's own deferred files are removed
+# -- never a directory with a .git, and never anything the overlay does not own.
+if [ ! -d "$TARGET/Build/vcpkg/.git" ] && [ -d "$TARGET/Build/vcpkg" ]; then
+    while IFS= read -r f; do
+        case "$f" in Build/vcpkg/*) ;; *) continue ;; esac
+        if [ -e "$TARGET/$f" ]; then
+            note "un-staging $f so the vcpkg bootstrap sees no checkout"
+            rm -f "$TARGET/$f"
+        fi
+    done < "$FILE_LIST"
+    # An empty Build/vcpkg is just as fatal as one with a file in it: the
+    # bootstrap tests for the DIRECTORY. rmdir, not rm -rf: if anything else is
+    # in there it is not ours and the failure should be loud.
+    rmdir "$TARGET/Build/vcpkg" 2>/dev/null && note "removed the empty Build/vcpkg" || true
+fi
+
 if [ -d "$TARGET/Build/vcpkg/.git" ]; then
     note "vcpkg checkout already present"
 elif [ "$PREFETCH" -eq 1 ]; then

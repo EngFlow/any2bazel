@@ -393,3 +393,107 @@ def test_no_two_patches_are_alternatives_of_each_other():
     dupes = {n for n in prefixes if prefixes.count(n) > 1}
     assert not dupes, \
         "patches sharing a series number are alternatives, not a series: %r" % (dupes,)
+
+
+def test_a_repin_does_not_abort_on_the_previous_pin_s_patches():
+    """The REPIN path: a tree that already has the overlay, from an older pin.
+
+    This is not a hypothetical. Ulf asked "how do I get my tree patched?" and the
+    answer was: you can't, the script aborts. His tree is the previous pin with
+    four patches applied, so tracked files are modified, so `git checkout
+    --detach <new commit>` refuses:
+
+        error: Your local changes to the following files would be overwritten by
+        checkout: Meta/Generators/libweb_bindings/to_idl_value.py, UI/Qt/TabBar.h
+
+    git is right to refuse; the script was wrong to leave it there. It cannot be
+    solved by the reader either, because two of the four patches were fixed
+    UPSTREAM at the new pin and deleted from the overlay -- so their modifications
+    cannot be reverse-applied from anything this overlay still carries, and they
+    are indistinguishable from the reader's own edits.
+
+    Hence: stash, never discard. `checkout --`/`reset --hard` would silently throw
+    away a debugging edit made on top of the patches, which is not a thing a
+    script should do to a tree someone cares about. Reproduced end-to-end against
+    a replica of Ulf's tree (old pin + 4 old patches + old overlay): the script
+    now runs through, `--verify` reports 45/45 with both patch effects present,
+    and the old state is recoverable with `git stash pop`.
+    """
+    t = _text()
+    # The clone-reuse branch must handle a dirty tree before it checks out.
+    reuse = t.split("reusing existing clone", 1)[1].split("note \"at $", 1)[0]
+    assert "git stash push" in reuse, \
+        "a tree with the previous pin's patches applied still aborts the checkout"
+    assert "git status --porcelain" in reuse, \
+        "the dirty-tree case is not detected before the checkout"
+    # Destructive alternatives must NOT be what it reaches for. Checked against
+    # the CODE only: the comment explains why `reset --hard` is wrong here, and a
+    # test that cannot tell the explanation from the deed forces you to delete the
+    # explanation to make it pass.
+    code = "\n".join(l.split("#", 1)[0] for l in reuse.splitlines())
+    for destructive in ("reset --hard", "checkout -- .", "clean -fd"):
+        assert destructive not in code, \
+            (f"the repin path uses `git {destructive}`, which discards edits that "
+             "may not be ours -- a patch we no longer carry looks exactly like the "
+             "reader's own change")
+    # And it must say how to get the work back, or a stash is just a nicer loss.
+    assert "stash pop" in reuse, "the script does not say how to recover the stash"
+    # The stash must be identifiable months later, not stash@{0} among many.
+    assert re.search(r'stash push[^\n]*-m ["\']?apply_overlay', reuse) or \
+        "-m \"apply_overlay.sh:" in reuse, "the stash is created without a message"
+
+
+def test_the_repin_clears_the_stale_build_vcpkg_before_the_prefetch():
+    """Deferring the copy is not enough when the tree ALREADY has the overlay.
+
+    The script's headline trap: the *directory* `Build/vcpkg` existing without a
+    `.git` makes upstream's `Meta/Utils/build_vcpkg.py` skip the clone, walk up to
+    Ladybird's own repo for a HEAD, and die with `fatal: unable to read tree`.
+    Phase 1 therefore defers `Build/vcpkg/BUILD.bazel` until after the prefetch.
+
+    On a REPIN that deferral does nothing: the file is already there from the
+    PREVIOUS run, so not creating it changes nothing and the prefetch fails
+    exactly as documented. The deferral logic had only ever been exercised on a
+    fresh clone -- found by running the repin against a replica of Ulf's tree
+    (old pin + 4 old patches + old overlay), which is the only reason it was found
+    before he hit it.
+
+    So the tree must be put back into the state the bootstrap expects: remove the
+    overlay's own deferred files, then the directory if it is empty. Guarded on
+    both sides -- it must NOT touch a real checkout (one with a .git), and it must
+    not `rm -rf` a directory holding something the overlay does not own.
+    """
+    t = _text()
+    phase2 = t.split("# Phase 2:", 1)[1]
+    # It has to notice the stale directory at all.
+    assert re.search(r'if \[ ! -d "\$TARGET/Build/vcpkg/\.git" \] && '
+                     r'\[ -d "\$TARGET/Build/vcpkg" \]', phase2), \
+        "a stale Build/vcpkg (directory, no .git) is not detected before the prefetch"
+    stale = phase2.split("un-staging", 1)[1].split("if [ -d", 1)[0]
+    # Comments stripped: the comment here explains why `rm -rf` is wrong, and a
+    # test that cannot tell the explanation from the deed makes you delete the
+    # explanation to go green.
+    stale = "\n".join(l.split("#", 1)[0] for l in stale.splitlines())
+    # Only the overlay's own files, and only when they exist.
+    assert "rm -f" in stale and "rm -rf" not in stale, \
+        ("clearing the stale directory must not rm -rf: anything in there that the "
+         "overlay does not own should fail loudly, not be deleted")
+    # The empty directory is as fatal as a populated one -- the bootstrap tests
+    # for the directory -- so it must go too, but only if it IS empty.
+    assert "rmdir" in stale, \
+        "an EMPTY Build/vcpkg still makes the bootstrap skip the clone"
+
+
+def test_the_repin_path_is_documented_for_someone_holding_an_old_tree():
+    """"How do I get my tree patched?" must have an answer in the README.
+
+    Ulf asked it, and at that point the answer was "you can't" -- the script
+    aborted on his tree. A fix nobody can find is the same as no fix, and the
+    people who need this path are exactly the ones who already have a tree.
+    """
+    readme = re.sub(r"\s+", " ", (REPO / "examples" / "ladybird" / "README.md").read_text())
+    assert "older pin" in readme or "old pin" in readme, \
+        "the README does not address a tree from a previous pin"
+    assert "stash" in readme, \
+        "the README does not say what happens to the previous pin's patches"
+    assert "stash pop" in readme, "the README does not say how to get them back"
