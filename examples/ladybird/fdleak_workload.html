@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!--
+  The fd-leak / teardown workload, as a file rather than a thing retyped from
+  memory in /tmp.
+
+  WHY IT EXISTS. Two of the three paths upstream #11041 fixes are reachable from
+  script, and both are paths where a wrong fix looks fine until it does not:
+
+    * ORDINARY COMPLETION (upstream patch 1). Each settled fetch runs the
+      user-finish branch in Request::set_up_internal_stream_data, which is where
+      defer_teardown() now happens. This is the branch my own patch got wrong: it
+      nulled m_internal_stream_data->read_stream from inside the branch, while the
+      read-notifier lambda that CALLS it goes on to dereference that OwnPtr at
+      Request.cpp:376 -> VERIFY(m_ptr) at AK/OwnPtr.h:134 -> SIGILL. Ulf hit that
+      after a few minutes of browsing; no workload of mine had reached it, because
+      I had never run enough completions through one WebContent.
+    * CANCELLATION (upstream patch 2). abort() must actually release the network
+      request: stop_fetch() returns early once the state is "aborted", so without
+      an explicit release the response pipe stays open for the life of the
+      process. A leak class my fd census could not name on its own.
+
+  The third path (a navigation parked for content sniffing, upstream patch 3)
+  needs a NAVIGABLE DESTROYED while parked -- an iframe removed while its response
+  has headers but fewer bytes than the sniff threshold. It is NOT exercised here,
+  and that omission is the point: my two earlier workloads abandoned navigations
+  without destroying the navigable, came out flat, and I nearly read that as
+  evidence against the hypothesis rather than evidence about my workload.
+
+  HOW TO RUN. It needs a real HTTP origin (file:// does not exercise the response
+  pipe the same way), so serve this directory and load it:
+
+      cd examples/ladybird && python3 -m http.server 8232 --bind 127.0.0.1 &
+      # data.txt is created by the page itself? No -- make one:
+      head -c 4000 /dev/zero | tr '\0' x > data.txt
+      XDG_RUNTIME_DIR=/tmp/xdg-lb ./bazel-bin/ladybird \
+          --headless=manual --temporary-profile \
+          http://127.0.0.1:8232/fdleak_workload.html
+
+  Then census the WebContent while it runs, which is the measurement that matters
+  (the rendered text only tells you it did not crash):
+
+      python3 fd_census.py $(pgrep -f bazel-bin/WebContent | head -1) --watch 30
+
+  Read the RATE, not the level: a high count with a flat rate is damage already
+  done. Expect peer=DEAD growth of 0/min, and zero VERIFICATION FAILED / SIGILL in
+  the browser's own output. NB --headless=text snapshots before the async loop
+  finishes, so it reports nothing useful here; use manual mode plus the census.
+-->
+<html><body><h1>fdleak workload</h1><div id=out>starting</div>
+<script>
+(async () => {
+  let ok = 0, bad = 0;
+  // The COMPLETION path: each of these runs the user-finish teardown branch.
+  for (let i = 0; i < 150; i++) {
+    try {
+      const r = await fetch('data.txt?i=' + i);
+      const t = await r.text();
+      if (t.length > 0) ok++; else bad++;
+    } catch (e) { bad++; }
+  }
+  // The CANCEL path: aborted before the body arrives.
+  let cancelled = 0;
+  for (let i = 0; i < 50; i++) {
+    const c = new AbortController();
+    const p = fetch('data.txt?c=' + i, { signal: c.signal });
+    c.abort();
+    try { await p; } catch (e) { cancelled++; }
+  }
+  // bad=0 is the assertion that matters besides the fd count: a "fix" that stops
+  // delivering bodies looks perfect in a census and shows up here.
+  document.getElementById('out').textContent =
+    'SETTLE ok=' + ok + ' bad=' + bad + ' cancelled=' + cancelled;
+})();
+</script></body></html>
