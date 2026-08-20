@@ -1,0 +1,22 @@
+# The EFFECT of upstream #11041 patch 3/3, over the file it touches
+# (Libraries/LibWeb/HTML/LocalNavigable.cpp). Checked only when the exact bytes
+# are absent, so a tree where #11041 has MERGED verifies clean.
+#
+# The effect: a navigation parked for content sniffing -- headers received, but
+# fewer bytes than the sniff threshold -- must have a teardown that runs when the
+# navigable is destroyed, when a newer navigation supersedes it, or when it is
+# destroyed already. Such a navigation has no document, so Document::abort() has
+# no controller to stop, and ONLY the arrival callback would release the request
+# -- which never runs. This was the open lead in
+# docs/UPSTREAM-ladybird-fd-leaks.md that I could not reproduce: both of my
+# workloads abandoned navigations without DESTROYING the navigable, so they
+# exercised everything except the condition that matters.
+#
+# Anchored on the pair of accessors by name: the mechanism IS the registration
+# plus the ownership check on clearing (only the navigation that registered a
+# teardown may clear it, or a late sniff callback clears a newer navigation's
+# teardown and leaks that one instead). A grep for run_pending_navigation_teardown
+# alone would pass on a tree that stores the teardown and never runs it.
+void LocalNavigable::set_pending_navigation_teardown
+void LocalNavigable::clear_pending_navigation_teardown
+run_pending_navigation_teardown\(\);

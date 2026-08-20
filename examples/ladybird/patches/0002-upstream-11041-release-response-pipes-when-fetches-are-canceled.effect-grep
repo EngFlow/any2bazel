@@ -1,0 +1,18 @@
+# The EFFECT of upstream #11041 patch 2/3, over the file it touches
+# (Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp). Checked only when
+# the exact bytes are absent, so a tree where #11041 has MERGED verifies clean
+# rather than being told to apply a patch that would conflict.
+#
+# The effect: abort() and terminate() must actually release the network request.
+# stop_fetch() returns early once the state is aborted/terminated, so without an
+# explicit release the response pipe stays open for the life of the process --
+# a whole leak class our fd census could not distinguish (it ranks by growth and
+# splits peer=DEAD/ALIVE, which does not point at the CANCEL path specifically).
+#
+# Anchored on the helper's definition plus a call, rather than on a call alone:
+# the name is the fix, and a definition with no caller would be the interesting
+# broken state. No @window -- the two call sites are in different functions
+# (abort, terminate) tens of lines apart, so a window would have to be so wide it
+# proved nothing; requiring both the definition and the declaration is stronger.
+void FetchController::stop_pending_request\(\)
+stop_pending_request\(\);

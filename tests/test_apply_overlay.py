@@ -196,11 +196,19 @@ def test_effect_grep_files_exist_for_patches_upstream_may_fix_itself():
     """
     text = _text()
     assert ".effect-grep" in text, "verify must fall back to an effect check"
-    fd_leak = PATCHES / "0001-librequests-tear-down-request-when-body-is-delivered.patch"
-    assert fd_leak.exists()
-    effect = fd_leak.with_suffix(".effect-grep")
-    assert effect.exists(), \
-        "the fd-leak patch is the one upstream is fixing; it needs an effect check"
+    # EVERY patch in the series needs one, not one named patch: the series is now
+    # upstream's three #11041 commits, and the whole point of carrying upstream's
+    # own commits is that they WILL appear in a future tree by merge rather than by
+    # us applying them. Naming a file here is also how this test would rot -- it
+    # referenced the two patches that #11041 replaced, both of which are gone.
+    patches = sorted(PATCHES.glob("0*.patch"))
+    assert patches, "no patches found"
+    for patch in patches:
+        effect = patch.with_suffix(".effect-grep")
+        assert effect.exists(), (
+            f"{patch.name} has no .effect-grep: on a tree where upstream's fix has "
+            "merged, --verify would report PATCH NOT APPLIED and tell the reader to "
+            "apply a patch that then conflicts (exactly what happened to Ulf)")
     # reverse-apply must still be tried FIRST, so the exact-bytes case keeps its
     # precise answer and the weaker check is only a fallback
     assert text.index("git apply --check -R") < text.index(".effect-grep")
@@ -215,15 +223,26 @@ def test_effect_grep_is_windowed_not_a_whole_file_grep():
     being too strict. The check therefore anchors on the branch condition and
     requires the call within a window of following lines.
     """
-    effect = (PATCHES / "0001-librequests-tear-down-request-when-body-is-delivered.effect-grep")
-    lines = [ln for ln in effect.read_text().splitlines()
-             if ln.strip() and not ln.startswith("#")]
-    assert any(ln.startswith("@window ") for ln in lines), \
-        "the effect check must be windowed; a whole-file grep accepts an unpatched tree"
-    window = [ln for ln in lines if ln.startswith("@window ")][0].split()
-    assert window[1].isdigit() and int(window[1]) < 40, \
-        "the window must be tight enough to mean 'in this branch'"
-    assert "$PATCHES" not in effect.read_text()
+    # The completion-branch patch is the one whose effect a whole-file grep cannot
+    # check, because defer_teardown() already appears in stop() and did_transfer().
+    # Found by CONTENT (the call it must place in that branch), not by filename.
+    windowed = []
+    for effect in sorted(PATCHES.glob("*.effect-grep")):
+        body = effect.read_text()
+        if "defer_teardown" not in body:
+            continue
+        windowed.append(effect)
+        lines = [ln for ln in body.splitlines()
+                 if ln.strip() and not ln.startswith("#")]
+        assert any(ln.startswith("@window ") for ln in lines), (
+            f"{effect.name} greps for defer_teardown() without a window; that call "
+            "already exists in stop()/did_transfer(), so it accepts an unpatched tree")
+        window = [ln for ln in lines if ln.startswith("@window ")][0].split()
+        assert window[1].isdigit() and int(window[1]) < 40, \
+            "the window must be tight enough to mean 'in this branch'"
+        assert "$PATCHES" not in body
+    assert windowed, \
+        "no effect check covers the completion-branch teardown, the fd leak's core fix"
     # and the script must implement the window, not just tolerate the directive
     text = _text()
     assert "@window " in text
@@ -272,57 +291,56 @@ def test_the_documented_overlay_file_count_matches_the_overlay():
             sorted(claims), actual)
 
 
-def test_the_response_fd_patch_closes_the_fd_where_the_body_is_proven_complete():
-    """The second half of the fd leak: the fd outlives the callbacks.
+def test_the_fd_leak_patches_are_upstreams_and_never_null_the_read_stream():
+    """The overlay carries upstream #11041, and must not carry my version again.
 
-    0001 drops the callbacks on completion, which unpins the GC cycle -- and on my
-    machine that took 143 leaked sockets to 0. On Ulf's tree it did not: he measured
-    97 sockets/min STILL leaking with the upstream-equivalent teardown applied,
-    every one peer=DEAD (RequestServer had already closed its end) and every one
-    sent by RequestServer (SO_PEERCRED, once `ps` named pid 2261433).
+    My `0002` (release_response_fd) CRASHED Ulf's browser after a few minutes of
+    real browsing, and the trace named the line:
 
-    The reason is ownership: the response fd is released only by ~Request (or by the
-    ReadStream inside m_internal_stream_data), so ANY surviving reference to the
-    Request keeps one fd per completed request alive -- dropping the callbacks is
-    not the same as closing the fd. 0002 closes it explicitly at the point the code
-    has already proven the body is complete.
+        VERIFICATION FAILED: m_ptr at ./AK/OwnPtr.h:134
+        #0 ...CallableWrapper<...set_up_internal_stream_data(...)::{lambda()#2}>::call()
 
-    Measured A/B, same binary, same 200-completed-request workload:
-      clean: 208 sockets, 203 peer=DEAD
-      fixed:   6 sockets,   0 peer=DEAD
+    That lambda is the read notifier's on_activation -- the frame that CALLS
+    on_finish. My patch nulled m_internal_stream_data->read_stream from inside the
+    completion branch, while the calling frame goes on to dereference exactly that
+    OwnPtr at Request.cpp:376 (`read_stream->is_eof()`), and OwnPtr::operator-> is
+    VERIFY(m_ptr). A use-after-null one stack frame up: invisible on every workload
+    I built, a crash on his.
+
+    Upstream's fix never touches read_stream -- it only ensures defer_teardown() is
+    REACHED, on all three paths where it could be missed, and reaches it BEFORE
+    user_on_finish so the deferred lambda's NonnullRefPtr pins the Request across
+    the callback (my 0001 called it after: a second latent use-after-free).
+
+    So this asserts the property, not the filenames: no patch in the series may null
+    read_stream, and the series must be upstream's. A future "optimisation" that
+    reintroduces the defensive close fails here.
     """
-    patch = PATCHES / "0002-requests-release-response-fd-on-completion.patch"
-    assert patch.exists()
-    text = patch.read_text()
-    # 0002 is the NEXT PATCH IN THE SERIES, not an alternative to 0001: it is
-    # generated on top of it and applies only after it. I first shipped a second
-    # "clean tree" variant for trees without the teardown fix, which cannot work --
-    # apply_overlay.sh globs patches/*.patch and applies them all, so one of the two
-    # was guaranteed to fail. Ulf hit it on the first run. The variant is deleted; it
-    # was also strictly weaker (it closed the fd without dropping the callbacks, so it
-    # left the GC cycle, and with it class B, in place).
-    assert not list(PATCHES.glob("*clean-tree*")), \
-        "an alternative in patches/*.patch cannot coexist with the glob that applies all"
-    assert "ON TOP OF the teardown fix" in text, \
-        "0002 must state that it builds on 0001 rather than replacing it"
-    # the notifier must be deregistered before the fd is closed, or the event loop
-    # is left polling a closed descriptor
-    body = text[text.index("release_response_fd"):]
-    assert body.index("read_notifier->close()") < body.index("m_fd = -1"), \
-        "deregister the notifier BEFORE closing the fd"
-    # it must NOT close on request_finished alone: RequestServer finishes writing
-    # long before WebContent drains the pipe, and closing there truncates bodies
-    # (verified once as blank pages)
-    assert "has_received_all_reported_bytes" in text or "user_finish_called" in text
-    effect = patch.with_suffix(".effect-grep")
-    assert effect.exists(), "carried until upstream fixes it -> needs an effect check"
-    lines = [ln for ln in effect.read_text().splitlines()
-             if ln.strip() and not ln.startswith("#")]
-    assert any(ln.startswith("@window ") for ln in lines)
-    # apply_overlay.sh takes only the FIRST @window; a second would be checked
-    # against the wrong slice, so the file must not carry one.
-    assert len([ln for ln in lines if ln.startswith("@window ")]) == 1, \
-        "apply_overlay.sh honours one @window only"
+    patches = sorted(PATCHES.glob("0*.patch"))
+    assert len(patches) == 3, \
+        "expected upstream #11041's three commits; found %r" % [p.name for p in patches]
+    for patch in patches:
+        text = patch.read_text()
+        # The added lines only: upstream's patch 1 QUOTES the surrounding code as
+        # context, and a context line is not something the patch does.
+        added = "\n".join(l[1:] for l in text.splitlines()
+                           if l.startswith("+") and not l.startswith("+++"))
+        assert "read_stream = nullptr" not in added, (
+            f"{patch.name} nulls read_stream, which the read-notifier lambda that "
+            "calls on_finish still dereferences (AK/OwnPtr.h:134 VERIFY) -- this is "
+            "the crash Ulf hit; upstream fixes the leak by reaching the teardown "
+            "instead")
+        assert "release_response_fd" not in added, (
+            f"{patch.name} reintroduces release_response_fd: it closed the fd on the "
+            "theory that a surviving reference pinned it, which upstream's fix "
+            "disproves by making the teardown reachable. Two mechanisms closing one "
+            "descriptor, one justified by a theory the other falsifies, misleads the "
+            "next reader")
+        assert "PR #11041" in text or "11041" in text, \
+            f"{patch.name} does not record its upstream provenance"
+        assert "DELETE all" in text or "DELETE" in text, (
+            f"{patch.name} does not say it is a pin artefact to delete on the repin "
+            "past the merge -- that is how a carried patch becomes a permanent fork")
 
 
 def test_the_patch_series_applies_as_a_series():

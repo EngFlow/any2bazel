@@ -1,0 +1,168 @@
+From 8636af4103410833243e5eb987d64e8baf076b1a Mon Sep 17 00:00:00 2001
+From: sideshowbarker <mike@w3.org>
+Date: Mon, 17 Aug 2026 07:28:12 +0900
+Subject: [PATCH 3/3] LibWeb: Tear down a navigation parked for content
+ sniffing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Removing an iframe whose response headers had arrived but whose
+body hadn’t arrived left the network request open for the lifetime of
+the process. A page that adds and removes such iframes in a loop leaked
+one file descriptor per iframe.
+
+Cause: If a navigation has a response but not yet enough bytes to sniff
+its content type, it gets parked in wait_for_sniff_bytes. It has no
+document at that point — so, Document::abort() has no fetch controller
+to stop, and the only code that releases the request is the arrival
+callback. That callback does handle a destroyed navigable — but it runs
+only once bytes arrive. So, a server that sends headers and then stops
+leaves nothing at all around to release the request.
+
+Fix: Register a teardown on the navigable before parking — and run it if
+the navigable is destroyed first. The teardown calls the same helper the
+arrival callback already uses — and destroying a navigable is where the
+rest of its in-flight navigation state is released.
+
+A navigation superseded before its populate task runs leaked the same
+way, for the same reason: That guard returned without releasing
+anything. It now releases the response as the guard above it does.
+---
+ Libraries/LibWeb/HTML/LocalNavigable.cpp | 50 +++++++++++++++++++++++-
+ Libraries/LibWeb/HTML/LocalNavigable.h   |  6 +++
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+
+| UPSTREAM PATCH -- Ladybird PR #11041 by sideshowbarker, commit 8636af4103410833243e5eb987d64e8baf076b1a.
+| NOT OURS. Carried only because our pin 71fb301a predates the merge; DELETE all
+| three (and this note) on the first repin past it -- see the README patch table.
+|
+| Why upstream's and not the two patches this replaces: those were written here
+| before #11041 existed, and one of them CRASHED Ulf's browser. Our 0002
+| (release_response_fd) nulled m_internal_stream_data->read_stream from inside the
+| completion branch, while the read_notifier's on_activation lambda -- the frame
+| that CALLS on_finish -- goes on to dereference that same OwnPtr:
+|
+|     if (m_internal_stream_data->read_stream->is_eof())   <-- Request.cpp:376
+|         m_internal_stream_data->read_notifier->close();
+|
+| so the null landed on VERIFY(m_ptr) in AK::OwnPtr::operator-> (AK/OwnPtr.h:134),
+| which is exactly the trace Ulf sent: CallableWrapper<...set_up_internal_stream_data
+| ...{lambda#2}>::call() -> ak_verification_failed -> SIGILL. Upstream never nulls
+| read_stream; it only ensures defer_teardown() is REACHED, and it reaches it BEFORE
+| user_on_finish so the deferred lambda's NonnullRefPtr pins the Request across the
+| callback. Our 0001 called it after, which is a second latent bug in the pair.
+|
+| The deeper point, recorded in docs/UPSTREAM-ladybird-fd-leaks.md: our 0002 existed
+| to close the fd on the theory that a surviving reference pinned it. Upstream fixes
+| the leak by running the teardown on all three paths -- so the theory was
+| unnecessary, and carrying both would have been two mechanisms closing one fd, one
+| of them justified by a theory the other disproves.
+
+diff --git a/Libraries/LibWeb/HTML/LocalNavigable.cpp b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+index ee28f176bc547..c908afbcee8df 100644
+--- a/Libraries/LibWeb/HTML/LocalNavigable.cpp
++++ b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+@@ -681,6 +681,40 @@ void LocalNavigable::set_has_been_destroyed()
+     m_has_been_destroyed = true;
+     resolve_all_pending_async_scroll_operations();
+     cancel_user_scroll_settlement();
++    run_pending_navigation_teardown();
++}
++
++void LocalNavigable::set_pending_navigation_teardown(GC::Ptr<GC::Function<void()>> teardown)
++{
++    // A navigation parking here while another is already parked supersedes it. So, tear the older one down — rather
++    // than dropping it and leaving its request open.
++    run_pending_navigation_teardown();
++
++    // Destruction has already run, so nothing would ever run this one. Tear it down now — instead of storing it forever.
++    if (m_has_been_destroyed) {
++        if (teardown)
++            teardown->function()();
++        return;
++    }
++
++    m_pending_navigation_teardown = teardown;
++}
++
++void LocalNavigable::clear_pending_navigation_teardown(GC::Ptr<GC::Function<void()>> expected)
++{
++    // Only the navigation that registered this teardown may clear it. A navigation whose sniff-byte callback
++    // arrives after a newer one has parked would otherwise clear the newer teardown — and leave that
++    // newer request with nothing to release it.
++    if (m_pending_navigation_teardown != expected)
++        return;
++
++    m_pending_navigation_teardown = nullptr;
++}
++
++void LocalNavigable::run_pending_navigation_teardown()
++{
++    if (auto teardown = exchange(m_pending_navigation_teardown, nullptr))
++        teardown->function()();
+ }
+ 
+ void LocalNavigable::remove_from_all_local_navigables()
+@@ -711,6 +745,7 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
+     visitor.visit(m_active_document);
+     visitor.visit(m_input_method_composition_node);
+     visitor.visit(m_container);
++    visitor.visit(m_pending_navigation_teardown);
+     m_event_handler.visit_edges(visitor);
+ 
+     for (auto& navigation_params : m_pending_navigations) {
+@@ -2190,6 +2225,9 @@ void LocalNavigable::populate_session_history_entry_document(
+ 
+             // 1. If navigable's ongoing navigation no longer equals navigationId, then run completionSteps and abort these steps.
+             if (navigation_id.has_value() && ongoing_navigation() != navigation_id) {
++                // AD-HOC: Nothing downstream will consume this response, and no document exists yet to abort — so,
++                //         release its request here, as the active-window guard above does.
++                stop_or_resume_response_body_delivery(navigation_params);
+                 if (completion_steps) {
+                     completion_steps->function()(nullptr);
+                 }
+@@ -2303,8 +2341,18 @@ void LocalNavigable::populate_session_history_entry_document(
+                 if (!sniff_bytes.has_value()) {
+                     // Async path: bytes not yet available, wait for them
+                     nav_params->response->resume_body_delivery_up_to(Fetch::Infrastructure::MAX_SNIFF_BYTES);
++
++                    // AD-HOC: The callback below runs only once bytes arrive — which never happens if the server sends
++                    //         headers and then stops. Hand the navigable a teardown — so that destroying it releases
++                    //         the request, instead of leaving the pipe open.
++                    auto teardown = GC::create_function(heap(), [navigation_params] {
++                        stop_or_resume_response_body_delivery(navigation_params);
++                    });
++                    nav_params->navigable->set_pending_navigation_teardown(teardown);
++
+                     body->wait_for_sniff_bytes(GC::create_function(heap(),
+-                        [output, nav_params, navigation_params, completion_steps, source_snapshot_params](ReadonlyBytes sniff_bytes) {
++                        [output, nav_params, navigation_params, completion_steps, source_snapshot_params, teardown](ReadonlyBytes sniff_bytes) {
++                            nav_params->navigable->clear_pending_navigation_teardown(teardown);
+                             // AD-HOC: The document may have been destroyed between when the fetch started and when the
+                             //         bytes arrived.
+                             if (nav_params->navigable->active_browsing_context()) {
+diff --git a/Libraries/LibWeb/HTML/LocalNavigable.h b/Libraries/LibWeb/HTML/LocalNavigable.h
+index 8ebc9e99660ae..879da0f94f09c 100644
+--- a/Libraries/LibWeb/HTML/LocalNavigable.h
++++ b/Libraries/LibWeb/HTML/LocalNavigable.h
+@@ -95,6 +95,10 @@ class WEB_API LocalNavigable : public Navigable {
+     void set_navigation_load_event_guard(DOM::Document& parent_doc);
+     void clear_navigation_load_event_guard();
+ 
++    void set_pending_navigation_teardown(GC::Ptr<GC::Function<void()>>);
++    void clear_pending_navigation_teardown(GC::Ptr<GC::Function<void()>> expected);
++    void run_pending_navigation_teardown();
++
+     RefPtr<SessionHistoryEntry> active_session_history_entry() const;
+     void set_active_session_history_entry(RefPtr<SessionHistoryEntry>);
+     RefPtr<SessionHistoryEntry> current_session_history_entry() const;
+@@ -406,6 +410,8 @@ class WEB_API LocalNavigable : public Navigable {
+     // AD-HOC: Guards the parent document's load event delay count during cross-document navigation.
+     Optional<DOM::DocumentLoadEventDelayer> m_navigation_load_event_guard;
+ 
++    GC::Ptr<GC::Function<void()>> m_pending_navigation_teardown;
++
+     // Implied link between navigable and its container.
+     GC::Ptr<NavigableContainer> m_container;
+ 

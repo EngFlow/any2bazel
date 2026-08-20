@@ -643,3 +643,69 @@ Not done here: #11041 is unmerged, so nothing is deleted yet. What I would *not*
 carry our `0002` forward alongside upstream's three — two mechanisms closing the same fd,
 one of them justified by a theory the other one falsifies, is how the next reader gets
 misled.
+
+---
+
+## Done: the overlay now carries upstream's three, because mine crashed his browser
+
+The section above was written while #11041 was still in review, and it ended with "not
+done here: nothing is deleted yet". It is done now, and the trigger was not the merge.
+
+Ulf ran the Bazel-built browser with my two patches applied. It loaded pages, and the fd
+census was flat — *"I also didn't see immediate socket leak, so that's good"* — and then
+after a few minutes it died:
+
+```
+VERIFICATION FAILED: m_ptr at ./AK/OwnPtr.h:134
+#0 in AK::Function<void ()>::CallableWrapper<Requests::Request::
+     set_up_internal_stream_data(...)::{lambda()#2}>::call()
+#1 in Core::Notifier::event(Core::Event&)
+```
+
+`{lambda()#2}` is the read notifier's `on_activation`. That is the frame which *calls*
+`on_finish` — and my `release_response_fd()`, invoked from inside the completion branch of
+`on_finish`, set `m_internal_stream_data->read_stream = nullptr` while `on_activation` was
+still on the stack and still about to dereference it:
+
+```cpp
+        } while (true);
+
+        if (m_internal_stream_data->read_stream->is_eof())   // Request.cpp:376
+            m_internal_stream_data->read_notifier->close();
+```
+
+`AK::OwnPtr::operator->` is `VERIFY(m_ptr)` (`AK/OwnPtr.h:134`), so the null became a
+trap and then `SIGILL`. **A use-after-null one stack frame up from the code I changed.**
+
+Three things worth keeping from this.
+
+**My reasoning about the fix was upside down.** I argued `0002` was needed because
+"collectable" and "closed" are different claims, and for an fd received over IPC only the
+second is the bug. That sentence is still true, and it was the wrong frame: the question
+is not *when is the fd closed* but *who owns it while the stack is still unwound*. The
+completion branch runs **inside** the read loop's callback; anything it destroys, the
+caller may still touch. Upstream's patch does not close the fd at all — it makes the
+existing deferred teardown *reachable* on each of the three paths where it was missed, and
+the teardown is deferred precisely so it cannot destroy state a live frame is using. The
+mechanism I reached for (destroy it now, synchronously, at the point I can prove the body
+is done) was in direct conflict with the one the code already had.
+
+**The ordering bug I had already spotted was the same bug, and I under-rated it.** I noted
+that upstream calls `defer_teardown()` *before* `user_on_finish` while my `0001` called it
+after, wrote that it was "the kind of latent ordering bug that shows up as a rare crash on
+someone else's machine", and then carried the patch anyway because it had never fired for
+me. It fired for him. "Never observed here" is a statement about my workloads.
+
+**One prediction verified, one falsified.** I predicted that if upstream's patches take the
+rate to zero, `0002`'s surviving-reference theory was unnecessary — that holds, and it is
+why `0002` is deleted rather than rebased. But I also wrote that the honest reading was
+"`0002` was a workaround for a missing call site, and it worked on my box because my box
+only ever hit the class `0001` already covered." That was too kind: it did not merely fail
+to help on his box, it *broke* his box, and the reason was visible in the source the whole
+time without any measurement at all.
+
+The overlay's `patches/` is now upstream's three commits, annotated in place with their
+provenance, each with an `.effect-grep` so `--verify` recognises the merged fix on a tree
+newer than our pin. `Internals.idl` gains `openResponsePipeCount()` in patch 1, which
+regenerates the LibWeb bindings — the overlay's codegen picks that up correctly (verified:
+the IDL change invalidates and rebuilds the binding set).

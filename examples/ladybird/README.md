@@ -138,14 +138,19 @@ reading it:
    (`71fb301a`). Against a different tree the build fails on a moved file — or
    worse, silently omits a new one.
 2. **The patches**, which have to be applied or the browser leaks one socket fd per
-   completed HTTP request until it dies of `EMFILE` overnight
-   ([`0001`](patches/0001-librequests-tear-down-request-when-body-is-delivered.patch)
-   and [`0002`](patches/0002-requests-release-response-fd-on-completion.patch);
+   completed HTTP request until it dies of `EMFILE` overnight. These are now
+   **upstream's own three commits from Ladybird PR #11041**, carried only because our
+   pin predates the merge
+   ([`0001`](patches/0001-upstream-11041-release-response-pipes-when-requests-complete.patch),
+   [`0002`](patches/0002-upstream-11041-release-response-pipes-when-fetches-are-canceled.patch),
+   [`0003`](patches/0003-upstream-11041-tear-down-a-navigation-parked-for-content-sniffing.patch);
    see [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md)).
-   There used to be four: the `PYTHONHASHSEED` determinism fix and the
-   non-self-contained `UI/Qt/TabBar.h` are both **fixed upstream** at this pin, so
-   the repin from `f9e34731` deleted them. A patch directory that only ever grows is
-   a patch directory nobody re-checks against upstream.
+   They **replace two patches written here**, one of which crashed Ulf's browser —
+   see "Why upstream's patches replaced mine" below. There used to be four others: the
+   `PYTHONHASHSEED` determinism fix and the non-self-contained `UI/Qt/TabBar.h` are
+   both **fixed upstream** at this pin, so the repin from `f9e34731` deleted them. A
+   patch directory that only ever grows is a patch directory nobody re-checks against
+   upstream.
 3. **The rename**: `bazelrc.txt` → `.bazelrc`. Stored under a different name so a
    `cp -r` cannot be mistaken for a working build — and a rename a human does by
    hand is a rename a human forgets.
@@ -1162,32 +1167,54 @@ Honest inventory of what stops this from being a clone-and-build.
    upstream fixes — a patch keeps applying long after it stops being needed, so
    "it still applies" is not evidence that it is still a bug.
 
-   What remains is the fd leak, in two patches that are one series. The first,
-   found only because the Bazel-built browser was left running overnight, is a
-   resource leak rather than a build defect:
-   [`patches/0001-librequests-tear-down-request-when-body-is-delivered.patch`](patches/0001-librequests-tear-down-request-when-body-is-delivered.patch).
-   WebContent leaks one AF_UNIX socket fd per *completed* HTTP request — a cycle
-   between the GC heap (four `GC::Root`s from `Fetching.cpp:2338`) and the
-   refcount heap (`Response` holding `Requests::Request` by `RefPtr`) that neither
-   collector can break — until `EMFILE` aborts three processes at once. The patch
-   is **necessary but not sufficient**: it fixes the completed-request class
-   (identifiable in `ss -np` by a dead peer, `* 0`), while a stalled-body class
-   with a live peer survives it. Both are written up with reproductions in
-   [`docs/UPSTREAM-ladybird-fd-leaks.md`](../../docs/UPSTREAM-ladybird-fd-leaks.md).
+   ### Why upstream's patches replaced mine
 
-   The **second** is the other half of the completed-request class, and it only showed
-   up on a tree that was not mine:
-   [`patches/0002-requests-release-response-fd-on-completion.patch`](patches/0002-requests-release-response-fd-on-completion.patch).
-   With `0001`'s teardown applied, Ulf still measured **97 leaked sockets/min**, all
-   `peer=DEAD` and all sent by RequestServer — because dropping the callbacks unpins
-   the GC cycle but does not *close the descriptor*: the response pipe is released
-   only by `~Request`, so any other reference to the request retains one fd per
-   completed request. `0002` closes it where the body is already proven complete — the
-   next patch in the series, applied on top of `0001`; `patches/*.patch` is applied by
-   glob in full, so an *alternative* to a patch must never live there.
-   Measured A/B on 200 completed requests: **208 sockets (203 dead) → 6 (0 dead)**,
-   with body delivery intact. "Collectable" and "closed" are different claims, and
-   for an fd received over IPC only the second one is the bug.
+   What remains is the fd leak, and the overlay now carries **upstream's three
+   commits** (Ladybird PR #11041, by sideshowbarker) rather than the two patches
+   written here. That swap was not housekeeping — **my `0002` crashed Ulf's browser**,
+   and the trace named the exact line:
+
+   ```
+   VERIFICATION FAILED: m_ptr at ./AK/OwnPtr.h:134
+   #0 ...CallableWrapper<Requests::Request::set_up_internal_stream_data(...)::{lambda()#2}>::call()
+   ```
+
+   That lambda is the read notifier's `on_activation`, and it is the frame that *calls*
+   `on_finish`. My `release_response_fd()` ran from inside that completion branch and
+   set `m_internal_stream_data->read_stream = nullptr` — while the calling frame goes on
+   to dereference exactly that `OwnPtr`:
+
+   ```cpp
+   if (m_internal_stream_data->read_stream->is_eof())   // Request.cpp:376
+       m_internal_stream_data->read_notifier->close();
+   ```
+
+   `OwnPtr::operator->` is `VERIFY(m_ptr)`. So the fix nulled a pointer its own caller
+   still owned: a use-after-null one stack frame up, invisible on my workloads and a
+   crash after a few minutes of real browsing on his. Upstream never touches
+   `read_stream`; it only ensures `defer_teardown()` is *reached*, and reaches it
+   **before** `user_on_finish` so the deferred lambda's `NonnullRefPtr` pins the
+   `Request` across the callback — where my `0001` called it *after*, which was a second
+   latent use-after-free in the same pair.
+
+   The deeper lesson is about what the two patches were *for*. Mine closed the fd on the
+   theory that a surviving reference pinned it; upstream fixes the leak by running the
+   teardown on all three paths it can be missed — ordinary completion, `abort()`/
+   `terminate()`, and a navigation parked for content sniffing. If reaching the teardown
+   is sufficient, the surviving-reference theory was never needed, and carrying both
+   would have meant two mechanisms closing one descriptor, one of them justified by a
+   theory the other disproves. Upstream also found a class my instrument could not:
+   `fd_census.py` ranks by growth and splits `peer=DEAD`/`ALIVE`, which identified the
+   completed-request class but says nothing specific about the *cancel* path. And their
+   patch 3 is the lead I had and could not reproduce — my two workloads abandoned
+   navigations without **destroying the navigable**, so they exercised everything except
+   the condition that matters. A falsified workload was evidence about my workload, not
+   about the hypothesis.
+
+   All three are annotated in place with their provenance and carry `.effect-grep`
+   files, so `apply_overlay.sh --verify` recognises the merged upstream fix on a tree
+   newer than our pin instead of demanding a patch that would conflict. Delete all
+   three on the first repin past the merge.
 
    Diagnose a running browser with [`fd_census.py`](fd_census.py), which needs no
    patch and no particular tree — `python3 fd_census.py --all --watch 30` ranks every

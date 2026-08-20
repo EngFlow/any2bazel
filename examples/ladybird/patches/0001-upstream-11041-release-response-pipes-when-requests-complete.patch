@@ -1,0 +1,234 @@
+From 63817a66757e4005383cd7c4e9508fa188e823fc Mon Sep 17 00:00:00 2001
+From: sideshowbarker <mike@w3.org>
+Date: Fri, 7 Aug 2026 09:44:33 -0700
+Subject: [PATCH 1/3] LibRequests+LibWeb: Release response pipes when requests
+ complete
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Pages issuing fetches in a tight loop accumulate one open Unix
+socket per completed fetch in their WebContent process. The WPT scroll-
+to-text-fragment/redirects.html test polls that way, and drove a local
+WebContent process to ~21,900 socket/fileport attachments — at which
+point the process crashed after receiving the next response pipe failed.
+In a local repro driving about 1,500 fetches per second, WebContent grew
+from 5,541 to 63,543 Unix-socket descriptors in 43 seconds.
+
+Cause: Requests::Request tears down its stream state only when a request
+is stopped or transferred. On ordinary completion, the ReadStream with
+the response-pipe descriptor, its notifier, and the internal buffers all
+stay alive until the Request object is destroyed – and a fetch Response
+holds a reference to its Request until GC. The scarce resource is file
+descriptors — but GC pressure is measured in heap bytes. So, a tight
+fetch loop retires thousands of completed requests without GC ever
+having a reason to run — and so, the descriptor table fills up.
+
+Fix: Schedule the existing deferred teardown at the moment a request
+delivers its user-finish callback (the single point every request passes
+through on ordinary completion) — for buffered and unbuffered modes and
+for network errors alike. That’s only reached once all response data has
+been delivered. So streaming consumers and paused document loads are un-
+affected — and stopped/transferred requests keep their existing teardown
+paths. The teardown must stay deferred: It’s scheduled from inside the
+callback chain it destroys, and the deferred task also keeps the Request
+alive if the callback drops the last ref. With this change, the repro
+holds steady at 0–2 open response pipes at an unchanged request rate.
+---
+ Libraries/LibRequests/Request.cpp             | 20 +++++++++++
+ Libraries/LibRequests/Request.h               |  9 +++--
+ Libraries/LibWeb/Internals/Internals.cpp      |  6 ++++
+ Libraries/LibWeb/Internals/Internals.h        |  1 +
+ Libraries/LibWeb/Internals/Internals.idl      |  1 +
+ ...sponse-pipes-released-after-completion.txt |  1 +
+ ...ponse-pipes-released-after-completion.html | 33 +++++++++++++++++++
+ 7 files changed, 66 insertions(+), 5 deletions(-)
+ create mode 100644 Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt
+ create mode 100644 Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html
+
+| UPSTREAM PATCH -- Ladybird PR #11041 by sideshowbarker, commit 63817a66757e4005383cd7c4e9508fa188e823fc.
+| NOT OURS. Carried only because our pin 71fb301a predates the merge; DELETE all
+| three (and this note) on the first repin past it -- see the README patch table.
+|
+| Why upstream's and not the two patches this replaces: those were written here
+| before #11041 existed, and one of them CRASHED Ulf's browser. Our 0002
+| (release_response_fd) nulled m_internal_stream_data->read_stream from inside the
+| completion branch, while the read_notifier's on_activation lambda -- the frame
+| that CALLS on_finish -- goes on to dereference that same OwnPtr:
+|
+|     if (m_internal_stream_data->read_stream->is_eof())   <-- Request.cpp:376
+|         m_internal_stream_data->read_notifier->close();
+|
+| so the null landed on VERIFY(m_ptr) in AK::OwnPtr::operator-> (AK/OwnPtr.h:134),
+| which is exactly the trace Ulf sent: CallableWrapper<...set_up_internal_stream_data
+| ...{lambda#2}>::call() -> ak_verification_failed -> SIGILL. Upstream never nulls
+| read_stream; it only ensures defer_teardown() is REACHED, and it reaches it BEFORE
+| user_on_finish so the deferred lambda's NonnullRefPtr pins the Request across the
+| callback. Our 0001 called it after, which is a second latent bug in the pair.
+|
+| The deeper point, recorded in docs/UPSTREAM-ladybird-fd-leaks.md: our 0002 existed
+| to close the fd on the theory that a surviving reference pinned it. Upstream fixes
+| the leak by running the teardown on all three paths -- so the theory was
+| unnecessary, and carrying both would have been two mechanisms closing one fd, one
+| of them justified by a theory the other disproves.
+
+diff --git a/Libraries/LibRequests/Request.cpp b/Libraries/LibRequests/Request.cpp
+index 6262425a5bad5..16234917a4927 100644
+--- a/Libraries/LibRequests/Request.cpp
++++ b/Libraries/LibRequests/Request.cpp
+@@ -35,6 +35,25 @@ static Optional<Core::ImmutableBytes> map_body_file(int fd, u64 offset, u64 size
+     return payload.release_value();
+ }
+ 
++static size_t s_live_read_stream_count = 0;
++
++size_t ReadStream::live_count()
++{
++    return s_live_read_stream_count;
++}
++
++ReadStream::ReadStream(NonnullOwnPtr<Stream> stream, NonnullRefPtr<Core::Notifier> notifier)
++    : m_stream(move(stream))
++    , m_notifier(move(notifier))
++{
++    ++s_live_read_stream_count;
++}
++
++ReadStream::~ReadStream()
++{
++    --s_live_read_stream_count;
++}
++
+ ErrorOr<NonnullOwnPtr<ReadStream>> ReadStream::create(int reader_fd)
+ {
+ #if defined(AK_OS_WINDOWS)
+@@ -326,6 +345,7 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
+         auto has_received_all_reported_bytes = m_internal_stream_data->request_done && m_internal_stream_data->delivered_size >= m_internal_stream_data->total_size;
+         if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
+             m_internal_stream_data->user_finish_called = true;
++            defer_teardown();
+             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
+         }
+     };
+diff --git a/Libraries/LibRequests/Request.h b/Libraries/LibRequests/Request.h
+index b4046fa8d114a..69cdf0d6d0398 100644
+--- a/Libraries/LibRequests/Request.h
++++ b/Libraries/LibRequests/Request.h
+@@ -55,6 +55,9 @@ class ResponseData {
+ class ReadStream {
+ public:
+     static ErrorOr<NonnullOwnPtr<ReadStream>> create(int reader_fd);
++    ~ReadStream();
++
++    static size_t live_count();
+ 
+     NonnullRefPtr<Core::Notifier> const& notifier() const { return m_notifier; }
+ 
+@@ -63,11 +66,7 @@ class ReadStream {
+     ErrorOr<Bytes> read_some(Bytes bytes) { return m_stream->read_some(bytes); }
+ 
+ private:
+-    ReadStream(NonnullOwnPtr<Stream> stream, NonnullRefPtr<Core::Notifier> notifier)
+-        : m_stream(move(stream))
+-        , m_notifier(move(notifier))
+-    {
+-    }
++    ReadStream(NonnullOwnPtr<Stream> stream, NonnullRefPtr<Core::Notifier> notifier);
+ 
+     NonnullOwnPtr<Stream> m_stream;
+     NonnullRefPtr<Core::Notifier> m_notifier;
+diff --git a/Libraries/LibWeb/Internals/Internals.cpp b/Libraries/LibWeb/Internals/Internals.cpp
+index d221019b6e8de..65cb4a9150f3d 100644
+--- a/Libraries/LibWeb/Internals/Internals.cpp
++++ b/Libraries/LibWeb/Internals/Internals.cpp
+@@ -22,6 +22,7 @@
+ #include <LibJS/Runtime/Object.h>
+ #include <LibJS/Runtime/Reference.h>
+ #include <LibJS/Runtime/VM.h>
++#include <LibRequests/Request.h>
+ #include <LibURL/Parser.h>
+ #include <LibWeb/ARIA/AriaData.h>
+ #include <LibWeb/ARIA/StateAndProperties.h>
+@@ -614,6 +615,11 @@ void Internals::simulate_request_server_connection_loss()
+     page().client().page_did_lose_request_server_connection();
+ }
+ 
++WebIDL::UnsignedLongLong Internals::open_response_pipe_count()
++{
++    return Requests::ReadStream::live_count();
++}
++
+ WebIDL::ExceptionOr<void> Internals::set_content_blockers(Utf16String const& patterns_source)
+ {
+     Utf16StringBuilder patterns_builder;
+diff --git a/Libraries/LibWeb/Internals/Internals.h b/Libraries/LibWeb/Internals/Internals.h
+index b2df9d5c9e051..cd0a9bbf4a2dc 100644
+--- a/Libraries/LibWeb/Internals/Internals.h
++++ b/Libraries/LibWeb/Internals/Internals.h
+@@ -106,6 +106,7 @@ class WEB_API Internals final : public InternalsBase {
+ 
+     bool set_http_memory_cache_enabled(bool enabled);
+     void simulate_request_server_connection_loss();
++    WebIDL::UnsignedLongLong open_response_pipe_count();
+     WebIDL::ExceptionOr<void> set_content_blockers(Utf16String const& patterns);
+     void set_content_blocking_enabled(bool enabled);
+     WebIDL::UnsignedLongLong partial_layout_count();
+diff --git a/Libraries/LibWeb/Internals/Internals.idl b/Libraries/LibWeb/Internals/Internals.idl
+index e2634eadcac82..107b11fd08160 100644
+--- a/Libraries/LibWeb/Internals/Internals.idl
++++ b/Libraries/LibWeb/Internals/Internals.idl
+@@ -85,6 +85,7 @@ interface Internals {
+ 
+     boolean setHttpMemoryCacheEnabled(boolean enabled);
+     undefined simulateRequestServerConnectionLoss();
++    unsigned long long openResponsePipeCount();
+     undefined setContentBlockers(Utf16DOMString patterns);
+     undefined setContentBlockingEnabled(boolean enabled);
+     unsigned long long partialLayoutCount();
+diff --git a/Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt b/Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt
+new file mode 100644
+index 0000000000000..836a4a872c4d4
+--- /dev/null
++++ b/Tests/LibWeb/Text/expected/Fetch/response-pipes-released-after-completion.txt
+@@ -0,0 +1 @@
++open response pipes after fetches: 0
+diff --git a/Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html b/Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html
+new file mode 100644
+index 0000000000000..29c66bcf3cd40
+--- /dev/null
++++ b/Tests/LibWeb/Text/input/Fetch/response-pipes-released-after-completion.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<script src="../include.js"></script>
++<script>
++    // Each HTTP request receives its response body through a RequestServer pipe that pins an open file descriptor in
++    // this process. Completed requests must release their pipes promptly, rather than holding them until GC — since a
++   //  page that fetches in a tight loop can // otherwise starve the process of file descriptors. See #11033.
++    asyncTest(async done => {
++        const server = httpTestServer();
++        const url = await server.createEcho("GET", "/response-pipe-release", {
++            status: 200,
++            headers: {
++                "Access-Control-Allow-Origin": "*",
++                "Cache-Control": "no-store",
++            },
++            body: "pong",
++        });
++
++        for (let i = 0; i < 8; ++i) {
++            const response = await fetch(`${url}?i=${i}`, { cache: "no-store" });
++            await response.text();
++        }
++
++        // Pipe teardown runs on a deferred task — so give the event loop a few turns.
++        let pipeCount = internals.openResponsePipeCount();
++        for (let attempt = 0; attempt < 100 && pipeCount !== 0; ++attempt) {
++            await timeout(10);
++            pipeCount = internals.openResponsePipeCount();
++        }
++
++        println(`open response pipes after fetches: ${pipeCount}`);
++        done();
++    });
++</script>
+

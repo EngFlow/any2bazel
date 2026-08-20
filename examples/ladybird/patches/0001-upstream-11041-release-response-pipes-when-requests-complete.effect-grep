@@ -1,0 +1,24 @@
+# The EFFECT this patch must have, as extended regexes over the file it touches
+# (Libraries/LibRequests/Request.cpp). Checked only when the patch's exact bytes
+# are NOT in the tree, so a tree that is NEWER than our pin -- one where #11041
+# has merged -- verifies as "already fixed" instead of being told to apply a
+# patch that would conflict. That is the whole reason this mechanism exists.
+#
+# The effect: the branch that decides the body is fully delivered (the one that
+# calls the user's finish callback) must ALSO tear the request down, so the
+# ReadStream holding the response-pipe fd is released instead of waiting for GC.
+#
+# The window matters. defer_teardown() already appears in stop() and
+# did_transfer(), so a whole-file grep for it passes on a tree WITHOUT the fix --
+# verified, and pinned by a test. So anchor on the branch condition and require
+# the call within the following few lines.
+#
+# NOTE the ORDER is deliberately NOT asserted here. Upstream calls
+# defer_teardown() BEFORE user_on_finish (so the deferred lambda's NonnullRefPtr
+# pins the Request across the callback); the patch this replaced called it after,
+# which was a latent use-after-free. A grep cannot express "before" without
+# becoming a byte comparison, and the exact-bytes check already covers our own
+# version -- so this asserts the fix is PRESENT and leaves ordering to the patch.
+@window 12 has_received_all_reported_bytes =
+user_finish_called = true
+defer_teardown\(\);

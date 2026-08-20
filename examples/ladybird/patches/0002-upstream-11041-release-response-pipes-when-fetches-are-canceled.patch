@@ -1,0 +1,136 @@
+From 2ae78115aecaae054532d8a8ba93fecb4c8a9a3c Mon Sep 17 00:00:00 2001
+From: sideshowbarker <mike@w3.org>
+Date: Mon, 17 Aug 2026 07:04:13 +0900
+Subject: [PATCH 2/3] LibWeb: Release response pipes when fetches are canceled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Aborting or terminating a fetch left its response pipe open for
+the lifetime of the process. A page that starts and cancels requests in
+a loop (an EventSource closed and reopened, a fetch or XHR aborted while
+the response is still hanging) leaked one file descriptor per cycle —
+until it ran out of them.
+
+Cause: abort() and terminate() only set the controller state. The one
+path that releases the request, stop_request(), is reached only from
+stop_fetch() — which returns early once the state is already “aborted”
+or “terminated”. So the two entry points that mark a fetch as canceled
+were the two that never told the network layer — and RequestServer holds
+a request alive until it either finishes or is stopped.
+
+Fix: Release the request from abort() and terminate() too — through a
+helper that stop_request() now shares.
+
+One caller relied on terminate() leaving the request alone. When a
+navigation response becomes a download, the request is handed to the UI
+process and the fetch is then terminated. That path now drops its handle
+to the request before terminating — so a download already under way
+isn’t stopped. RequestServer reports the transfer back to the
+WebContent process — and that’s what closes the reader end of the pipe.
+---
+ .../LibWeb/Fetch/Infrastructure/FetchController.cpp | 13 +++++++++++++
+ .../LibWeb/Fetch/Infrastructure/FetchController.h   |  5 +++++
+ Libraries/LibWeb/HTML/LocalNavigable.cpp            |  7 ++++++-
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+| UPSTREAM PATCH -- Ladybird PR #11041 by sideshowbarker, commit 2ae78115aecaae054532d8a8ba93fecb4c8a9a3c.
+| NOT OURS. Carried only because our pin 71fb301a predates the merge; DELETE all
+| three (and this note) on the first repin past it -- see the README patch table.
+|
+| Why upstream's and not the two patches this replaces: those were written here
+| before #11041 existed, and one of them CRASHED Ulf's browser. Our 0002
+| (release_response_fd) nulled m_internal_stream_data->read_stream from inside the
+| completion branch, while the read_notifier's on_activation lambda -- the frame
+| that CALLS on_finish -- goes on to dereference that same OwnPtr:
+|
+|     if (m_internal_stream_data->read_stream->is_eof())   <-- Request.cpp:376
+|         m_internal_stream_data->read_notifier->close();
+|
+| so the null landed on VERIFY(m_ptr) in AK::OwnPtr::operator-> (AK/OwnPtr.h:134),
+| which is exactly the trace Ulf sent: CallableWrapper<...set_up_internal_stream_data
+| ...{lambda#2}>::call() -> ak_verification_failed -> SIGILL. Upstream never nulls
+| read_stream; it only ensures defer_teardown() is REACHED, and it reaches it BEFORE
+| user_on_finish so the deferred lambda's NonnullRefPtr pins the Request across the
+| callback. Our 0001 called it after, which is a second latent bug in the pair.
+|
+| The deeper point, recorded in docs/UPSTREAM-ladybird-fd-leaks.md: our 0002 existed
+| to close the fd on the theory that a surviving reference pinned it. Upstream fixes
+| the leak by running the teardown on all three paths -- so the theory was
+| unnecessary, and carrying both would have been two mechanisms closing one fd, one
+| of them justified by a theory the other disproves.
+
+diff --git a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp
+index 5e41472a1eb3b..6ba3de7c24e8c 100644
+--- a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp
++++ b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.cpp
+@@ -104,6 +104,10 @@ void FetchController::abort(JS::Realm& realm, Optional<JS::Value> error)
+             : serialized_value_or_error.value();
+     };
+     m_serialized_abort_reason = structured_serialize(error.value(), fallback_error_value);
++
++    // AD-HOC: stop_fetch() returns early once the state is "aborted". So, this is the last chance to release the
++    //         network request. Without it the response pipe stays open for good.
++    stop_pending_request();
+ }
+ 
+ // https://fetch.spec.whatwg.org/#fetch-controller-terminate
+@@ -111,6 +115,10 @@ void FetchController::terminate()
+ {
+     // To terminate a fetch controller controller, set controller’s state to "terminated".
+     m_state = State::Terminated;
++
++    // AD-HOC: As in abort() above — stop_fetch() won’t release the request once the state is "terminated" — so,
++    //         release it here.
++    stop_pending_request();
+ }
+ 
+ void FetchController::stop_fetch()
+@@ -143,6 +151,11 @@ void FetchController::stop_fetch()
+ void FetchController::stop_request()
+ {
+     VERIFY(m_state == State::Stopped);
++    stop_pending_request();
++}
++
++void FetchController::stop_pending_request()
++{
+     if (m_pending_request) {
+         m_pending_request->stop();
+         m_pending_request = nullptr;
+diff --git a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h
+index fb27df8f53e55..480a764277c0d 100644
+--- a/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h
++++ b/Libraries/LibWeb/Fetch/Infrastructure/FetchController.h
+@@ -86,6 +86,11 @@ class WEB_API FetchController : public JS::Cell {
+     //    Null or a fetch timing info.
+     GC::Ptr<FetchTimingInfo> m_full_timing_info;
+ 
++    // Releases the network request behind this controller. Every way a fetch stops early has to reach this: The
++    // response pipe is a socket pair, and RequestServer holds the request alive until it either finishes or is stopped.
++    // So, a request that's abandoned without being stopped would keep its descriptor for the lifetime of the process.
++    void stop_pending_request();
++
+     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
+     // report timing steps (default null)
+     //    Null or an algorithm accepting a global object.
+diff --git a/Libraries/LibWeb/HTML/LocalNavigable.cpp b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+index ff47e30dfa7c2..ee28f176bc547 100644
+--- a/Libraries/LibWeb/HTML/LocalNavigable.cpp
++++ b/Libraries/LibWeb/HTML/LocalNavigable.cpp
+@@ -540,8 +540,13 @@ static bool handle_navigation_response_as_download(GC::Ref<NavigationParams> nav
+             return true;
+         }
+ 
+-        if (navigation_params->fetch_controller)
++        if (navigation_params->fetch_controller) {
++            // AD-HOC: The request now belongs to the UI process (it adopted it above). So, before terminating, drop our
++            //         handle to it. Otherwise, fetch termination would stop a download already under way. RequestServer
++            //         reports the transfer back to us; that's what tears down this process's end of the pipe.
++            navigation_params->fetch_controller->set_pending_request(nullptr);
+             navigation_params->fetch_controller->terminate();
++        }
+ 
+         return true;
+     }
+
