@@ -2737,7 +2737,7 @@ this document is only as strong as what was actually removed — which is the ar
 for removal as a method, not against it: it is the only check here that ever found
 this class of bug, and each time I widened what I removed, it found another.
 
-## Finding 42: the browser ran, then ran out of file descriptors — and my first four diagnoses were theories, not counts (and my fifth, the patch, was only half of it)
+## Finding 42: the browser ran, then ran out of file descriptors — and my first four diagnoses were theories, not counts, my fifth (a patch) was only half of it, and my sixth crashed Ulf's browser
 
 The Bazel-built browser worked and then died overnight with `dup: Too many open files
 (errno=24)`. This finding is not about the migration at all: it is an upstream Ladybird
@@ -2801,6 +2801,23 @@ making the *instrument* answer the classification question, so the next report i
 instead of another theory. The diagnostic build is kept, deliberately outside the overlay's
 `patches/*.patch` glob and pinned there by a test, as
 `examples/ladybird/patches/DIAGNOSTIC-fdleak-census.patch.txt`.
+
+**Second postscript: the classification was right and the conclusion I drew from it was
+wrong.** The peer-dead/peer-alive split above is a sound way to read a census, and I then
+used it to argue that peer-dead-and-still-leaking meant *some other reference owns the fd*,
+so the fix was to close the descriptor explicitly in the completion branch. Upstream's
+PR #11041 shows the truth was simpler: the codebase's existing **deferred** teardown was
+never reached on three paths (ordinary completion, `abort()`/`terminate()`, and a
+navigation parked for content sniffing whose navigable is destroyed). Both stories predict
+identical census columns — what separates them is enumerating the call sites, not
+collecting more numbers. My explicit close nulled `read_stream` from inside a callback
+whose caller dereferences it two statements later, and **abort-crashed Ulf's browser** on a
+`VERIFY(m_ptr)` one stack frame up. The overlay now carries upstream's three patches
+instead of my two. `docs/UPSTREAM-ladybird-fd-leaks.md` has been restructured to lead with
+that outcome and the ownership-during-stack-unwind lesson, with the whole investigation
+demoted to an appendix labelled superseded — because a document that grows by append
+eventually misinforms by ordering, and a reader who stopped before the last section of that
+one would have taken away the model that produced a crashing patch.
 
 ## Environment notes (this sandbox)
 
