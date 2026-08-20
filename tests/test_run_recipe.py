@@ -122,3 +122,57 @@ def test_the_resource_root_recipe_survives_a_stale_share_symlink():
     sh = _run_recipe_shell()
     assert re.search(r"rm -f\s+\"?\$\(dirname\s+\"?\$BIN\"?\)\"?/share", sh), \
         "the recipe does not clear a `share` symlink left pointing into CMake's tree"
+
+
+def test_the_diagnostic_checks_for_a_shadowing_libexec_before_it_checks_qt():
+    """The stale-libexec failure must be ruled out FIRST, because it mimics Qt.
+
+    It has now bitten twice, and both times it arrived disguised: a SIGILL or
+    `VERIFICATION FAILED` with a Qt-flavoured backtrace (QApplicationPrivate,
+    QEventDispatcherGlib, libQt6Core frames), preceded by `Endpoint magic number
+    mismatch, not my message!` on every IPC message. Nothing in that picture says
+    "you are running binaries from a previous build" -- but the PATHS in the
+    backtrace do: `ladybird` from bazel-out/.../bin/ and `Compositor` from
+    bazel-out/.../libexec/.
+
+    So the Qt diagnostic checks it before any Qt question, or it confidently
+    investigates the wrong subsystem. (Todo 4a93a257: for a "built fine, behaves
+    wrong" bug, ask what is EXECUTING before auditing what produced it.)
+    """
+    script = os.path.join(_EXAMPLE, "qt_runtime_diagnose.sh")
+    assert os.path.isfile(script), "the Qt runtime diagnostic is missing"
+    with open(script) as f:
+        t = f.read()
+    assert "libexec" in t, \
+        "the diagnostic never checks for a shadowing libexec, the likelier cause"
+    # Before the Qt sections: a diagnostic that asks about Qt first sends the
+    # reader into the wrong subsystem, which is exactly what happened.
+    libexec_at = t.index("libexec")
+    qt_at = min(t.index("MODULE.bazel"), t.index("qtconf.bzl"))
+    assert libexec_at < qt_at, \
+        ("the libexec check must come BEFORE the Qt checks: it mimics a Qt crash "
+         "and is the more common cause")
+    # It must name the lookup order, or "delete libexec" is a superstition.
+    assert re.search(r"libexec.{0,120}\bFIRST\b", t, re.S | re.I), \
+        "the diagnostic does not say libexec is searched FIRST (why the copy wins)"
+    # And it must print what each service RESOLVES to, which is the datum the
+    # backtrace carried and no build check produces.
+    assert "SHADOWS" in t, \
+        "the diagnostic does not report which copy of each service would run"
+    for svc in ("Compositor", "WebContent", "RequestServer"):
+        assert svc in t, f"the resolution check does not cover {svc}"
+
+
+def test_the_diagnostic_unsets_ld_library_path_when_it_runs_the_binary():
+    """A run with LD_LIBRARY_PATH set cannot tell you whether you need it.
+
+    Ulf's run.sh sets LD_LIBRARY_PATH=~/Qt/6.9.2/gcc_64/lib, which masks BOTH Qt
+    runtime failures (the missing bundled ICU, and the wrong-SDK QPA plugin). The
+    diagnostic exists to say which one fired, so it must run the binary WITHOUT it.
+    """
+    script = os.path.join(_EXAMPLE, "qt_runtime_diagnose.sh")
+    with open(script) as f:
+        t = f.read()
+    assert "env -u LD_LIBRARY_PATH" in t, \
+        ("the diagnostic must run the binary with LD_LIBRARY_PATH unset -- with it "
+         "set, both failures disappear and the run proves nothing")

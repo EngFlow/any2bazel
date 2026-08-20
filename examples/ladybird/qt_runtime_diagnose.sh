@@ -40,6 +40,55 @@ say "0. the tree"
 echo "tree:   $TREE"
 echo "commit: $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 
+say "0b. is a STALE libexec/ shadowing the services? (the most likely crash)"
+# Checked FIRST, before anything about Qt, because this failure looks like a Qt
+# crash, arrives as a SIGILL/VERIFICATION FAILED with a Qt-flavoured backtrace,
+# and has nothing to do with Qt. It is also the failure that has now bitten twice.
+#
+# LibWebView/Utilities.cpp's get_paths_for_helper_process() searches
+#   <prefix>/libexec/<name>   FIRST
+#   <prefix>/bin/<name>       second
+# so ANY libexec copy wins over the binaries Bazel just built, and only the copy
+# is ever executed. After a repin the stale copies are from the OLD pin, whose IPC
+# message IDs have shifted, so every message fails to parse:
+#
+#   Failed to parse IPC message:
+#     Peer endpoint error: Endpoint magic number mismatch, not my message!
+#   IPC::ConnectionBase: Disconnecting misbehaving peer due to malformed message
+#   VERIFICATION FAILED: connection at Services/Compositor/ConnectionFromClient.cpp
+#
+# The tell is in the backtrace's PATHS, not in its frames: `ladybird` runs from
+# bazel-out/.../bin/ while `Compositor` runs from bazel-out/.../libexec/. Todo
+# 4a93a257 is exactly this lesson -- for a "built fine, behaves wrong" bug, ask
+# what is EXECUTING before auditing what produced it.
+stale=0
+for d in bazel-out/*/libexec bazel-bin/libexec; do
+    [ -d "$d" ] || continue
+    stale=$((stale + 1))
+    echo "  SHADOWING: $d"
+    ls "$d" 2>/dev/null | sed 's/^/      /'
+    echo "      newest file here: $(find "$d" -type f -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | sort | tail -1)"
+done
+if [ "$stale" -gt 0 ]; then
+    echo "  compare against the FRESH build:"
+    for b in bazel-bin/Compositor bazel-bin/WebContent; do
+        [ -e "$b" ] && echo "      $(find "$b" -printf '%TY-%Tm-%Td %p\n' 2>/dev/null)"
+    done
+    cat <<'FIX'
+  -> THIS IS ALMOST CERTAINLY YOUR BUG. libexec is searched BEFORE bin, so those
+     copies are what run, not what you just built. If their dates are older than
+     bazel-bin's, the UI is talking to services from a previous pin and every IPC
+     message fails with "Endpoint magic number mismatch". Delete them:
+FIX
+    for d in bazel-out/*/libexec bazel-bin/libexec; do
+        [ -d "$d" ] && echo "         rm -rf $TREE/$d"
+    done
+    echo "     Nothing needs staging there: the services are already siblings of"
+    echo "     ladybird in bazel-bin, which is the second entry in the lookup chain."
+else
+    echo "  none -- good (the services resolve to bazel-bin, the fresh build)"
+fi
+
 say "1. which Qt the BUILD was told to use (MODULE.bazel)"
 sed -n 's|^[[:space:]]*paths = {"linux-x86_64": "\([^"]*\)".*|\1|p' MODULE.bazel | head -1
 
@@ -119,9 +168,26 @@ env -u LD_LIBRARY_PATH "$BIN" --version 2>&1 | head -5
 rc=$?
 echo "--version exit: $rc"
 
+say "8. what the helper processes would actually RESOLVE to"
+# The question the backtrace answers and no build check does: for each service,
+# which copy is first on Ladybird's lookup chain. Printed even when 0b found
+# nothing, because "the fresh one" is the answer that makes the negative useful.
+for svc in Compositor WebContent RequestServer ImageDecoder WebWorker; do
+    found=""
+    for d in bazel-out/*/libexec bazel-bin/libexec; do
+        [ -x "$d/$svc" ] && { found="$d/$svc  <-- SHADOWS bazel-bin"; break; }
+    done
+    [ -n "$found" ] || { [ -x "bazel-bin/$svc" ] && found="bazel-bin/$svc"; }
+    printf '    %-14s %s\n' "$svc" "${found:-NOT FOUND}"
+done
+
 cat <<'EOF'
 
 === READ IT LIKE THIS
+  section 0b found a libexec/, or section 8 says SHADOWS
+                        -> NOT a Qt problem at all, whatever the backtrace looks
+                           like. Stale services from an older build are what run;
+                           the IPC ids have shifted. `rm -rf` them and re-run.
   section 6 shows "not found", or section 7 says "error while loading shared
   libraries"            -> failure A: the private-library staging. Section 3 is
                            empty while section 4 lists libicu*. Send me 3+4.
