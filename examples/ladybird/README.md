@@ -102,8 +102,7 @@ python3 Meta/fetch_vcpkg_git_archives.py     # 2. the four git archives (~80s), 
                                              #    and VERIFIED against the committed SHA512
                                              # (the HSTS table needs no step: Bazel
                                              #  fetches it from a pinned commit)
-bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder \
-            //:Compositor //:WebWorker
+bazel build //:ladybird     # the 5 services come with it (they are its `data`)
 ```
 
 Step 2 is `Meta/fetch_vcpkg_git_archives.py`, added here. Verified: **4/4 reproduced
@@ -525,7 +524,7 @@ python3 Meta/fetch_vcpkg_git_archives.py  # (b) 4/4 reproduced with git archive 
 #    //:vcpkg_installed alone if you want to time it.
 #    No CMake build is needed, and none is consulted -- see the removal test
 #    above. That was not true before finding 35.
-bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder //:Compositor //:WebWorker
+bazel build //:ladybird     # //:WebContent etc. are data of //:ladybird
 ```
 
 To **regenerate or verify the BUILD files** you additionally need the reference
@@ -584,6 +583,24 @@ resource root is `<bindir>/../share/Lagom`, not `<bindir>/share/Lagom` --
 `LibWebView/Utilities.cpp`'s `find_prefix()` takes the PARENT of the binary's
 directory and appends `share/Lagom`. Ask the build for the paths rather than
 spelling any of them out:
+
+**`//:ladybird` declares the five services as `data`, so one target builds them all.**
+This recipe used to name all six targets, and that was a workaround for a missing
+dependency edge: the services are found by PATH at runtime
+(`get_paths_for_helper_process`), not linked, so nothing in the graph said the browser
+needs them and `bazel build //:ladybird` alone left whatever `WebContent` was already
+in `bazel-bin`. Ulf hit the consequence: `ladybird` dated Aug 20 beside a `WebContent`
+dated Aug 11 — this pin's browser talking to the previous pin's service. Upstream had
+inserted ~3 IPC messages between the pins, shifting every id after them, so every
+message failed to decode with `Can't read past the end of the stream memory` /
+`Endpoint magic number mismatch, not my message!`, which reads like a codegen or ABI
+bug and is nothing of the kind. The magic number in those frames is
+`AK::string_hash("WebContentServer")` — the *correct* endpoint; the message
+**numbering** is what disagreed (7/7 against the old pin, 0/7 against the new one).
+`data` rather than `deps` because they are spawned processes, not link inputs — the
+relationship `LibWasm` already has to `cranelift-compiler` — and the list is derived
+from the `launch_server_process<>` call sites in `HelperProcess.cpp`, since upstream
+adds services (`Compositor` is new since the previous pin).
 
 **Do NOT stage the services into a `libexec/` directory.** They are already
 siblings of `ladybird` in `bazel-bin`, and `LibWebView/Utilities.cpp`'s

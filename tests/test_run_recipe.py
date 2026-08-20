@@ -176,3 +176,75 @@ def test_the_diagnostic_unsets_ld_library_path_when_it_runs_the_binary():
     assert "env -u LD_LIBRARY_PATH" in t, \
         ("the diagnostic must run the binary with LD_LIBRARY_PATH unset -- with it "
          "set, both failures disappear and the run proves nothing")
+
+
+def test_ladybird_declares_the_services_it_spawns_as_data():
+    """`bazel build //:ladybird` must rebuild the services too.
+
+    The services are found by PATH at runtime (get_paths_for_helper_process), not
+    linked, so nothing in the build graph said the browser needs them: a build of
+    //:ladybird alone left whatever WebContent happened to be in bazel-bin from a
+    previous build. Ulf hit it in its most confusing form -- ladybird dated Aug 20
+    beside a WebContent dated Aug 11, a browser from this pin talking to a service
+    from the previous one. Upstream had inserted ~3 IPC messages between the pins,
+    shifting every id after them, so every message failed to decode with
+
+        Local endpoint error: Can't read past the end of the stream memory
+        Peer endpoint error: Endpoint magic number mismatch, not my message!
+
+    which reads like a codegen or ABI bug and is nothing of the kind. (The magic
+    0xffa5367a is AK::string_hash("WebContentServer"), i.e. the CORRECT endpoint;
+    the message NUMBERING is what disagreed -- 7/7 against the old pin, 0/7 against
+    the new one.) His fix: declare them.
+
+    `data`, not `deps`: separate processes, not link inputs -- the relationship
+    LibWasm already has to cranelift-compiler.
+    """
+    build = os.path.join(_EXAMPLE, "workspace", "BUILD.bazel")
+    with open(build) as f:
+        text = f.read()
+    # The ladybird cc_binary block.
+    i = text.index("name = 'ladybird'")
+    block = text[i:text.index("\n)", i)]
+    m = re.search(r"data = \[([^\]]*)\]", block)
+    assert m, "//:ladybird declares no data at all"
+    data = m.group(1)
+    for svc in ("Compositor", "ImageDecoder", "RequestServer", "WebContent", "WebWorker"):
+        assert f"':{svc}'" in data, (
+            f"//:ladybird does not declare :{svc} in data, so `bazel build "
+            "//:ladybird` can leave a STALE copy of it in bazel-bin and the IPC "
+            "message ids will not match")
+    # deps would be wrong: they are processes, not libraries to link.
+    deps = re.search(r"deps = \[(.*?)\]", block, re.S)
+    if deps:
+        assert "':WebContent'" not in deps.group(1), \
+            "the services must be data (spawned processes), not deps (link inputs)"
+
+
+def test_the_spawned_service_list_is_derived_from_ladybirds_own_source():
+    """A hand-kept list of services is one new service away from the same bug.
+
+    Upstream ADDS services (Compositor is new since the previous pin), and the
+    names are already written down in the place the runtime lookup uses them: the
+    string literals passed to launch_server_process<> in HelperProcess.cpp. So the
+    emitter reads them from there, and fails loudly if it parses none -- an empty
+    list would silently re-emit the bug it exists to prevent.
+    """
+    emitter = os.path.join(_EXAMPLE, "workspace", "Meta", "emit_build_bazel.py")
+    with open(emitter) as f:
+        text = f.read()
+    assert "def spawned_services" in text, "the emitter has no spawned_services()"
+    assert "HelperProcess.cpp" in text, \
+        "the service list is not read from HelperProcess.cpp (hand-listed?)"
+    assert "launch_server_process" in text, \
+        "the service names must come from the launch_server_process<> call sites"
+    fn = text[text.index("def spawned_services"):]
+    fn = fn[:fn.index("\ndef ")]
+    # No literal roster inside the function: that is the thing being avoided.
+    for svc in ("WebContent", "RequestServer", "ImageDecoder", "WebWorker"):
+        assert f'"{svc}"' not in fn and f"'{svc}'" not in fn, \
+            f"spawned_services() hardcodes {svc} instead of deriving it"
+    # An empty parse must be fatal, not an empty list.
+    assert "sys.exit" in fn, \
+        ("spawned_services() must FAIL when it parses no service names -- returning "
+         "[] would silently rebuild //:ladybird without its services again")

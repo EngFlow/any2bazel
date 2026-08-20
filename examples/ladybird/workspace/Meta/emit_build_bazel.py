@@ -540,6 +540,55 @@ ROOT_TARGETS = [
 # Emitted after the Qt autogen rules, since it consumes them.
 QT_TARGETS = ["ladybird"]
 
+
+def spawned_services():
+    """The helper binaries the UI SPAWNS at runtime, read out of Ladybird's source.
+
+    WHY THIS IS A DEPENDENCY AT ALL, and the bug it fixes.
+    `bazel build //:ladybird` built the browser and NOTHING ELSE, because nothing in
+    the graph said the browser needs its services -- they are found by PATH at
+    runtime (get_paths_for_helper_process), not linked. So the recipe told people to
+    name all six targets, and a build of just //:ladybird left whatever WebContent
+    happened to be in bazel-bin from a previous build.
+
+    Ulf hit the consequence in its most confusing form: ladybird dated Aug 20 next
+    to a WebContent dated Aug 11, i.e. a browser from THIS pin talking to a service
+    from the PREVIOUS one. Upstream had inserted ~3 IPC messages between the pins,
+    shifting every id after them, so every message failed to decode:
+
+      Failed to parse IPC message:
+        Local endpoint error: Can't read past the end of the stream memory
+        Peer endpoint error: Endpoint magic number mismatch, not my message!
+
+    which reads like a codegen or ABI bug and is nothing of the kind. (The magic
+    number in those frames, 0xffa5367a, is AK::string_hash("WebContentServer") --
+    the CORRECT endpoint. The ids are what disagreed: his WebContent's numbering
+    matched f9e34731 7/7 and 71fb301a 0/7.) His diagnosis: declare them, so they
+    rebuild with the thing that spawns them. Exactly right.
+
+    `data`, not `deps`: they are separate processes, not link inputs -- the same
+    relationship LibWasm already has to cranelift-compiler, which this emitter
+    already gets right (see rewrite_binary_path_define). data also puts them in the
+    runfiles tree, which is what `bazel run` needs.
+
+    DERIVED from HelperProcess.cpp, never hand-listed. The names are the string
+    literals passed to launch_server_process<>, i.e. the same source of truth the
+    runtime lookup uses; a hand-kept list here would be a sixth service away from
+    silently reintroducing the bug (and upstream adds services -- Compositor is new
+    since the previous pin). If the parse finds nothing, that is a hard failure
+    rather than a build that quietly omits them again.
+    """
+    src = os.path.join(ROOT, "Libraries", "LibWebView", "HelperProcess.cpp")
+    with open(src) as f:
+        text = f.read()
+    names = sorted(set(re.findall(r'launch_server_process<[^>]*>\(\s*"(\w+)"sv', text)))
+    if not names:
+        sys.exit("emit_build_bazel: found no launch_server_process<> calls in %s -- "
+                 "the spawned-service list is DERIVED from them, and an empty list "
+                 "would silently rebuild //:ladybird without its services (the Aug 11 "
+                 "WebContent bug). Has the launch helper been rewritten?" % src)
+    return names
+
 # Ring 2's own targets: the vcpkg tree build action and its inputs. Emitted
 # rather than hand-appended, because a hand-appended tail is a file the emitter
 # would silently truncate on the next run -- exactly the drift this project keeps
@@ -1003,7 +1052,11 @@ def main():
                     extra_srcs=[":qt_moc", ":qt_rcc"],
                     # The Qt plugins + qt.conf: runtime inputs of the GUI, in the
                     # same sense as the cranelift-compiler binary LibWasm spawns.
-                    extra_data=[":qt_conf", ":qt_plugins"])
+                    # Plus the five helper processes the UI spawns by path: see
+                    # spawned_services() for why `bazel build //:ladybird` used to
+                    # leave a stale WebContent behind, and what that looks like.
+                    extra_data=[":qt_conf", ":qt_plugins"] +
+                               [":" + s for s in spawned_services()])
     print(VCPKG_TAIL, end="")
     # Last, so it is the final thing on stderr rather than buried in the middle.
     report_host_includes()

@@ -1857,7 +1857,7 @@ cc_binary(
     local_defines = ['LADYBIRD_QT_HAVE_POSITIONING=1', 'QT_CORE_LIB', 'QT_GUI_LIB', 'QT_NO_DEBUG', 'QT_POSITIONING_LIB', 'QT_WIDGETS_LIB'],
     copts = ['-pthread'],
     linkopts = ['-lGLX', '-lOpenGL', '-lgio-2.0', '-lglib-2.0', '-lgobject-2.0', '-lvulkan', '-lxkbcommon'],
-    data = [':qt_conf', ':qt_plugins'],
+    data = [':Compositor', ':ImageDecoder', ':RequestServer', ':WebContent', ':WebWorker', ':qt_conf', ':qt_plugins'],
     deps = [
         '//:AK',
         '//:LibCore',

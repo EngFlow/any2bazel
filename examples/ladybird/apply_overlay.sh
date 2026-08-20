@@ -791,8 +791,7 @@ cat <<EOF
 ==> done. Both prefetches have run; the next command is the build:
 
     cd $TARGET
-    bazel build //:ladybird //:WebContent //:RequestServer //:ImageDecoder \\
-                //:Compositor //:WebWorker
+    bazel build //:ladybird
 
     Re-check this tree at any time with:
         $(basename "$0") --verify $TARGET
