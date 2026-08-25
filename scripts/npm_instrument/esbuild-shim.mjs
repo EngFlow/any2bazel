@@ -1,3 +1,17 @@
+// Copyright 2026 EngFlow GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // ESM shim that user code reaches when it does `import * as esbuild from
 // 'esbuild'`. Loader.mjs's resolve hook redirects 'esbuild' to this file
 // with a `?real=<url-encoded-file-url>` search param pointing at the real
