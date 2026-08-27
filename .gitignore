@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# Bazel stuff
+/bazel-*
+
 # Local symlink to a target repo used for a migration dry-run (Dolphin)
 dolphin_migration
 
