@@ -388,6 +388,15 @@ VSCODE_EMIT_BUILD_IR=$PWD/actions.ndjson \
 python3 scripts/extract_npm.py actions.ndjson <repo_root> model.npm.json
 python3 scripts/diff_ts.py model.npm.json model.bazel.json    # standalone check
 ```
+The preload must be run from a copy **inside the target repo**
+(`cp scripts/npm_instrument/*.mjs <repo>/.instr/`): `typescript-shim.mjs`
+resolves `typescript` relative to its own location, so running it from this
+repo fails with `ERR_MODULE_NOT_FOUND`.
+
+Worked example, with byte-parity results and the failure modes a bespoke JS
+build brings (no action graph to extract, traversal-order-dependent output,
+`node_modules` as both toolchain and foreign Bazel package):
+[docs/CASE-vscode-migration.md](docs/CASE-vscode-migration.md).
 
 ## Tests
 
