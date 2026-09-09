@@ -11,7 +11,7 @@
 
   <h1>any2bazel</h1>
   <p>
-    Migrate a project to <a href="https://bazel.build">Bazel</a> — from <strong>CMake</strong>, <strong>Maven</strong>, and more — by iterating until Bazel's actual build actions match the reference build.
+    Generate and maintain <a href="https://bazel.build">Bazel</a> build files for a project so they remain in sync with another build system (<strong>CMake</strong>, <strong>Maven</strong>, and more) — whether as part of a migration, or to keep parallel builds consistent.
   </p>
 </div>
 
