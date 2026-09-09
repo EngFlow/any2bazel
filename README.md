@@ -1,18 +1,13 @@
 <div align="center">
-  <a href="https://github.com/engflow/any2bazel">
-    <img width="360" src="docs/assets/engflow-logo.svg" alt="EngFlow">
-  </a>
-  <br>
-  <br>
+  <h1>any2bazel</h1>
+  <p>
+    Generate and maintain <a href="https://bazel.build">Bazel</a> build files for a project so they remain in sync with another build system (<strong>CMake</strong>, <strong>Maven</strong>, and more) — whether as part of a migration, or to keep parallel builds consistent.
+  </p>
 
 [![license][license]][license-url]
 [![claude-code][claude-code]][claude-code-url]
 [![bazel][bazel]][bazel-url]
 
-  <h1>any2bazel</h1>
-  <p>
-    Generate and maintain <a href="https://bazel.build">Bazel</a> build files for a project so they remain in sync with another build system (<strong>CMake</strong>, <strong>Maven</strong>, and more) — whether as part of a migration, or to keep parallel builds consistent.
-  </p>
 </div>
 
 ## Table of contents
