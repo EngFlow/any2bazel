@@ -17,10 +17,6 @@ driven by a deterministic diff, so each round is cheap and the LLM only does the
 creative work (generating and fixing BUILD files), never the mechanical
 comparison.
 
-> **Formerly `cmake2bazel`.** The engine grew a language-neutral, action-based
-> IR with multiple frontends. One artifact still carries the old name: the
-> migration config file is still literally `cmake2bazel.json`.
-
 ## Frontends and maturity
 
 All frontends extract into one shared **action-based model**; a language/
@@ -46,7 +42,7 @@ CMake File API codemodel  ──extract_cmake.py──┐
                                               ├─► reconstruct.py ─► diff.py ─► worklist / converged?
 Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
                                                        │
-                          cmake2bazel.json (migration decisions)
+                          any2bazel.json (migration decisions)
 ```
 
 - **CMake side = File API codemodel-v2** (not `compile_commands.json`, which
@@ -88,11 +84,11 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
 `canonicalize.py` strips noise before comparing flags. Universal mechanics
 (driver/wrapper paths, `-c`/`-o`, sysroot, reproducibility defines, `-O*`/`-g*`)
 are dropped in code — never your concern. Judgment calls (warning-set or cosmetic
-differences) go in `cmake2bazel.json`'s `ignore`. Correctness flags (`-std=*`,
+differences) go in `any2bazel.json`'s `ignore`. Correctness flags (`-std=*`,
 `-fno-exceptions`, `-fno-rtti`, …) must never be ignored — they surface as hard
 errors by design.
 
-## The migration config: `cmake2bazel.json`
+## The migration config: `any2bazel.json`
 
 Lives at the **migrated project's repo root**, committed alongside the BUILD
 files as the durable record of migration decisions. The filename still carries
@@ -197,7 +193,7 @@ flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
 > `python3 "$SKILL_DIR/scripts/extract_cmake.py" …` where `$SKILL_DIR` is this
 > skill's install location (e.g. `~/.claude/skills/any2bazel`). The artifacts
 > you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
-> `BUILD.bazel`/`MODULE.bazel`, and `cmake2bazel.json` — live in or beside the
+> `BUILD.bazel`/`MODULE.bazel`, and `any2bazel.json` — live in or beside the
 > target repo.
 >
 > **Working directory:** run `cmake` and `bazel` from the **target repo root**
@@ -254,7 +250,7 @@ instead of being a warning nobody reads.
 >   that are **not** in `.bazelrc` (e.g. boringssl expects `-fno-exceptions
 >   -fno-rtti` to be set at the top level, not in libraries). The tool cannot
 >   infer these — get them from the project's build instructions and pass them
->   through, or record genuinely-irreducible differences in `cmake2bazel.json`.
+>   through, or record genuinely-irreducible differences in `any2bazel.json`.
 > - Use the **same platform/options** as the CMake configure in step 2, or the
 >   two sides aren't comparable.
 
@@ -266,13 +262,13 @@ python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
 ```
 If analysis fails, fix that first before trusting the diff. If a flag differs
 only because of a build-convention gap (e.g. `-std=gnu++17` vs `-std=c++17`,
-GNU-extensions on/off), that's a judgment call for `cmake2bazel.json`, not a
+GNU-extensions on/off), that's a judgment call for `any2bazel.json`, not a
 BUILD-file bug.
 
 ### 5. Diff
 ```bash
 python3 scripts/diff.py model.cmake.json model.bazel.json \
-    <repo_root>/cmake2bazel.json > diff.json   # 3rd arg optional
+    <repo_root>/any2bazel.json > diff.json   # 3rd arg optional
 ```
 `diff.json` has `converged` (⇔ zero `error` discrepancies), a `discrepancies`
 worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
@@ -309,7 +305,7 @@ hand-reading the worklist.
 
 ### 7. Fix  *(LLM step)*, then loop
 For each `error`, decide: real defect → fix the BUILD file; accepted difference
-→ add to `cmake2bazel.json` `ignore` (only for warning/cosmetic flags, **never**
+→ add to `any2bazel.json` `ignore` (only for warning/cosmetic flags, **never**
 correctness flags).
 
 | kind             | fix |
@@ -325,7 +321,7 @@ correctness flags).
 | `test_binary_count` | (tests on, warning) differing number of test executables — investigate which side has the extra/missing binary |
 
 Then re-diff: if you edited `BUILD.bazel`/`MODULE.bazel`, re-run from step 4
-(re-extract the Bazel side); if you only edited `cmake2bazel.json`, re-run from
+(re-extract the Bazel side); if you only edited `any2bazel.json`, re-run from
 step 5. Repeat until `converged: true`. Report remaining `warn` items and the
 `excluded` roles.
 
@@ -334,7 +330,7 @@ Once production parity is reached, opt into test diffing:
 - Re-extract **both** sides with tests enabled and the **same** scope: CMake
   configured without `-D..._BUILD_TESTING=OFF`; aquery over `//...` (not a
   single target). Asymmetric scope fabricates findings.
-- Set `"include_tests": true` in `cmake2bazel.json`, re-extract both models
+- Set `"include_tests": true` in `any2bazel.json`, re-extract both models
   (steps 2 and 4) with the test-inclusive configure/aquery, then re-run the
   diff/triage/fix loop (steps 5–7).
 - Test sources are compared as a project-wide TU-set union (grouping/naming
@@ -345,7 +341,7 @@ Once production parity is reached, opt into test diffing:
 
 ### 9. Report
 Summarize: production targets reconciled, rounds taken, suppressions recorded in
-`cmake2bazel.json` (with rationale), excluded roles (dashboard/codegen) for
+`any2bazel.json` (with rationale), excluded roles (dashboard/codegen) for
 human follow-up, and — if `include_tests` was on — test-source parity and any
 test-binary count gap.
 
@@ -353,13 +349,13 @@ test-binary count gap.
 
 `$SKILL_DIR/scripts/` are deterministic and must **not** be edited per-run. All
 per-iteration judgment goes into the generated `BUILD.bazel`/`MODULE.bazel` and
-`cmake2bazel.json` (reviewed).
+`any2bazel.json` (reviewed).
 
 ## Other frontends
 
 The Maven and VSCode/npm frontends share the action model and differ but are
 newer captures — treat their output as exploratory, and don't apply the CMake
-`cmake2bazel.json` machinery to them (they don't read it).
+`any2bazel.json` machinery to them (they don't read it).
 
 ### Maven → Bazel (early)
 Maven has no action graph; the reference is the **forked `javac` argument

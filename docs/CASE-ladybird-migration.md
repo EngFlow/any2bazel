@@ -351,7 +351,7 @@ src/hdr lists from `generated_srcs.bzl`).
     exclude = LIBWEB_GENERATED_HDRS) + LIBWEB_GENERATED_HDRS` (generated wins).
     The remaining 689 "missing_tu" in the LibWeb diff are purely the
     `bazel-out/…/bin/` vs `Build/full/` genfile-path prefix, not real gaps
-    (add a genfiles-prefix normalization to `cmake2bazel.json` to silence).
+    (add a genfiles-prefix normalization to `any2bazel.json` to silence).
 
 11. **Extractor OOM on large targets (real tool bug — FIXED).** LibWeb's single
     link action pulls a `depSetOfFiles` DAG of ~4k depsets over a ~13k-artifact

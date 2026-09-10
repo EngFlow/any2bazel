@@ -48,7 +48,7 @@ deterministic diff drives the loop — an LLM does only the creative work
   equivalent builds converge to zero errors.
 - **Grouping-agnostic** for libraries and Java source sets — library renames
   and object-library fold-ins converge with no mapping.
-- **Reviewer-auditable** suppressions in a checked-in `cmake2bazel.json`.
+- **Reviewer-auditable** suppressions in a checked-in `any2bazel.json`.
 - **MVP scope** — no codegen, custom commands, or packaging yet.
 
 > [!NOTE]

@@ -32,11 +32,11 @@ Identity choices (subject to revision once a real-vs-real diff lights up):
 
 Usage:
     # Run the instrumented build first:
-    NODE_OPTIONS="--import file://$PWD/cmake2bazel/scripts/npm_instrument/preload.mjs" \\
+    NODE_OPTIONS="--import file://$PWD/any2bazel/scripts/npm_instrument/preload.mjs" \\
     VSCODE_EMIT_BUILD_IR=$PWD/actions.ndjson \\
     npm run transpile-client
 
-    python3 cmake2bazel/scripts/extract_npm.py actions.ndjson "$PWD" model.npm.json
+    python3 any2bazel/scripts/extract_npm.py actions.ndjson "$PWD" model.npm.json
 """
 
 from __future__ import annotations
