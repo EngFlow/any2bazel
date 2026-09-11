@@ -512,7 +512,7 @@ def summarize(discs: List[Discrepancy],
 if __name__ == "__main__":
     import sys
     # Used as a CLI by the skill loop:
-    #   diff.py <cmake.json> <bazel.json> [cmake2bazel.json]
+    #   diff.py <cmake.json> <bazel.json> [any2bazel.json]
     # The 3rd arg is the migration config (target_map + ignore lists). If
     # omitted, the diff runs with no human-approved suppressions.
     import config as config_mod

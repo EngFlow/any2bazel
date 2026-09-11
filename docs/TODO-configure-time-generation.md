@@ -42,7 +42,7 @@ must not be merged in the model:
 
 2. **The differ.** Compare `configured_files` across sides by **CONTENT**
    (read `output_path` on each side, byte-compare; escalate to LLM judgment;
-   record normalization rules in `cmake2bazel.json`). Only `is_compile_input`
+   record normalization rules in `any2bazel.json`). Only `is_compile_input`
    files block parity; benign outputs (.pc, install .cmake) are reported, not
    enforced. The content check is filesystem-dependent — degrade gracefully
    ("output not on disk → report, never silently pass"), like the include-order

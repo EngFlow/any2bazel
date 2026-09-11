@@ -14,7 +14,7 @@
 
 """Migration config -- the checked-in record of human decisions.
 
-Lives at the migrated project's repo root as `cmake2bazel.json`. Unlike the
+Lives at the migrated project's repo root as `any2bazel.json`. Unlike the
 hardcoded canonicalization rules (driver mechanics, toolchain/sysroot,
 reproducibility injections -- universal facts baked into canonicalize.py), this
 file holds the JUDGMENT CALLS a migration must make and that deserve review:
@@ -31,7 +31,7 @@ file holds the JUDGMENT CALLS a migration must make and that deserve review:
 Because it's a file, every suppression is an explicit, reviewable, version-
 controlled line -- a durable record of why a given difference was accepted.
 
-Example cmake2bazel.json:
+Example any2bazel.json:
     {
       "target_map": { },
       "ignore": {
@@ -49,7 +49,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
-CONFIG_FILENAME = "cmake2bazel.json"
+CONFIG_FILENAME = "any2bazel.json"
 
 
 @dataclass
@@ -188,5 +188,5 @@ def load(path: str) -> MigrationConfig:
 
 
 def find_and_load(repo_root: str) -> MigrationConfig:
-    """Load <repo_root>/cmake2bazel.json if it exists."""
+    """Load <repo_root>/any2bazel.json if it exists."""
     return load(os.path.join(repo_root, CONFIG_FILENAME))

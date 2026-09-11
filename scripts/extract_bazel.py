@@ -50,7 +50,7 @@ _LINK = {"CppLink", "CppArchive"}
 # both Bazel-specific, not real compilations -- skipped, like C++ header
 # processing.) Mapped to the neutral 'JavaCompile' mnemonic the differ groups on.
 _JAVAC = {"Javac"}
-# Custom TS rule mnemonic emitted by cmake2bazel/bazel/rules/ts_program.bzl.
+# Custom TS rule mnemonic emitted by any2bazel/bazel/rules/ts_program.bzl.
 _TSPROGRAM = {"TsProgram"}
 
 # Infer target kind from the link ACTION, not just the output extension.

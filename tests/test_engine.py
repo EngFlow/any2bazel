@@ -548,7 +548,7 @@ def test_exclude_targets_suppresses_structural_diffs():
 
 
 def test_config_loads_all_fields_from_json():
-    # The skill drives the diff via a cmake2bazel.json on disk, so loading must
+    # The skill drives the diff via a any2bazel.json on disk, so loading must
     # populate every lever. Guards against a field added to the dataclass but
     # not wired into load().
     import json

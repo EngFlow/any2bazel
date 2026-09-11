@@ -375,7 +375,7 @@ fell out that no code review would have caught:
 | `-DOFF` reaching 554 TUs | an upstream CMake bug: `Externals/pugixml/CMakeLists.txt` does `set(PUGIXML_BUILD_DEFINES OFF)` meaning "none", and pugixml forwards `${PUGIXML_BUILD_DEFINES}` into `target_compile_definitions(... PUBLIC)`, so the literal string becomes a define on pugixml and every consumer |
 
 The last row is worth its own note on **process**: the right move was to record it
-in `cmake2bazel.json`'s `ignore.defines` with the explanation, *not* to add
+in `any2bazel.json`'s `ignore.defines` with the explanation, *not* to add
 `-DOFF` to the Bazel build so the diff would go quiet. A parity diff exists to
 find differences worth explaining; copying an upstream bug to silence one turns
 the tool into a rubber stamp. Every suppression being a reviewable line in a
