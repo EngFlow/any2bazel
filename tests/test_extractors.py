@@ -191,6 +191,34 @@ def test_header_processing_actions_are_not_tus():
         assert not any(s.endswith(".h") for s in srcs), srcs  # header dropped
 
 
+def test_bazel_objccompile_is_a_real_compile():
+    # objc_library sources (.m/.mm) show up under Bazel's ObjcCompile mnemonic,
+    # not CppCompile. CMake's File API has no such split -- it reports them as
+    # CppCompile too -- so ObjcCompile must land in the same TU bucket, or an
+    # Objective-C target's sources silently vanish from the Bazel model (they
+    # still compile fine; only the extractor's view of them was missing).
+    aquery = {
+        "artifacts": [{"id": 1, "pathFragmentId": 10}],
+        "pathFragments": [{"id": 10, "label": "cocoa_init.o", "parentId": 11},
+                          {"id": 11, "label": "bazel-out"}],
+        "targets": [{"id": 100, "label": "//:glfw_cocoa"}],
+        "actions": [
+            {"mnemonic": "ObjcCompile", "targetId": 100, "outputIds": [1],
+             "arguments": ["clang", "-c", "src/cocoa_init.m",
+                           "-o", "bazel-out/cocoa_init.o", "-DFOO=1"]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as root:
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(aquery, f)
+        b = extract_bazel.extract(aq_path, REPO)
+        t = _view(b, ":glfw_cocoa")
+        srcs = [tu.source for tu in t.tus]
+        assert "src/cocoa_init.m" in srcs, srcs
+        assert t.role.value == "production", t.role
+
+
 def test_bazel_extracts_link_flags_from_cpplink():
     # A CppLink action: link flags must be extracted; driver mechanics (wrapper,
     # -o/output), object/archive inputs and -l libs must be dropped.

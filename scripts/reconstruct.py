@@ -40,12 +40,12 @@ from canonicalize import canonicalize_flags, canonicalize_link_flags
 from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
                    TargetKind, TranslationUnit)
 
-_COMPILE_MNEMONICS = {"CppCompile"}
+_COMPILE_MNEMONICS = {"CppCompile", "ObjcCompile"}
 _LINK_MNEMONICS = {"CppLink", "CppArchive"}
 _JAVA_COMPILE_MNEMONICS = {"JavaCompile"}
 
 _HEADER_EXTS = (".h", ".hpp", ".hh", ".hxx", ".inc", ".inl")
-_SOURCE_EXTS = (".cc", ".cpp", ".cxx", ".c", ".C")
+_SOURCE_EXTS = (".cc", ".cpp", ".cxx", ".c", ".C", ".m", ".mm")
 _ARCHIVE_EXTS = (".a", ".lo", ".lib")
 _JAVA_EXT = ".java"
 

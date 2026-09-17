@@ -255,7 +255,7 @@ instead of being a warning nobody reads.
 >   two sides aren't comparable.
 
 ```bash
-bazel aquery 'mnemonic("CppCompile|CppLink|CppArchive", //...)' \
+bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
     [--config=<name>] [--copt=... --cxxopt=...] \
     --output=jsonproto > aquery.json
 python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
