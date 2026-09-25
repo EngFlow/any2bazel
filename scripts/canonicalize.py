@@ -151,7 +151,8 @@ def _is_driver_token(tok: str) -> bool:
     these, so this only affects the Bazel side."""
     if tok.startswith("-"):
         return False
-    return (tok.endswith((".sh", ".o", ".obj", ".cc", ".cpp", ".cxx", ".c", ".C"))
+    return (tok.endswith((".sh", ".o", ".obj", ".cc", ".cpp", ".cxx", ".c", ".C",
+                          ".m", ".mm"))
             or "/" in tok and not tok.startswith("/"))  # relative exec/source paths
 
 

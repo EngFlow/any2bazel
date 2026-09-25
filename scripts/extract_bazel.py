@@ -15,12 +15,16 @@
 """Extract a CanonicalModel from `bazel aquery --output=jsonproto`.
 
 aquery is the Bazel-side counterpart to the CMake File API: it exposes the
-actual actions the build would run -- CppCompile actions (one per TU, with the
-full argv) AND CppLink/CppArchive actions (the link closure). compile commands
-alone would miss the link half, so we use aquery.
+actual actions the build would run -- CppCompile/ObjcCompile actions (one per
+TU, with the full argv) AND CppLink/CppArchive actions (the link closure).
+compile commands alone would miss the link half, so we use aquery. ObjcCompile
+is Bazel's mnemonic for .m/.mm sources compiled via objc_library -- CMake's
+File API has no such distinction (it reports those under CppCompile too), so
+both must map to the same neutral compile bucket here or objc_library sources
+silently vanish from the Bazel model.
 
 Usage:
-    bazel aquery 'mnemonic("CppCompile|CppLink|CppArchive", //...)' \
+    bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
         --output=jsonproto > aquery.json
     python3 extract_bazel.py aquery.json <repo_root> model.bazel.json
 
@@ -44,7 +48,7 @@ from model import (Action, BuildSystem, CanonicalModel, Target, TargetKind,
                    TargetRole)
 from serialize import dump_model
 
-_COMPILE = {"CppCompile"}
+_COMPILE = {"CppCompile", "ObjcCompile"}
 _LINK = {"CppLink", "CppArchive"}
 # Bazel Java compile. (Turbine = header/ijar compile, JavaSourceJar = packaging:
 # both Bazel-specific, not real compilations -- skipped, like C++ header
@@ -108,7 +112,7 @@ def _label_to_name(label: str) -> str:
 
 
 _HEADER_PROCESSING_MARKERS = ("-xc++-header", "-fsyntax-only")
-_REAL_SOURCE_EXTS = (".cc", ".cpp", ".cxx", ".c", ".C")
+_REAL_SOURCE_EXTS = (".cc", ".cpp", ".cxx", ".c", ".C", ".m", ".mm")
 
 
 def _is_real_compile(args) -> bool:
