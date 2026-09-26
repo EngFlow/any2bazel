@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 from typing import Iterable, List, Tuple
 
 # Flags Bazel's C++ toolchain injects that are PURE NOISE: they never have a
@@ -114,6 +115,20 @@ BAZEL_DEFAULT_LINK_PREFIXES = (
     "-Wl,-install_name",
     "-Wl,-rpath,__BAZEL",       # bazel sandbox rpaths
 )
+
+
+def _is_bazel_solib_rpath(tok: str) -> bool:
+    """Bazel's own rpaths, into its `_solib_<cpu>` directories (spelled
+    `-Xlinker -rpath -Xlinker $ORIGIN/.../_solib_k8/...`, which fold_xlinker
+    turns into one `-Wl,-rpath,<dir>`). Only those are toolchain noise; a
+    project's own rpath (-Wl,-rpath,$ORIGIN/../lib, -Wl,-rpath=/opt/lib,
+    -Wl,-rpath-link,...) is kept and compared, even one whose path happens to
+    contain `_solib_` elsewhere."""
+    return _BAZEL_SOLIB_RPATH.match(tok) is not None
+
+
+_BAZEL_SOLIB_RPATH = re.compile(
+    r"-Wl,-rpath,(\$ORIGIN|\$EXEC_ORIGIN|@loader_path)(/.*)?/_solib_[^/]*(/|$)")
 
 # Link flags with no correctness meaning on either side (build-type / debug).
 IGNORABLE_LINK_PREFIXES = (
@@ -316,6 +331,30 @@ def canonicalize_flags(
     return canon_defines, tuple(canon_includes), canon_other
 
 
+def fold_xlinker(tokens: List[str]) -> List[str]:
+    """`-Xlinker X` -> `-Wl,X`: the same linker argument in one token. Then an
+    rpath given as two linker arguments (`-Wl,-rpath` followed by `-Wl,DIR`,
+    whichever spelling produced them) is joined into `-Wl,-rpath,DIR`, which
+    is what the linker receives, so every spelling of one rpath compares
+    equal."""
+    folded: List[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == "-Xlinker" and i + 1 < len(tokens):
+            folded.append("-Wl," + tokens[i + 1]); i += 2
+        else:
+            folded.append(tokens[i]); i += 1
+    out: List[str] = []
+    i = 0
+    while i < len(folded):
+        if (folded[i] == "-Wl,-rpath" and i + 1 < len(folded)
+                and folded[i + 1].startswith("-Wl,")):
+            out.append("-Wl,-rpath," + folded[i + 1][4:]); i += 2
+        else:
+            out.append(folded[i]); i += 1
+    return out
+
+
 def canonicalize_link_flags(raw: List[str], *, is_bazel: bool) -> Tuple[str, ...]:
     """Extract correctness-relevant LINK flags from a link command.
 
@@ -332,16 +371,21 @@ def canonicalize_link_flags(raw: List[str], *, is_bazel: bool) -> Tuple[str, ...
     """
     out: List[str] = []
     i = 0
-    n = len(raw)
-    if is_bazel and n and _is_link_input(raw[0]):
+    if is_bazel and raw and _is_link_input(raw[0]):
         i = 1  # leading linker/wrapper path
+    # `-Xlinker X` and `-Wl,X` pass the same argument to the linker; fold the
+    # two-token form first, so it compares as one flag on either side and goes
+    # through the same noise filters (Bazel's rpaths, below).
+    raw = list(raw[:i]) + fold_xlinker(list(raw[i:]))
+    n = len(raw)
     while i < n:
         tok = raw[i]
         if tok in _LINK_PAIR_FLAGS and i + 1 < n:
             i += 2; continue
         if _is_link_input(tok):
             i += 1; continue
-        if is_bazel and _matches_any(tok, BAZEL_DEFAULT_LINK_PREFIXES):
+        if is_bazel and (_is_bazel_solib_rpath(tok)
+                         or _matches_any(tok, BAZEL_DEFAULT_LINK_PREFIXES)):
             i += 1; continue
         if _matches_any(tok, IGNORABLE_LINK_PREFIXES):
             i += 1; continue
