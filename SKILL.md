@@ -204,6 +204,20 @@ the reference build or bazel.
 > repo root** (the Bazel workspace). Only the `$SKILL_DIR/scripts/*.py` helpers
 > live elsewhere.
 >
+> **Long commands.** Run a build or test suite in the foreground, with a
+> `timeout` long enough for it, when your command tool allows that long (its
+> maximum timeout is in its description; 10 minutes by default in Claude Code):
+> it returns the moment the command ends. If it may
+> take longer, start it in the background as
+> `cmd > /tmp/cmd.log 2>&1 & echo $! > /tmp/cmd.pid` (outside the workspace, so
+> the log is not migrated) and wait in slices that end as soon as it does,
+> repeating until it has ended:
+> `for i in $(seq 36); do kill -0 "$(cat /tmp/cmd.pid)" 2>/dev/null || break; sleep 15; done; tail -5 /tmp/cmd.log`.
+> Never wait with `pgrep -f <name>`: the waiting command's own command line
+> contains the name, so it always finds itself. Don't sleep a fixed long time
+> on a guess, either. A second Bazel command in the same workspace waits for
+> the first. Run built programs with `</dev/null` and a `timeout`.
+>
 > **`<repo_root>` placeholder:** the project's source/workspace root. It MUST be
 > **identical** in the reference extractor (`extract_<frontend>.py`) and
 > `extract_bazel.py` calls: both key translation units by their path relative
