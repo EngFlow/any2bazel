@@ -84,6 +84,7 @@ def triage(diff: dict, only_kind: Optional[str] = None) -> dict:
         "excluded": diff.get("excluded", {}),
         "bazel_only_flags": diff.get("bazel_only_flags"),
         "levels": diff.get("levels"),
+        "ndebug": diff.get("ndebug"),
     }
 
 
@@ -110,12 +111,26 @@ def render(t: dict, top: int = 25) -> str:
                     lines.append(f"  {lang:6s} {side:5s}  opt: {fmt(h['opt'])}"
                                  f"  |  debug: {fmt(h['debug'])}"
                                  f"  |  format: {fmt(h.get('debug_format', {}))}")
+    nd = t.get("ndebug")
+    if nd:
+        def side(h):
+            return " ".join(f"{v} x{n}" for v, n in (h or {}).items()) or "-"
+        tag = "DIFFERS" if nd.get("differs") else "same"
+        line = (f"NDEBUG / assertions ({tag}): cmake {side(nd.get('cmake'))}"
+                f"  |  bazel {side(nd.get('bazel'))}")
+        if "bazel_added" in nd:
+            line += (f"; bazel adds it on {nd['bazel_added']} compared TU pairs,"
+                     f" lacks it on {nd['bazel_missing']}")
+        lines.append(line)
     extra = t.get("bazel_only_flags")
     if extra:
         comp, link = extra.get("compile") or {}, extra.get("link") or {}
+        defs = extra.get("defines") or {}
         lines.append(f"bazel-only flags (never a discrepancy; review): "
-                     f"{len(comp)} compile, {len(link)} link")
-        for label, hist in (("compile (TU pairs)", comp), ("link (executables)", link)):
+                     f"{len(comp)} compile, {len(link)} link; "
+                     f"bazel-only defines (WARN only): {len(defs)}")
+        for label, hist in (("compile (TU pairs)", comp), ("link (executables)", link),
+                            ("defines (TU pairs)", defs)):
             if not hist:
                 continue
             items = list(hist.items())

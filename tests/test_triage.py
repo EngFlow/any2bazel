@@ -105,6 +105,21 @@ def test_render_shows_levels():
     assert "format: (none) x94" in text
 
 
+def test_render_shows_ndebug_and_bazel_only_defines():
+    diff = {"converged": True, "errors": 0, "warnings": 1534, "discrepancies": [],
+            "excluded": {},
+            "ndebug": {"note": "...", "cmake": {"(none)": 1534},
+                       "bazel": {"NDEBUG": 1534}, "bazel_added": 1534,
+                       "bazel_missing": 0, "differs": True},
+            "bazel_only_flags": {"note": "...", "compile": {}, "link": {},
+                                 "defines": {"NDEBUG": 1534}}}
+    text = render(triage(diff))
+    assert ("NDEBUG / assertions (DIFFERS): cmake (none) x1534  |  bazel NDEBUG x1534;"
+            " bazel adds it on 1534 compared TU pairs, lacks it on 0") in text, text
+    assert "bazel-only defines (WARN only): 1" in text
+    assert "defines (TU pairs): NDEBUG x1534" in text
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
