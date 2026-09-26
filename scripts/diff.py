@@ -19,8 +19,9 @@ migrate loop calls this; an empty worklist (for a full round) means "done".
 Parity has two stages, both reported here:
   COMPILE PARITY    -- per-TU flag/define/include equivalence (project-wide
                        TU-set) + external link-dependency closure.
-  LINK CONSISTENCY  -- per name-aligned executable/shared-lib, equivalent link
-                       flags (link_flags_diff).
+  LINK CONSISTENCY  -- per name-aligned executable, equivalent link flags
+                       (link_flags_diff). Shared libraries are compared by
+                       their TUs only; their link lines are not checked.
 
 ASYMMETRY: a flag present in CMake but missing in Bazel is a discrepancy
 (under-specified Bazel target -> likely wrong build). A flag present only in
@@ -73,7 +74,7 @@ class Kind(str, Enum):
     DEFINES_DIFF = "defines_diff"
     INCLUDES_DIFF = "includes_diff"
     FLAGS_DIFF = "flags_diff"
-    LINK_FLAGS_DIFF = "link_flags_diff"   # executable/shared-lib link flags
+    LINK_FLAGS_DIFF = "link_flags_diff"   # executable link flags
     MISSING_DEP = "missing_dep"
     # Java (CompileGroup) source-set comparison:
     MISSING_JAVA_SRC = "missing_java_src"  # .java compiled in A but not B
@@ -187,7 +188,7 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
 def _diff_link_flags(name: str, ta: "TargetView", tb: "TargetView",
                      cfg: "MigrationConfig",
                      notes: Optional[DiffNotes] = None) -> List[Discrepancy]:
-    """Asymmetric link-flag subset for one aligned executable/shared-lib: every
+    """Asymmetric link-flag subset for one aligned executable: every
     CMake link flag must be present on the Bazel side; extra Bazel link flags
     are tolerated (and recorded in `notes`). Reviewer-approved differences
     (cfg.link_flag_ignored) are dropped from both sides first. Mirrors the
@@ -589,12 +590,12 @@ def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
          sources compile but are never linked into runnable tests.
 
     SCOPE: tests get the COMPILE-PARITY stage only. LINK CONSISTENCY (per-binary
-    link flags and link-dep closure) runs for PRODUCTION executables/shared
-    libs, not for test binaries: tests align by source-set union, not by binary
-    identity, so there's no per-binary link command to compare. So with tests
-    on, "converged" means production artifacts are link-consistent AND all test
-    SOURCES compile equivalently -- not that each test binary links identically.
-    Extending link consistency to per-test-binary is a natural future increment.
+    link flags) runs for PRODUCTION executables, not for test binaries: tests
+    align by source-set union, not by binary identity, so there's no
+    per-binary link command to compare. So with tests on, "converged" means
+    production artifacts are link-consistent AND all test SOURCES compile
+    equivalently -- not that each test binary links identically. Extending
+    link consistency to per-test-binary is a natural future increment.
     """
     out: List[Discrepancy] = []
     a_tests = {n for n, t in a_views.items()
