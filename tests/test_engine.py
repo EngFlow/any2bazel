@@ -143,6 +143,122 @@ def test_missing_cmake_flag_is_caught():
     assert "NEEDED=1" in dd.cmake_only
 
 
+def test_undefine_cancels_earlier_defines_last_wins():
+    from canonicalize import canonicalize_flags
+    def canon(raw):
+        d, _, f = canonicalize_flags(raw, REPO, is_bazel=False)
+        return d, f
+    # a -U cancels earlier defines, and stays a flag iff it is the last word
+    assert canon(["-DNDEBUG", "-UNDEBUG"]) == ((), ("-UNDEBUG",))
+    assert canon(["-D", "X=1", "-U", "X", "-DY"]) == (("Y=1",), ("-UX",))
+    assert canon(["-U_FORTIFY_SOURCE"]) == ((), ("-U_FORTIFY_SOURCE",))
+    # a later -D clears it, whatever preceded the -U
+    assert canon(["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=1"]) == \
+        (("_FORTIFY_SOURCE=1",), ())
+    assert canon(["-D_FORTIFY_SOURCE=1", "-U_FORTIFY_SOURCE",
+                  "-D_FORTIFY_SOURCE=2"]) == (("_FORTIFY_SOURCE=2",), ())
+    assert canon(["-UNDEBUG", "-DNDEBUG"]) == (("NDEBUG=1",), ())
+    # function-like macros are matched by their name, in both orders
+    assert canon(["-DF(x)=x", "-UF"]) == ((), ("-UF",))
+    assert canon(["-UF", "-DF(x)=x"]) == (("F(x)=x",), ())
+    # a later -D replaces earlier definitions of the name, -U or not
+    assert canon(["-DF(x)=1", "-DF(x)=2"]) == (("F(x)=2",), ())
+    assert canon(["-DF(x)=1", "-UF", "-DF(x)=2"]) == (("F(x)=2",), ())
+    # a define with no value is value 1, for the compiler and for the diff
+    assert canon(["-DX=1", "-DX"]) == canon(["-DX", "-DX=1"]) == (("X=1",), ())
+    assert canon(["-DF(x)"]) == (("F(x)=1",), ())
+    assert canon(["-DX="]) == (("X=",), ())  # defined as empty: not 1
+
+
+def test_valueless_define_equals_value_one_across_sides():
+    a = _model(tu_from_raw("src/a.cpp", ["-DX", "-DX=1"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DX=1", "-DX"], is_bazel=True),
+               is_bazel=True)
+    assert diff_models(a, b) == []
+
+
+def test_define_canonicalization_agrees_with_the_preprocessor():
+    # Differential check against the C preprocessor, skipped when no compiler
+    # is installed: for fixed-seed random -D/-U sequences over object-like and
+    # function-like names (joined and split forms, with and without values,
+    # repeats), two sequences must canonicalize to the same define set exactly
+    # when `cc -E` expands a probe source identically. Known limitation, left
+    # out of the pool: a function-like macro that differs only by parameter
+    # names (F(x)=x vs F(y)=y) preprocesses the same but reports a difference.
+    import random
+    import shutil
+    import subprocess
+    from canonicalize import canonicalize_flags
+    cc = next((c for c in ("cc", "gcc", "clang") if shutil.which(c)), None)
+    if cc is None:
+        return
+    pool = []
+    for n in ("A", "B"):
+        pool += [(f"-D{n}",), (f"-D{n}=1",), (f"-D{n}=2",), (f"-D{n}=",),
+                 ("-D", n), ("-D", f"{n}=2"), (f"-U{n}",), ("-U", n)]
+    pool += [("-DF(x)",), ("-DF(x)=x",), ("-DF(x)=1",), ("-D", "F(x)=x+1"),
+             ("-DF=3",), ("-UF",), ("-U", "F")]
+    src = "".join(f"#ifdef {n}\n{n} is [{n}]\n#else\n{n} undef\n#endif\n"
+                  for n in ("A", "B"))
+    src += "#ifdef F\nF is [F(7)] [F]\n#else\nF undef\n#endif\n"
+    rng = random.Random(7)
+    seqs = sorted({tuple(t for _ in range(rng.randint(0, 5))
+                         for t in rng.choice(pool)) for _ in range(300)})
+    by_output, by_defines = {}, {}
+    for s in seqs:
+        out = subprocess.run([cc, "-E", "-P", "-x", "c", "-", *s], input=src,
+                             capture_output=True, text=True, check=True).stdout
+        defines = canonicalize_flags(list(s), REPO, is_bazel=False)[0]
+        by_output.setdefault(" ".join(out.split()), set()).add(defines)
+        by_defines.setdefault(defines, set()).add(" ".join(out.split()))
+    split = {o: d for o, d in by_output.items() if len(d) > 1}
+    merged = {d: o for d, o in by_defines.items() if len(o) > 1}
+    assert not split, f"same preprocessing, different define sets: {split}"
+    assert not merged, f"same define set, different preprocessing: {merged}"
+
+
+def test_redefinition_with_and_without_undefine_converges():
+    # Both preprocess to F(x) == 2; only the Bazel side has the -U between.
+    a = _model(tu_from_raw("src/a.cpp", ["-DF(x)=1", "-DF(x)=2"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DF(x)=1", "-UF", "-DF(x)=2"],
+                           is_bazel=True), is_bazel=True)
+    assert diff_models(a, b) == []
+
+
+def test_fortify_override_in_copts_converges_both_ways():
+    # `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2` copied into copts: under -c opt
+    # Bazel's toolchain has already passed -D_FORTIFY_SOURCE=1 -DNDEBUG. Both
+    # sides compile with exactly _FORTIFY_SOURCE=2, so nothing may differ.
+    override = ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=2"]
+    preamble = ["-D_FORTIFY_SOURCE=1", "-DNDEBUG"]
+    for cmake_raw, bazel_raw in ((["-DNDEBUG"] + override, preamble + override),
+                                 (preamble + override, ["-DNDEBUG"] + override)):
+        a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+        b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+        assert diff_models(a, b) == [], (cmake_raw, bazel_raw)
+
+
+def test_bazel_undefine_after_opt_ndebug_matches_a_reference_without_it():
+    # `build --copt=-UNDEBUG` after -c opt's -DNDEBUG: assertions on, like a
+    # reference that never defines NDEBUG. No define differs.
+    a = _model(tu_from_raw("src/a.cpp", ["-O2"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-O2", "-DNDEBUG", "-UNDEBUG"],
+                           is_bazel=True), is_bazel=True)
+    assert diff_models(a, b) == []
+
+
+def test_bazel_undefine_is_caught_against_a_reference_with_ndebug():
+    # The reverse: the reference turns assertions off, Bazel turns them back on.
+    a = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG", "-UNDEBUG"], is_bazel=True),
+               is_bazel=True)
+    discs = diff_models(a, b)
+    assert [(d.kind, d.severity, d.cmake_only) for d in discs] == \
+        [("defines_diff", "error", ["NDEBUG=1"])], discs
+
+
 def test_extra_bazel_define_is_warn_not_error():
     cmake_raw = ["-DFOO=1"]
     bazel_raw = ["-DFOO=1", "-DEXTRA=1"]
@@ -445,7 +561,7 @@ def test_a_cmake_variant_missing_on_bazel_is_caught():
     discs = diff_models(a, b)
     errs = [d for d in discs if d.severity == Severity.ERROR.value]
     assert len(errs) == 1 and errs[0].kind == "defines_diff", errs
-    assert errs[0].cmake_only == ["FULL"], errs
+    assert errs[0].cmake_only == ["FULL=1"], errs
 
 
 def test_an_extra_bazel_variant_is_tolerated():
@@ -469,7 +585,7 @@ def test_tied_pairings_prefer_the_smaller_difference():
         tu_from_raw("gen/b1.cc", [], True)]))
     discs = diff_models(a, b, MigrationConfig(source_map=(("gen/", "@gen"),)))
     assert [(d.cmake_only, d.bazel_only) for d in discs] == \
-        [(["LIB1"], []), (["LIB2"], [])], discs
+        [(["LIB1=1"], []), (["LIB2=1"], [])], discs
 
 
 def test_tied_pairings_prefer_the_exact_variant_over_a_noisy_one():
