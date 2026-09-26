@@ -587,6 +587,98 @@ def test_summary_without_notes_has_no_bazel_only_field():
     assert "bazel_only_flags" not in summarize(diff_models(a, a))
 
 
+def test_levels_reported_when_diff_is_blind_to_them():
+    # CMake Release compiles at -O3; Bazel -c opt at -O2. -O* is dropped from
+    # the per-TU diff, so the diff converges -- the levels summary must not.
+    a = _model(tu_from_raw("src/a.cpp", ["-O3", "-DNDEBUG"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-O2", "-g0", "-DNDEBUG"], is_bazel=True),
+               is_bazel=True)
+    res = summarize(diff_models(a, b), a, b)
+    assert res["converged"], res
+    lv = res["levels"]
+    assert lv["differs"]
+    assert lv["cmake"] == {"CXX": {"opt": {"-O3": 1}, "debug": {"(none)": 1},
+                                   "debug_format": {"(none)": 1}}}
+    assert lv["bazel"] == {"CXX": {"opt": {"-O2": 1}, "debug": {"-g0": 1},
+                                   "debug_format": {"(none)": 1}}}
+
+
+def test_levels_last_flag_wins_and_split_by_language():
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("src/a.c", ["-g", "-O2", "-O0"], False),
+        tu_from_raw("src/b.cc", ["-g"], False)]))
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("src/a.c", ["-O0", "-g"], True),
+        tu_from_raw("src/b.cc", ["-g"], True),
+        # a Bazel header-processing action is not a TU and is not counted
+        Action("CppCompile", ("-xc++-header", "-fsyntax-only", "-O2",
+                              "-c", "src/b.h"))]))
+    lv = summarize(diff_models(a, b), a, b)["levels"]
+    assert lv["cmake"]["C"] == {"opt": {"-O0": 1}, "debug": {"-g": 1}, "debug_format": {"(none)": 1}}
+    assert lv["cmake"]["CXX"] == {"opt": {"(none)": 1}, "debug": {"-g": 1}, "debug_format": {"(none)": 1}}
+    assert lv["bazel"] == lv["cmake"]
+    assert not lv["differs"]
+
+
+def test_levels_language_on_one_side_only_does_not_set_differs():
+    # `differs` compares levels for languages BOTH sides compile; a language
+    # only one side has is a missing-TU matter, reported but not a level diff.
+    a = _model(tu_from_raw("src/a.c", ["-O2"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-O3"], is_bazel=True), is_bazel=True)
+    lv = summarize(diff_models(a, b), a, b)["levels"]
+    assert set(lv["cmake"]) == {"C"} and set(lv["bazel"]) == {"CXX"}, lv
+    assert lv["differs"] is False
+
+
+def test_debug_level_and_format_are_tracked_separately():
+    # -g3 emits macro information that -g1 does not; sharing -gdwarf-4 must
+    # not hide that. A format flag alone enables debug info at level -g.
+    a = _model(tu_from_raw("src/a.cpp", ["-g3", "-gdwarf-4"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-g1", "-gdwarf-4"], is_bazel=True),
+               is_bazel=True)
+    lv = summarize(diff_models(a, b), a, b)["levels"]
+    assert lv["cmake"]["CXX"]["debug"] == {"-g3": 1}
+    assert lv["bazel"]["CXX"]["debug"] == {"-g1": 1}
+    assert lv["cmake"]["CXX"]["debug_format"] == {"-gdwarf-4": 1}
+    assert lv["differs"]
+    c = _model(tu_from_raw("src/a.cpp", ["-gdwarf-5"], is_bazel=True), is_bazel=True)
+    lc = summarize(diff_models(a, c), a, c)["levels"]["bazel"]["CXX"]
+    assert (lc["debug"], lc["debug_format"]) == ({"-g": 1}, {"-gdwarf-5": 1})
+
+
+def test_levels_skip_a_bazel_target_excluded_under_its_mapped_name():
+    # target_map renames pkg:tool to tool, which is excluded: the diff skips
+    # it, so the levels must not count it either.
+    def m(name, raw, is_bazel):
+        model = _bs(CanonicalModel(), is_bazel)
+        model.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("src/a.cpp", ["-O2"], is_bazel)]))
+        model.add(Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("tool/m.cpp", raw, is_bazel)]))
+        return model
+    a, b = m("tool", ["-O2"], False), m("pkg:tool", ["-O0"], True)
+    cfg = MigrationConfig(target_map={"tool": "pkg:tool"}, exclude_targets={"tool"})
+    lv = summarize(diff_models(a, b, cfg), a, b, cfg)["levels"]
+    assert lv["bazel"]["CXX"]["opt"] == {"-O2": 1}, lv
+    assert not lv["differs"], lv
+
+
+def test_levels_count_only_compared_targets():
+    a = _bs(CanonicalModel(), False)
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("src/a.cpp", ["-O2"], False)]))
+    a.add(Target("vendored", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("third_party/z.c", ["-O3"], False)]))
+    a.add(Target("t_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("test/t.cpp", ["-O0"], False)]))
+    lv = summarize([], a, a, MigrationConfig(exclude_targets={"vendored"}))["levels"]
+    assert lv["cmake"] == {"CXX": {"opt": {"-O2": 1}, "debug": {"(none)": 1},
+                                   "debug_format": {"(none)": 1}}}
+
+
 def test_ignore_flags_and_defines_suppress_diffs():
     # A reviewer-approved flag/define difference is suppressed via config and
     # the diff converges; without the config it's an error.
