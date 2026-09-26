@@ -312,7 +312,9 @@ are easiest to reason about once the TUs underneath agree.
 also emits **WARN-only** kinds that don't block `converged` — `extra_tu` /
 `extra_target` (compiled/built on the Bazel side but not the reference) and
 `extra_test_tu` — note them but they need no action unless they point to
-something you didn't intend to add.
+something you didn't intend to add. The WARN `configured_files_not_compared`
+does need action: byte-compare each listed file against the one your Bazel
+build generates.
 
 #### Triage findings {#triage}
 

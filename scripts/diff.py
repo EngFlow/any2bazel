@@ -82,6 +82,8 @@ class Kind(str, Enum):
     MISSING_TEST_TU = "missing_test_tu"     # test source compiled in cmake, not bazel
     EXTRA_TEST_TU = "extra_test_tu"         # test source compiled in bazel, not cmake
     TEST_BINARY_COUNT = "test_binary_count"  # differing number of test executables
+    # configure-time generated files exist but their CONTENTS are not compared:
+    CONFIGURED_FILES = "configured_files_not_compared"
 
 
 @dataclass
@@ -546,7 +548,28 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # ---- tests (opt-in) ----------------------------------------------------
     if cfg.include_tests:
         out.extend(_diff_tests(a_views, b_views, cfg, a_all, b_all, notes))
+
+    # ---- configure-time generated files: recorded, NOT compared -------------
+    # configure_file() outputs never reach a command line, so a value that
+    # differs only inside one (a config.h define, a version string) is
+    # invisible to everything above. Say so in the worklist itself, where the
+    # reader of diff.json will see it, rather than only in the docs.
+    out.extend(_configured_files_warning(a))
     return out
+
+
+def _configured_files_warning(a: CanonicalModel) -> List[Discrepancy]:
+    files = a.configured_files
+    if not files:
+        return []
+    names = sorted(files)
+    n_inputs = sum(1 for c in files.values() if c.is_compile_input)
+    return [Discrepancy(
+        Kind.CONFIGURED_FILES.value, Severity.WARN.value, "<configure>",
+        f"{len(names)} configure-time generated file(s), {n_inputs} on a compile "
+        "include path, are not covered by this comparison: byte-compare each "
+        "against the file the Bazel build generates",
+        cmake_only=names)]
 
 
 def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],

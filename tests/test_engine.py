@@ -905,6 +905,23 @@ def test_ndebug_without_notes_reports_sides_only():
     assert "bazel_added" not in nd and nd["differs"] is False, nd
 
 
+def test_configured_files_raise_a_non_blocking_warning():
+    from model import ConfiguredFile
+    a = _model(tu_from_raw("src/a.cpp", ["-DX"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DX"], is_bazel=True), is_bazel=True)
+    assert diff_models(a, b) == []  # nothing configured -> no warning
+    a.add_configured_file(ConfiguredFile("config.h", "/b/config.h",
+                                         is_compile_input=True))
+    a.add_configured_file(ConfiguredFile("foo.pc", "/b/foo.pc"))
+    discs = diff_models(a, b)
+    res = summarize(discs)
+    assert res["converged"] and res["warnings"] == 1, res
+    w = discs[0]
+    assert w.kind == "configured_files_not_compared" and w.severity == "warn"
+    assert w.cmake_only == ["config.h", "foo.pc"]
+    assert w.detail.startswith("2 configure-time generated file(s), 1 on a")
+
+
 def test_ignore_flags_and_defines_suppress_diffs():
     # A reviewer-approved flag/define difference is suppressed via config and
     # the diff converges; without the config it's an error.
