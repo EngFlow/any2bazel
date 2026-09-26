@@ -75,6 +75,8 @@ class Kind(str, Enum):
     INCLUDES_DIFF = "includes_diff"
     FLAGS_DIFF = "flags_diff"
     LINK_FLAGS_DIFF = "link_flags_diff"   # executable link flags
+    # compile-only flags CMake repeats on a link line, absent on Bazel's (WARN)
+    LINK_COMPILE_ONLY_FLAGS = "link_compile_only_flags"
     MISSING_DEP = "missing_dep"
     # Java (CompileGroup) source-set comparison:
     MISSING_JAVA_SRC = "missing_java_src"  # .java compiled in A but not B
@@ -187,6 +189,35 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
     return out
 
 
+# -f flags that only steer the compiler's front end or code generation for a
+# translation unit, and that CMake repeats on link lines when they are in
+# CMAKE_<LANG>_FLAGS. Listed one by one: most -f flags DO matter at link time
+# (-fopenmp, -fsanitize*, -flto*, -fuse-ld=, -fprofile-*), so -f in general is
+# not compile-only.
+_COMPILE_ONLY_F_FLAGS = ("-fexceptions", "-fno-exceptions", "-fcommon",
+                         "-fno-common", "-fvisibility-inlines-hidden")
+_COMPILE_ONLY_F_PREFIXES = ("-fvisibility=",)
+
+
+def _compile_only_on_link(flag: str, lto: bool = False) -> bool:
+    """A flag that only means something to the COMPILER, which CMake repeats on
+    link lines because CMAKE_<LANG>_FLAGS reach both: warnings (-W..., -w) and
+    -Wp, preprocessor pass-throughs (but not -Wl, or -Wa,), -pedantic*, -D/-U,
+    and the front-end -f flags listed above. The driver ignores them when
+    linking. -Wl, is the linker's own, and -Wa, is kept because an LTO link
+    runs the assembler. With `lto` (an -flto* flag on that link), warning
+    controls and the -f flags are kept too: code generation, and diagnostics
+    such as -Werror=lto-type-mismatch, happen at link time then. Flags that do
+    matter at link time (-fopenmp, -pthread, -static*, -fsanitize*, -flto*,
+    -f... in general) are not in this set and stay errors."""
+    if flag.startswith(("-Wl,", "-Wa,")):
+        return False
+    is_f = flag in _COMPILE_ONLY_F_FLAGS or flag.startswith(_COMPILE_ONLY_F_PREFIXES)
+    if lto and ((flag.startswith("-W") and not flag.startswith("-Wp,")) or flag == "-w" or is_f):
+        return False
+    return is_f or flag == "-w" or flag.startswith(("-W", "-D", "-U", "-pedantic"))
+
+
 def _diff_link_flags(name: str, ta: "TargetView", tb: "TargetView",
                      cfg: "MigrationConfig",
                      notes: Optional[DiffNotes] = None) -> List[Discrepancy]:
@@ -199,16 +230,31 @@ def _diff_link_flags(name: str, ta: "TargetView", tb: "TargetView",
     b_lf = {f for f in tb.link_flags if not cfg.link_flag_ignored(f)}
     if notes is not None:
         notes.bazel_only_link_flags.update(b_lf - a_lf)
-    if a_lf - b_lf:
-        return [Discrepancy(
+    out: List[Discrepancy] = []
+    missing = a_lf - b_lf
+    lto = any(f.startswith("-flto") for f in a_lf | b_lf)
+    compile_only = {f for f in missing if _compile_only_on_link(f, lto)}
+    if missing - compile_only:
+        out.append(Discrepancy(
             kind=Kind.LINK_FLAGS_DIFF.value,
             severity=Severity.ERROR.value,
             target=name,
             detail="cmake link flags missing on bazel side",
-            cmake_only=sorted(a_lf - b_lf),
+            cmake_only=sorted(missing - compile_only),
             bazel_only=sorted(b_lf - a_lf),
-        )]
-    return []
+        ))
+    if compile_only:
+        # Reported, not blocking: every CMake project that sets warning flags
+        # or -DNDEBUG in CMAKE_<LANG>_FLAGS has them on each link line.
+        out.append(Discrepancy(
+            kind=Kind.LINK_COMPILE_ONLY_FLAGS.value,
+            severity=Severity.WARN.value,
+            target=name,
+            detail="compile-only flags (warnings, -pedantic, -D/-U, front-end "
+                   "-f flags) on the cmake link line; no effect when linking",
+            cmake_only=sorted(compile_only),
+        ))
+    return out
 
 
 def _norm_includes(includes, cfg) -> tuple:

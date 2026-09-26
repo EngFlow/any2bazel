@@ -1090,6 +1090,78 @@ def test_missing_link_flag_is_caught():
     assert "-rdynamic" in lf[0].cmake_only
 
 
+def test_compile_only_flags_on_cmake_link_line_are_a_warning():
+    # CMAKE_<LANG>_FLAGS reach CMake's link line too; warnings, -pedantic and
+    # -D/-U mean nothing to the linker, so they must not block convergence --
+    # but link-relevant flags (-fopenmp, -Wl,...) still must.
+    link = ["-Wall", "-Wno-format-truncation", "-pedantic", "-DNDEBUG",
+            "-UFOO", "-Wp,-D_FORTIFY_SOURCE=2", "-fopenmp", "-Wl,--as-needed",
+            "-Wa,--noexecstack"]
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", link, False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-fopenmp"], True))
+    discs = diff_models(a, b)
+    by_kind = {d.kind: d for d in discs}
+    assert set(by_kind) == {"link_flags_diff", "link_compile_only_flags"}, discs
+    assert by_kind["link_flags_diff"].severity == "error"
+    assert by_kind["link_flags_diff"].cmake_only == ["-Wa,--noexecstack",
+                                                     "-Wl,--as-needed"]
+    w = by_kind["link_compile_only_flags"]
+    assert w.severity == "warn"
+    assert w.cmake_only == ["-DNDEBUG", "-UFOO", "-Wall", "-Wno-format-truncation",
+                            "-Wp,-D_FORTIFY_SOURCE=2", "-pedantic"]
+
+
+def test_front_end_f_flags_and_w_on_cmake_link_line_are_a_warning():
+    # Seen hand-suppressed in lab runs: -fexceptions (lensfun, 7 runs), -w and
+    # -fno-common (CMake), -fvisibility=hidden (GDAL, QGIS). They steer the
+    # compiler only. Other -f flags stay link errors.
+    link = ["-fexceptions", "-fno-common", "-w", "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden", "-fopenmp", "-fsanitize=address",
+            "-fuse-ld=gold"]
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", link, False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", [], True))
+    by_kind = {d.kind: d for d in diff_models(a, b)}
+    assert by_kind["link_flags_diff"].cmake_only == ["-fopenmp", "-fsanitize=address",
+                                                     "-fuse-ld=gold"]
+    assert by_kind["link_compile_only_flags"].cmake_only == [
+        "-fexceptions", "-fno-common", "-fvisibility-inlines-hidden",
+        "-fvisibility=hidden", "-w"]
+
+
+def test_front_end_f_flags_stay_link_errors_under_lto():
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(_exe("app", ["-flto", "-fvisibility=hidden", "-w", "-fexceptions"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-flto"], True))
+    by_kind = {d.kind: d for d in diff_models(a, b)}
+    assert by_kind["link_flags_diff"].cmake_only == ["-fexceptions", "-fvisibility=hidden", "-w"]
+    assert "link_compile_only_flags" not in by_kind
+
+
+def test_warning_controls_stay_link_errors_under_lto():
+    # With -flto the compiler's middle and back end run at link time, and so
+    # do their diagnostics: a missing -Werror=lto-type-mismatch matters there.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(_exe("app", ["-flto", "-Werror=lto-type-mismatch", "-DNDEBUG",
+                       "-Wp,-D_FORTIFY_SOURCE=2", "-pedantic"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-flto"], True))
+    by_kind = {d.kind: d for d in diff_models(a, b)}
+    assert by_kind["link_flags_diff"].cmake_only == ["-Werror=lto-type-mismatch"]
+    # preprocessor and front-end flags still have no effect at an LTO link
+    assert by_kind["link_compile_only_flags"].cmake_only == \
+        ["-DNDEBUG", "-Wp,-D_FORTIFY_SOURCE=2", "-pedantic"]
+
+
+def test_only_compile_only_link_flags_missing_converges():
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(_exe("app", ["-Wall", "-pedantic", "-fopenmp"], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-fopenmp"], True))
+    res = summarize(diff_models(a, b))
+    assert res["converged"] and res["warnings"] == 1, res
+    # and ignore.link_flags still silences them entirely
+    cfg = MigrationConfig(ignore_link_flag_prefixes=("-W", "-pedantic"))
+    assert diff_models(a, b, cfg) == []
+
+
 def test_extra_bazel_link_flag_tolerated():
     # Asymmetric: an extra link flag only on the bazel side must NOT fail.
     a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-pthread"], False))
@@ -1111,10 +1183,12 @@ def test_link_toolchain_noise_stripped():
 
 
 def test_ignore_link_flags_suppresses():
-    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-fvisibility=hidden", "-pthread"], False))
+    # (-fvisibility=hidden was the example here; it is now reported as a
+    # compile-only warning, so a link-relevant flag stands in for it.)
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-Wl,--no-undefined", "-pthread"], False))
     b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("app", ["-pthread"], True))
     assert not summarize(diff_models(a, b))["converged"]
-    cfg = MigrationConfig(ignore_link_flags={"-fvisibility=hidden"})
+    cfg = MigrationConfig(ignore_link_flags={"-Wl,--no-undefined"})
     assert summarize(diff_models(a, b, cfg))["converged"]
 
 
