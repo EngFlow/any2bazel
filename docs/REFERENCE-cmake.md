@@ -14,8 +14,10 @@ as the reference build.
 
 When [confirming scope](../SKILL.md#confirm-scope), inspect `CMakeLists.txt`
 for these and surface them before proceeding:
-- Build-time generated code: `add_custom_command`, protoc or other codegen
-  steps. `configure_file` is handled by you, not the tool: see
+- Build-time generation with no clear Bazel mapping: a sub-build the CMake
+  model does not show (autotools, a vendored fork's own build) whose outputs
+  the binaries link. Other codegen (`add_custom_command`, protoc) is yours to
+  migrate, and so is `configure_file`: see
   [Configure-time generated files](#configure-time-generated-files).
 - `find_package` of non-system libraries. There is no automatic
   `find_package` → bzlmod resolution; each one must be mapped by hand.

@@ -240,8 +240,12 @@ proceed, unless an item on the not-yet-supported list below applies: without an
 answer, stop there and report it.
 
 **NOT yet supported — warn the user if the project has these:**
-- Build-time custom commands / generated code. Configure-time generated
-  files are handled by you, not the tool: see the reference guide.
+- Build-time generation with **no clear Bazel mapping**: a sub-build the
+  reference model does not show (autotools, a vendored fork's own build) whose
+  outputs the binaries link. Other codegen and configure-time generated files
+  are yours to migrate: see
+  [Create initial BUILD.bazel files](#create-build-files) and the reference
+  guide.
 - Per-test-binary identity alignment, and include search **order** (presence
   only) — both have planned follow-ups
 - Packaging / install rules
@@ -320,6 +324,10 @@ compiles that may. A code generator that lists a stamped header among its
 inputs (Qt's moc lists every header) reruns on every commit whether or not it
 uses it. Where many compiles may rerun, measure; `stamp_scope.py --help` says
 how. Do not add stamping to a project whose reference build has none.
+
+**Build-time codegen** that maps to a `genrule` over a host tool (bison/flex) or
+to a ruleset (protoc) is yours to migrate: use the project's declared generator
+version.
 
 The reference guide covers what is specific to translating its build system
 (for CMake: the build type and configure-time generated files).
