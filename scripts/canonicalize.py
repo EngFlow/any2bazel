@@ -183,12 +183,44 @@ def _matches_any(flag: str, prefixes: Iterable[str]) -> bool:
     return any(flag == p or flag.startswith(p) for p in prefixes)
 
 
+def _macro_name(define: str) -> str:
+    """The macro a define names: the identifier before any `(` (a
+    function-like macro, `F(x)=x`) or `=` (a value)."""
+    ends = [i for i in (define.find("("), define.find("=")) if i >= 0]
+    return define[:min(ends)] if ends else define
+
+
+def _undefine(defines: List[str], undefined: List[str], name: str) -> None:
+    """Apply `-U name` as the compiler does: it cancels every `name` define
+    that came before it. `name` is also recorded in `undefined`, the names
+    whose LAST word is a -U: those are emitted as `-Uname` flags and still
+    compared, because the -U may target a compiler-predefined macro (e.g.
+    -U_FORTIFY_SOURCE). A later -D on `name` clears it (see _redefine), so
+    whether a -U survives never depends on what came before it."""
+    defines[:] = [d for d in defines if _macro_name(d) != name]
+    if name not in undefined:
+        undefined.append(name)
+
+
+def _redefine(defines: List[str], undefined: List[str], d: str) -> None:
+    """Apply `-D d` as the compiler does: it replaces every earlier definition
+    of the same macro name (so each side ends with the last word per name,
+    whether or not a -U came between), and a -U on that name is no longer the
+    last word."""
+    key = _macro_name(d)
+    defines[:] = [x for x in defines if _macro_name(x) != key]
+    if key in undefined:
+        undefined.remove(key)
+
+
 def _add_define(defines: List[str], d: str) -> None:
     """Append a define unless it's a hardcoded reproducibility injection
-    (__DATE__/__TIME__/__TIMESTAMP__), matched by key before '='."""
+    (__DATE__/__TIME__/__TIMESTAMP__), matched by key before '='. A define
+    with no value means value 1 to the compiler (`-DX` is `-DX=1`, `-DF(x)`
+    is `-DF(x)=1`), so it is spelled that way and the two compare equal."""
     key = d.split("=", 1)[0]
     if key not in _DROP_DEFINE_KEYS:
-        defines.append(d)
+        defines.append(d if "=" in d else d + "=1")
 
 
 def canonicalize_flags(
@@ -199,7 +231,8 @@ def canonicalize_flags(
 ) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
     """Return (defines, includes, other_flags) in canonical form.
 
-    - defines: sorted, deduped, '-D' stripped to 'KEY=VAL'
+    - defines: sorted, deduped, '-D' stripped to 'KEY=VAL'; a later -U removes
+      them (see _undefine)
     - includes: repo-relative, ORDER PRESERVED, dedup-adjacent only
     - other_flags: correctness-relevant only (ignorable + bazel-default dropped),
       sorted for stable comparison
@@ -207,6 +240,7 @@ def canonicalize_flags(
     defines: List[str] = []
     includes: List[str] = []
     other: List[str] = []
+    undefined: List[str] = []  # names whose last word is -U (see _undefine)
 
     i = 0
     n = len(raw)
@@ -227,9 +261,16 @@ def canonicalize_flags(
 
         # -Dfoo / -D foo
         if tok == "-D" and i + 1 < n:
-            _add_define(defines, raw[i + 1]); i += 2; continue
+            _redefine(defines, undefined, raw[i + 1]); _add_define(defines, raw[i + 1])
+            i += 2; continue
         if tok.startswith("-D"):
-            _add_define(defines, tok[2:]); i += 1; continue
+            _redefine(defines, undefined, tok[2:]); _add_define(defines, tok[2:])
+            i += 1; continue
+        # -Ufoo / -U foo: cancels the defines collected so far (last wins)
+        if tok == "-U" and i + 1 < n:
+            _undefine(defines, undefined, raw[i + 1]); i += 2; continue
+        if tok.startswith("-U"):
+            _undefine(defines, undefined, tok[2:]); i += 1; continue
 
         # force-include flavors: -include FILE / -imacros FILE. The argument is
         # a FILE path (not a search dir), which each build system may spell
@@ -260,6 +301,8 @@ def canonicalize_flags(
 
         other.append(tok); i += 1
 
+    # a -U that is the last word on its name stays a comparable flag
+    other.extend("-U" + name for name in undefined)
     # defines: order-insensitive
     canon_defines = tuple(sorted(set(defines)))
     # includes: order preserved, drop only consecutive dups
