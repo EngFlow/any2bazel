@@ -795,6 +795,116 @@ def test_levels_count_only_compared_targets():
                                    "debug_format": {"(none)": 1}}}
 
 
+def _ndebug_pair(cmake_raw, bazel_raw, cfg=None):
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    notes = DiffNotes()
+    discs = diff_models(a, b, cfg, notes)
+    return summarize(discs, a, b, cfg, notes)
+
+
+def test_ndebug_added_by_bazel_opt_is_reported_though_converged():
+    # -c opt adds -DNDEBUG; the reference keeps assertions. An extra Bazel
+    # define is only a WARN, so the diff converges -- the summary must say it.
+    res = _ndebug_pair(["-O2"], ["-O2", "-DNDEBUG"])
+    assert res["converged"], res
+    nd = res["ndebug"]
+    assert nd["cmake"] == {"(none)": 1} and nd["bazel"] == {"NDEBUG": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (1, 0, True)
+    assert res["bazel_only_flags"]["defines"] == {"NDEBUG=1": 1}
+
+
+def test_ndebug_missing_on_bazel_is_reported_in_the_other_direction():
+    res = _ndebug_pair(["-O3", "-DNDEBUG"], ["-O3"])
+    assert not res["converged"]  # a missing CMake define stays an error
+    nd = res["ndebug"]
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 1, True)
+
+
+def test_ndebug_undefined_again_counts_as_absent():
+    # `build --copt=-UNDEBUG` beside -c opt keeps assertions on: last one wins.
+    res = _ndebug_pair([], ["-DNDEBUG", "-UNDEBUG"])
+    nd = res["ndebug"]
+    assert nd["bazel"] == {"(none)": 1}, nd
+    assert (nd["bazel_added"], nd["differs"]) == (0, False), nd
+    assert res["bazel_only_flags"]["defines"] == {}, res  # agrees with ndebug
+
+
+def test_ndebug_pair_counts_honour_argv_order():
+    # `build --copt=-UNDEBUG` followed by a rule-level -DNDEBUG leaves NDEBUG
+    # defined. The pair counts must agree with the per-side counts.
+    res = _ndebug_pair(["-DNDEBUG"], ["-UNDEBUG", "-DNDEBUG"])
+    nd = res["ndebug"]
+    assert nd["cmake"] == {"NDEBUG": 1} and nd["bazel"] == {"NDEBUG": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 0, False), nd
+
+
+def test_ndebug_turned_back_on_is_missing_and_an_error():
+    # Reference -DNDEBUG; Bazel -DNDEBUG then -UNDEBUG: assertions on.
+    res = _ndebug_pair(["-DNDEBUG"], ["-DNDEBUG", "-UNDEBUG"])
+    assert not res["converged"], res
+    nd = res["ndebug"]
+    assert nd["bazel"] == {"(none)": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 1, True)
+
+
+def test_ndebug_and_defines_collected_through_executables():
+    # The executable path pairs TUs per target, not through <libraries>.
+    def exe(raw, is_bazel):
+        m = _bs(CanonicalModel(), is_bazel)
+        m.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("tool/m.cpp", raw, is_bazel)]))
+        return m
+    a, b = exe(["-O2"], False), exe(["-O2", "-DNDEBUG", "-DEXTRA"], True)
+    notes = DiffNotes()
+    res = summarize(diff_models(a, b, notes=notes), a, b, notes=notes)
+    assert res["converged"], res
+    assert res["bazel_only_flags"]["defines"] == {"EXTRA=1": 1, "NDEBUG=1": 1}
+    assert (res["ndebug"]["bazel_added"], res["ndebug"]["bazel"]) == (1, {"NDEBUG": 1})
+
+
+def test_ndebug_counts_ignore_the_ignore_list():
+    # An accepted suppression may hide the WARN and the bazel-only define, but
+    # never the assertion-state line.
+    cfg = MigrationConfig(ignore_defines={"NDEBUG"})
+    res = _ndebug_pair([], ["-DNDEBUG", "-DEXTRA=1"], cfg)
+    assert res["converged"] and res["warnings"] == 1, res  # EXTRA=1 only
+    assert res["bazel_only_flags"]["defines"] == {"EXTRA=1": 1}
+    assert res["ndebug"]["bazel_added"] == 1 and res["ndebug"]["differs"]
+
+
+def test_ndebug_differs_follows_the_compared_pairs():
+    # An extra Bazel-only TU without NDEBUG changes the per-side key sets but
+    # is never compared; both pair counts are 0, so nothing differs.
+    a = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG"], is_bazel=False), is_bazel=False)
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("src/a.cpp", ["-DNDEBUG"], True),
+        tu_from_raw("src/extra.cpp", [], True)]))
+    notes = DiffNotes()
+    nd = summarize(diff_models(a, b, notes=notes), a, b, notes=notes)["ndebug"]
+    assert nd["bazel"] == {"NDEBUG": 1, "(none)": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 0, False)
+
+
+def test_ndebug_skips_a_bazel_target_excluded_under_its_mapped_name():
+    a = _model(tu_from_raw("src/a.cpp", [], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", [], is_bazel=True), is_bazel=True)
+    a.add(Target("tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("tool/m.cpp", [], False)]))
+    b.add(Target("pkg:tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("tool/m.cpp", ["-DNDEBUG"], True)]))
+    cfg = MigrationConfig(target_map={"tool": "pkg:tool"}, exclude_targets={"tool"})
+    nd = summarize(diff_models(a, b, cfg), a, b, cfg)["ndebug"]
+    assert nd["bazel"] == {"(none)": 1}, nd
+
+
+def test_ndebug_without_notes_reports_sides_only():
+    a = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG"], is_bazel=False), is_bazel=False)
+    nd = summarize(diff_models(a, a), a, a)["ndebug"]
+    assert "bazel_added" not in nd and nd["differs"] is False, nd
+
+
 def test_ignore_flags_and_defines_suppress_diffs():
     # A reviewer-approved flag/define difference is suppressed via config and
     # the diff converges; without the config it's an error.
