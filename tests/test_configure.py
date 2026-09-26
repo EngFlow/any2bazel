@@ -90,6 +90,27 @@ def test_options_captured():
     assert cfs[0].options == ("@ONLY",)
 
 
+def test_uppercase_command_spelling_is_matched():
+    # CMake commands are case-insensitive and the trace keeps the spelling the
+    # CMakeLists used; CONFIGURE_FILE and Configure_File are the same command.
+    upper = dict(_cf(f"{SRC}/my_config.h.cmake", f"{BUILD}/my_config.h"),
+                 cmd="CONFIGURE_FILE")
+    mixed = dict(_cf(f"{SRC}/version.h.in", f"{BUILD}/version.h"),
+                 cmd="Configure_File")
+    t = _trace(upper, mixed, _cf(f"{SRC}/zconf.h.cmakein", f"{BUILD}/zconf.h"))
+    cfs = parse_configure_trace(t, SRC, BUILD, include_dirs=[BUILD])
+    os.unlink(t)
+    assert sorted(c.name for c in cfs) == ["my_config.h", "version.h", "zconf.h"]
+
+
+def test_other_commands_are_ignored():
+    t = _trace({"cmd": "file", "args": ["WRITE", f"{BUILD}/x.h", "y"]},
+               {"cmd": "CONFIGURE_FILE_EXTRA", "args": [f"{SRC}/a.in", f"{BUILD}/a.h"]})
+    cfs = parse_configure_trace(t, SRC, BUILD, include_dirs=[BUILD])
+    os.unlink(t)
+    assert cfs == []
+
+
 def test_no_include_dirs_means_not_compile_input():
     # without include dirs we cannot assert compile-input status -> False (we do
     # not guess); the file is still recorded.

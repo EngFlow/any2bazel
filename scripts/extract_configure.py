@@ -88,7 +88,10 @@ def parse_configure_trace(
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if e.get("cmd") != "configure_file":
+            # CMake command names are case-insensitive, and the trace reports
+            # the spelling used in the CMakeLists (large projects commonly
+            # write CONFIGURE_FILE); match either.
+            if (e.get("cmd") or "").lower() != "configure_file":
                 continue
             args = [a for a in e.get("args", []) if a]
             if len(args) < 2:
