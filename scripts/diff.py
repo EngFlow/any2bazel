@@ -38,9 +38,10 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
-from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES
+from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES, canonicalize_flags
 from config import MigrationConfig
-from model import (CanonicalModel, TargetKind, TargetRole, TranslationUnit)
+from model import (BuildSystem, CanonicalModel, TargetKind, TargetRole,
+                   TranslationUnit)
 from reconstruct import (TargetView, _is_header_processing,
                          _source_from_compile_args, reconstruct)
 
@@ -105,9 +106,18 @@ class DiffNotes:
     These counters make them visible: flag -> number of compared TU pairs
     (compile; one pair per CMake TU variant, see _diff_variants) or aligned
     executables (link) where Bazel has it and CMake does not, after the
-    reviewer's ignore lists and the toolchain's tolerated defaults."""
+    reviewer's ignore lists and the toolchain's tolerated defaults. Defines
+    only Bazel has are a WARN per TU, which no summary showed either; they are
+    counted the same way, per compared TU pair.
+
+    NDEBUG is counted separately, in both directions and regardless of
+    ignore.defines, because it is assertion state: Bazel's `-c opt` adds it, so
+    pinning opt against a reference that keeps assertions turns them off."""
     bazel_only_flags: Counter = field(default_factory=Counter)
     bazel_only_link_flags: Counter = field(default_factory=Counter)
+    bazel_only_defines: Counter = field(default_factory=Counter)
+    ndebug_bazel_added: int = 0    # compared TU pairs: Bazel defines, CMake not
+    ndebug_bazel_missing: int = 0  # compared TU pairs: CMake defines, Bazel not
 
 
 def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
@@ -336,7 +346,19 @@ def _diff_variants(target: str, a_vs: List[TranslationUnit],
             a_fl = {f for f in a.flags if not cfg.flag_ignored(f)}
             b_fl = {f for f in b.flags if not cfg.flag_ignored(f)}
             notes.bazel_only_flags.update(_display_bazel_only(b_fl - a_fl))
+            a_def = {d for d in a.defines if not cfg.define_ignored(d)}
+            b_def = {d for d in b.defines if not cfg.define_ignored(d)}
+            notes.bazel_only_defines.update(b_def - a_def)
+            a_nd, b_nd = _defines_ndebug(a.defines), _defines_ndebug(b.defines)
+            notes.ndebug_bazel_added += b_nd and not a_nd
+            notes.ndebug_bazel_missing += a_nd and not b_nd
     return out
+
+
+def _defines_ndebug(defines) -> bool:
+    """NDEBUG (any value) among canonicalized defines, which already apply -U
+    in order (the last -D/-U wins; see canonicalize._undefine)."""
+    return any(d.split("=", 1)[0] == "NDEBUG" for d in defines)
 
 
 # Java source roots: a .java path is keyed by its PACKAGE-rooted form (the path
@@ -686,6 +708,41 @@ def levels_summary(a: CanonicalModel, b: CanonicalModel,
     return {"note": LEVELS_NOTE, "cmake": la, "bazel": lb, "differs": differs}
 
 
+NDEBUG_NOTE = ("Assertion state. NDEBUG is part of what a build type means, and "
+               "Bazel's -c opt adds it: pinning opt against a reference without "
+               "NDEBUG turns assertions off. An extra Bazel define is only a WARN, "
+               "so this does not block convergence. Counts ignore ignore.defines.")
+
+
+def ndebug_summary(a: CanonicalModel, b: CanonicalModel, cfg: "MigrationConfig",
+                   notes: Optional[DiffNotes] = None) -> dict:
+    """NDEBUG on each side over the compared compile actions (their
+    canonicalized defines, so -U applies in order), plus, when `notes` is
+    given, the compared TU pairs where only Bazel defines it (`bazel_added`:
+    assertions off that the reference keeps) or only CMake does
+    (`bazel_missing`: assertions on that the reference turns off)."""
+    def count(model, renames=None):
+        c = Counter()
+        is_bazel = model.build_system == BuildSystem.BAZEL
+        for _, args in _compared_compile_args(model, cfg, renames):
+            defines = canonicalize_flags(list(args), model.repo_root,
+                                         is_bazel=is_bazel)[0]
+            c["NDEBUG" if _defines_ndebug(defines) else "(none)"] += 1
+        return _by_count(c)
+    ca, cb = count(a), count(b, _bazel_renames(a, b, cfg))
+    out = {"note": NDEBUG_NOTE, "cmake": ca, "bazel": cb}
+    if notes is not None:
+        # The compared pairs decide: a Bazel-only TU that is never compared
+        # must not flip the verdict while both pair counts are zero.
+        out["bazel_added"] = notes.ndebug_bazel_added
+        out["bazel_missing"] = notes.ndebug_bazel_missing
+        differs = bool(notes.ndebug_bazel_added or notes.ndebug_bazel_missing)
+    else:
+        differs = bool(ca) and bool(cb) and set(ca) != set(cb)
+    out["differs"] = differs
+    return out
+
+
 def _by_count(c: Counter) -> dict:
     """Counter -> dict ordered by count (desc), then value: stable JSON."""
     return {k: n for k, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))}
@@ -693,8 +750,8 @@ def _by_count(c: Counter) -> dict:
 
 BAZEL_ONLY_NOTE = ("Flag comparison is one-directional: every CMake flag must be "
                    "on the Bazel side, but these flags only the Bazel side has "
-                   "are never a discrepancy. Review them; converged does not "
-                   "cover them.")
+                   "are never a discrepancy, and these defines only it has are "
+                   "only a WARN. Review them; converged does not cover them.")
 
 
 def summarize(discs: List[Discrepancy],
@@ -713,11 +770,13 @@ def summarize(discs: List[Discrepancy],
     if a is not None and b is not None:
         result["excluded"] = excluded_summary(a, b, cfg or MigrationConfig())
         result["levels"] = levels_summary(a, b, cfg or MigrationConfig())
+        result["ndebug"] = ndebug_summary(a, b, cfg or MigrationConfig(), notes)
     if notes is not None:
         result["bazel_only_flags"] = {
             "note": BAZEL_ONLY_NOTE,
             "compile": _by_count(notes.bazel_only_flags),  # flag -> TU pairs
             "link": _by_count(notes.bazel_only_link_flags),  # flag -> executables
+            "defines": _by_count(notes.bazel_only_defines),  # define -> TU pairs
         }
     return result
 

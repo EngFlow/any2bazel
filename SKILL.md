@@ -290,8 +290,10 @@ python3 scripts/diff.py model.<frontend>.json model.bazel.json \
 `diff.json` has `converged` (⇔ zero `error` discrepancies), a `discrepancies`
 worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
 `bazel_only`), an `excluded` map of non-participating targets by role,
-`levels` (optimization/debug level per side), and `bazel_only_flags`: flags
-only the Bazel side has. Those are never a discrepancy (the comparison is
+`levels` (optimization/debug level per side), `ndebug` (assertion state per
+side, and on how many compared TU pairs Bazel adds or lacks `NDEBUG`), and
+`bazel_only_flags`: flags and defines only the Bazel side has. Those flags are
+never a discrepancy and those defines only a WARN (the comparison is
 one-directional), so a `-w` or `-Wno-error=` you add converges silently;
 review the list before reporting.
 `cmake_only` is a historical name: for every frontend it means "present in the
