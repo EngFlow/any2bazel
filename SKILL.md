@@ -229,7 +229,8 @@ Inspect the reference build for anything unsupported. Surface them and confirm
 with the user before proceeding.
 
 **NOT yet supported — warn the user if the project has these:**
-- Custom commands / generated code
+- Build-time custom commands / generated code. Configure-time generated
+  files are handled by you, not the tool: see the reference guide.
 - Per-test-binary identity alignment, and include search **order** (presence
   only) — both have planned follow-ups
 - Packaging / install rules
@@ -271,7 +272,7 @@ generated `.bazelrc` so a declared version that MVS overrides fails the build
 instead of being a warning nobody reads.
 
 The reference guide covers what is specific to translating its build system
-(for CMake: the build type).
+(for CMake: the build type and configure-time generated files).
 
 ### Main migration loop {#main-migration-loop}
 

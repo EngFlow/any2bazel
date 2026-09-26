@@ -14,8 +14,9 @@ as the reference build.
 
 When [confirming scope](../SKILL.md#confirm-scope), inspect `CMakeLists.txt`
 for these and surface them before proceeding:
-- Generated code: `configure_file`, `add_custom_command`, protoc or other
-  codegen steps.
+- Build-time generated code: `add_custom_command`, protoc or other codegen
+  steps. `configure_file` is handled by you, not the tool: see
+  [Configure-time generated files](#configure-time-generated-files).
 - `find_package` of non-system libraries. There is no automatic
   `find_package` → bzlmod resolution; each one must be mapped by hand.
 
@@ -62,6 +63,15 @@ and pin it in `.bazelrc`, e.g. `build -c opt` plus `build --copt=-O3`. `opt`
 also turns assertions off where the reference keeps them (`ndebug` in
 `diff.json`); `build --copt=-UNDEBUG` undoes the toolchain's `-DNDEBUG`, not
 one in a rule's `copts`.
+
+### Configure-time generated files
+
+For `configure_file` and probe headers, prefer a Starlark `configure_file` rule
+over the `.in` template, so the configuration stays derived. Checking in a
+probe's result is acceptable for one platform if the file says so and you
+verify it, file by file, against the configure output it came from. Never
+point Bazel at CMake's build directory: that will not rebuild from the
+repository, which is worse than migrating less.
 
 ## CMake-specific comparison notes
 
