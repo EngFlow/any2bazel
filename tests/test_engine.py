@@ -640,6 +640,62 @@ def test_config_loads_all_fields_from_json():
     assert cfg.map_include("external/absl+/base") == "@absl/base"  # rewrite
 
 
+def test_bazel_args_accepts_flags_and_flag_values():
+    import config as config_mod
+    for ok in ([], ["--config=release"], ["-c", "opt"],
+               ["--config", "release", "--copt=-O3"],
+               ["--compilation_mode=opt", "--cxxopt=-std=c++17", "--force_pic"]):
+        assert config_mod.validate_bazel_args(ok) == tuple(ok), ok
+
+
+def test_bazel_args_rejects_a_command_line():
+    # A whole aquery command in the field (seen in practice): spliced into
+    # `bazel aquery <args> <query>` it yields two query expressions.
+    import config as config_mod
+    bad_lists = (
+        ["aquery", 'mnemonic("CppCompile|CppLink|CppArchive", //...)',
+         "--output=jsonproto"],
+        ["--config=release", "build"],        # '=' flag takes no separate value
+        ["-c", "opt", "//..."],               # one value per flag
+        "--config=release",                   # a string, not a list
+    )
+    for bad in bad_lists:
+        try:
+            config_mod.validate_bazel_args(bad)
+        except ValueError as e:
+            if isinstance(bad, list):
+                assert repr(bad[-1] if bad[0].startswith("-") else bad[0]) in str(e), e
+        else:
+            raise AssertionError(f"accepted {bad!r}")
+
+
+def test_bazel_args_rejects_a_non_string_entry():
+    import config as config_mod
+    try:
+        config_mod.validate_bazel_args(["-c", 3])
+    except ValueError as e:
+        assert "3" in str(e) and "not a string" in str(e), e
+    else:
+        raise AssertionError("accepted a non-string entry")
+
+
+def test_config_load_refuses_malformed_bazel_args():
+    import json
+    import tempfile
+    import config as config_mod
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"bazel_args": ["aquery", "//...", "--output=jsonproto"]}, f)
+        path = f.name
+    try:
+        config_mod.load(path)
+    except ValueError as e:
+        assert "'aquery'" in str(e), e
+    else:
+        raise AssertionError("malformed bazel_args loaded without error")
+    finally:
+        os.unlink(path)
+
+
 def _test_models(cmake_test_srcs, bazel_test_srcs, n_cmake_bins=1, n_bazel_bins=1):
     """Build a/b models with a shared production lib plus test targets carrying
     the given sources, split across n_*_bins test executables."""

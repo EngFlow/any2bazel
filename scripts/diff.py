@@ -519,5 +519,8 @@ if __name__ == "__main__":
     from serialize import load_model
     a = load_model(sys.argv[1])
     b = load_model(sys.argv[2])
-    cfg = config_mod.load(sys.argv[3]) if len(sys.argv) > 3 else MigrationConfig()
+    try:
+        cfg = config_mod.load(sys.argv[3]) if len(sys.argv) > 3 else MigrationConfig()
+    except ValueError as e:
+        sys.exit(f"diff.py: {sys.argv[3]}: {e}")
     print(json.dumps(summarize(diff_models(a, b, cfg), a, b, cfg), indent=2))

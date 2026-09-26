@@ -100,9 +100,12 @@ class MigrationConfig:
     # Unlike `ignore` (flags/defines), this is the only lever for missing_tu /
     # missing_target on whole subtrees. Each entry is a reviewable decision.
     exclude_targets: Set[str] = field(default_factory=set)
-    # The bazel aquery invocation this migration is compared against, recorded
+    # The FLAGS appended to `bazel build` / `bazel aquery` so the Bazel side
+    # mirrors the real build (e.g. "--config=release", or "-c" "opt"), recorded
     # so the comparison is reproducible. Read by the skill/operator, not by the
-    # diff itself (the diff consumes the already-extracted model).
+    # diff itself (the diff consumes the already-extracted model); validated at
+    # load (see validate_bazel_args) because anything that consumes it splices
+    # it into a bazel command line.
     bazel_args: tuple = ()
     # Opt-in: also diff TEST targets (role=test). OFF by default because test
     # diffing requires BOTH models to be extracted with tests enabled and the
@@ -161,6 +164,38 @@ class MigrationConfig:
         return name in self.exclude_targets
 
 
+def validate_bazel_args(args) -> tuple:
+    """Check that `bazel_args` is a list of flags, and return it as a tuple.
+
+    Each entry must be a flag (starts with '-') or the value of the flag just
+    before it, when that flag has no '=' (so ["-c", "opt"] and
+    ["--config", "release"] are fine). Anything else -- most often a whole
+    command such as ["aquery", "mnemonic(...)", "--output=jsonproto"] -- is
+    refused, naming the entry: spliced into `bazel aquery <args> <query>` it
+    becomes a second query expression and breaks the command. A boolean flag
+    followed by a stray word slips through; the check is a guard against the
+    command-in-the-field mistake, not a Bazel option parser."""
+    if isinstance(args, str) or not isinstance(args, (list, tuple)):
+        raise ValueError(
+            f"bazel_args must be a list of flags, got {type(args).__name__}")
+    value_allowed = False
+    for a in args:
+        if not isinstance(a, str):
+            raise ValueError(f"bazel_args entry {a!r} is not a string")
+        if a.startswith("-"):
+            value_allowed = "=" not in a
+            continue
+        if value_allowed:
+            value_allowed = False
+            continue
+        raise ValueError(
+            f"bazel_args entry {a!r} is not a flag or a flag's value. "
+            "bazel_args holds only the flags appended to `bazel build` / "
+            "`bazel aquery` to mirror the real build (e.g. [\"--config=release\"] "
+            "or [\"-c\", \"opt\"]), never the command or query itself.")
+    return tuple(args)
+
+
 def load(path: str) -> MigrationConfig:
     """Load config from an explicit file path, or return empty if absent."""
     if not path or not os.path.isfile(path):
@@ -182,7 +217,7 @@ def load(path: str) -> MigrationConfig:
         source_map=tuple(
             (e["from"], e["to"]) for e in ig.get("source_map", [])),
         exclude_targets=set(obj.get("exclude_targets", [])),
-        bazel_args=tuple(obj.get("bazel_args", [])),
+        bazel_args=validate_bazel_args(obj.get("bazel_args", [])),
         include_tests=bool(obj.get("include_tests", False)),
     )
 

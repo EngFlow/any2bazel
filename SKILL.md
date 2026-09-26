@@ -112,9 +112,12 @@ whether its frontend reads it:
 ```
 
 Fields:
-- **`bazel_args`** — the extra args aquery must run with to mirror the real
-  build (see [Extract the Bazel action graph](#extract-bazel-graph)). Recorded so
-  the comparison is reproducible; read by the operator, not the diff.
+- **`bazel_args`** — the extra **flags** aquery must run with to mirror the
+  real build (see [Extract the Bazel action graph](#extract-bazel-graph)), e.g.
+  `["--config=release"]` or `["-c", "opt"]`; never a command
+  (`["aquery", "mnemonic(...)", ...]` is wrong). Recorded so the comparison is
+  reproducible; `diff.py` refuses an entry that is neither a flag nor a flag's
+  value.
 - **`target_map`** — `reference_name → bazel_name` for intentionally renamed
   **executables**. Bazel targets are keyed by full label, so the value is
   usually `:name` (e.g. `"bssl": ":bssl"`). Libraries need no mapping.
