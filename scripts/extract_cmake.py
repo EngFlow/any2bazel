@@ -40,6 +40,7 @@ import os
 import sys
 from typing import Dict, List, Optional
 
+from canonicalize import fold_xlinker
 from extract_configure import parse_configure_trace
 from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
                    TargetKind, TargetRole)
@@ -176,8 +177,9 @@ def _attach_deps(target: Target, tobj: dict, id_to_name: Dict[str, str]) -> None
         dep_name = id_to_name.get(dep["id"])
         if dep_name:
             target.deps.append(Dependency(dep_name, external=False))
-    # link fragments: role "libraries" -> external deps (annotation); role
-    # "flags" -> a CppLink Action's argv (the differ canonicalizes them).
+    # link fragments: role "libraries" -> external deps (annotation), plus any
+    # link-interface FLAGS among them; role "flags" -> a CppLink Action's argv
+    # (the differ canonicalizes them).
     link = tobj.get("link") or {}
     flag_tokens: List[str] = []
     for frag in link.get("commandFragments", []):
@@ -187,11 +189,45 @@ def _attach_deps(target: Target, tobj: dict, id_to_name: Dict[str, str]) -> None
             ext = _library_identity(fragment)
             if ext and not any(d.name == ext for d in target.deps):
                 target.deps.append(Dependency(ext, external=True))
+            elif ext is None:
+                flag_tokens.extend(_link_interface_flags(fragment))
         elif role == "flags":
             flag_tokens.extend(_split_fragment(fragment))
     if flag_tokens:
         target.actions.append(Action(mnemonic="CppLink",
                                      arguments=tuple(flag_tokens)))
+
+
+# Flags in a "libraries" fragment that position or locate the libraries around
+# them rather than changing how the program links: they belong to the link
+# closure (compared as deps), and rpaths name the CMake build tree. Matched
+# after `-Xlinker X` pairs are folded to `-Wl,X` (see _link_interface_flags).
+_LIBRARY_POSITIONING_PREFIXES = (
+    "-L", "-framework", "-Wl,-rpath", "-Wl,--rpath", "-Wl,-R",
+    "-Wl,--whole-archive",
+    "-Wl,--no-whole-archive", "-Wl,-whole-archive", "-Wl,-no-whole-archive",
+    "-Wl,--push-state", "-Wl,--pop-state", "-Wl,--start-group",
+    "-Wl,--end-group", "-Wl,-(", "-Wl,-)", "-Wl,-Bstatic", "-Wl,-Bdynamic",
+    "-Wl,--as-needed", "-Wl,--no-as-needed", "-Wl,-force_load",
+)
+
+
+def _link_interface_flags(fragment: str) -> List[str]:
+    """The link FLAGS a non-library "libraries" fragment carries, or [].
+
+    Such a fragment is a flag a dependency carries on its link interface (e.g.
+    Python's `-Xlinker -export-dynamic`, OpenMP's `-fopenmp`, Threads'
+    `-pthread`) rather than a library. These change how the program links, so
+    they are compared with the target's link flags; before, they were dropped
+    and a missing one could not show up in the diff. `-Xlinker` pairs are
+    folded first, so `-Xlinker -rpath -Xlinker <dir>` is recognised as the
+    rpath it is; positioning flags and -l references yield []."""
+    tokens = fold_xlinker(_split_fragment(fragment))
+    if (not tokens or not tokens[0].startswith("-")
+            or tokens[0].startswith("-l")
+            or tokens[0].startswith(_LIBRARY_POSITIONING_PREFIXES)):
+        return []
+    return tokens
 
 
 def _library_identity(fragment: str) -> Optional[str]:
