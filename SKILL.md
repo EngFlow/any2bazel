@@ -61,6 +61,12 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
   Bazel flags are tolerated (listed in `diff.json` as `bazel_only_flags`). No
   artifact/symbol diff or test execution yet.
 
+  **`converged: true` is parity of command lines, nothing more.** Check
+  separately what it cannot see:
+  - **Generated file contents.** A value that reaches only a generated file
+    (`configure_file` output, genrule output) never appears on a command line.
+    Byte-compare each generated file against the reference build's.
+
 ### How targets are matched
 
 - **Roles:** each target gets a `role` (`production`, `test`, `dashboard`,
