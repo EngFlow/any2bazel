@@ -82,6 +82,7 @@ def triage(diff: dict, only_kind: Optional[str] = None) -> dict:
         "warnings": diff.get("warnings"),
         "kinds": out_kinds,
         "excluded": diff.get("excluded", {}),
+        "bazel_only_flags": diff.get("bazel_only_flags"),
     }
 
 
@@ -95,6 +96,18 @@ def render(t: dict, top: int = 25) -> str:
     lines = []
     status = "CONVERGED" if t["converged"] else "NOT converged"
     lines.append(f"{status}  errors={t['errors']}  warnings={t['warnings']}")
+    extra = t.get("bazel_only_flags")
+    if extra:
+        comp, link = extra.get("compile") or {}, extra.get("link") or {}
+        lines.append(f"bazel-only flags (never a discrepancy; review): "
+                     f"{len(comp)} compile, {len(link)} link")
+        for label, hist in (("compile (TU pairs)", comp), ("link (executables)", link)):
+            if not hist:
+                continue
+            items = list(hist.items())
+            lines.append(f"  {label}: " + ", ".join(
+                f"{v} x{n}" for v, n in items[:top])
+                + (f", ... +{len(items) - top} more" if len(items) > top else ""))
     for k in t["kinds"]:
         lines.append(f"\n[{k['severity']}] {k['kind']} x{k['count']}")
         for label, hist, cap in (

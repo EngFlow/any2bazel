@@ -58,7 +58,8 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
 
   Done when both stages converge. The comparison is **asymmetric**: every
   correctness-relevant reference flag must be present on the Bazel side; extra
-  Bazel flags are tolerated. No artifact/symbol diff or test execution yet.
+  Bazel flags are tolerated (listed in `diff.json` as `bazel_only_flags`). No
+  artifact/symbol diff or test execution yet.
 
 ### How targets are matched
 
@@ -286,7 +287,10 @@ python3 scripts/diff.py model.<frontend>.json model.bazel.json \
 ```
 `diff.json` has `converged` (⇔ zero `error` discrepancies), a `discrepancies`
 worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
-`bazel_only`), and an `excluded` map of non-participating targets by role.
+`bazel_only`), an `excluded` map of non-participating targets by role, and
+`bazel_only_flags`: flags only the Bazel side has. Those are never a
+discrepancy (the comparison is one-directional), so a `-w` or `-Wno-error=`
+you add converges silently; review the list before reporting.
 `cmake_only` is a historical name: for every frontend it means "present in the
 reference, absent in Bazel".
 Synthetic target names `<libraries>`, `<external>` (and `<tests>` when

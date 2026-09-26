@@ -75,6 +75,22 @@ def test_render_caps_bazel_only_tail():
     assert "-std=gnu++17" in text
 
 
+def test_render_shows_bazel_only_flags_even_when_converged():
+    diff = {"converged": True, "errors": 0, "warnings": 0, "discrepancies": [],
+            "excluded": {},
+            "bazel_only_flags": {"note": "...",
+                                 "compile": {"-Wno-error=parentheses": 24, "-w": 3},
+                                 "link": {}}}
+    text = render(triage(diff))
+    assert "bazel-only flags (never a discrepancy; review): 2 compile, 0 link" in text
+    assert "compile (TU pairs): -Wno-error=parentheses x24" in text
+
+
+def test_render_without_bazel_only_flags_is_unchanged():
+    # diff.json written before the field existed renders as before
+    assert "bazel-only" not in render(triage(DIFF))
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

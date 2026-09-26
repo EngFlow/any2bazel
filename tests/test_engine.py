@@ -29,7 +29,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from config import MigrationConfig
-from diff import Severity, diff_models, summarize
+from diff import DiffNotes, Severity, diff_models, summarize
 from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
                    TargetKind, TargetRole)
 
@@ -514,6 +514,77 @@ def test_multi_variant_verdict_does_not_depend_on_hash_seed():
             outs.add(out)
     assert len(outs) == 1, "diff output varies with PYTHONHASHSEED"
     assert json.loads(outs.pop())["converged"]
+
+
+def test_bazel_only_flags_are_reported_but_never_block():
+    # The comparison is one-directional: flags only Bazel has never produce a
+    # discrepancy, so a converged diff must still SAY they exist.
+    cmake_raw = ["-std=c++17", "-Werror"]
+    bazel_raw = ["-std=c++17", "-Werror", "-Wno-error=parentheses", "-w",
+                 "-fstack-protector"]  # the last: tolerated toolchain default
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    notes = DiffNotes()
+    discs = diff_models(a, b, notes=notes)
+    res = summarize(discs, a, b, notes=notes)
+    assert res["converged"] and discs == [], res
+    assert res["bazel_only_flags"]["compile"] == {"-Wno-error=parentheses": 1, "-w": 1}
+    assert res["bazel_only_flags"]["link"] == {}
+
+
+def test_bazel_only_flags_respect_ignore_and_count_per_tu():
+    cmake_raw = ["-std=c++17"]
+    bazel_raw = ["-std=c++17", "-fno-strict-aliasing", "-Wno-unused"]
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    for m, raw, bz in ((a, cmake_raw, False), (b, bazel_raw, True)):
+        m.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw(f"src/{n}.cpp", raw, bz)
+                              for n in ("a", "b", "c")]))
+    notes = DiffNotes()
+    summarize(diff_models(a, b, MigrationConfig(ignore_flags={"-Wno-unused"}), notes))
+    assert dict(notes.bazel_only_flags) == {"-fno-strict-aliasing": 3}
+
+
+def test_bazel_only_link_flags_are_reported():
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-pthread"], False))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(_exe("app", ["-pthread", "-Wl,--export-dynamic"], True))
+    notes = DiffNotes()
+    res = summarize(diff_models(a, b, notes=notes), notes=notes)
+    assert res["converged"], res
+    assert res["bazel_only_flags"]["link"] == {"-Wl,--export-dynamic": 1}
+
+
+def test_bazel_only_flags_are_collected_from_tests_when_opted_in():
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("t_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("test/t.cpp", ["-std=c++17"], False)]))
+    b.add(Target("t:t_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("test/t.cpp", ["-std=c++17", "-w"], True)]))
+    notes = DiffNotes()
+    discs = diff_models(a, b, MigrationConfig(include_tests=True), notes)
+    assert summarize(discs)["converged"], discs
+    assert dict(notes.bazel_only_flags) == {"-w": 1}
+
+
+def test_bazel_only_flags_come_from_the_exact_variant_when_one_exists():
+    # Two Bazel variants of x.cc, one exact and one adding -w; the notes must
+    # reflect the chosen (exact) pair, not the noisy one.
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("l", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x.cc", ["-std=c++17"], False)]))
+    for name, raw in (("a:noisy", ["-std=c++17", "-w", "-Wno-error=foo"]),
+                      ("b:exact", ["-std=c++17"])):
+        b.add(Target(name, TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("x.cc", raw, True)]))
+    notes = DiffNotes()
+    assert diff_models(a, b, notes=notes) == []
+    assert dict(notes.bazel_only_flags) == {}
+
+
+def test_summary_without_notes_has_no_bazel_only_field():
+    a = _model(tu_from_raw("src/a.cpp", ["-O2"], is_bazel=False), is_bazel=False)
+    assert "bazel_only_flags" not in summarize(diff_models(a, a))
 
 
 def test_ignore_flags_and_defines_suppress_diffs():

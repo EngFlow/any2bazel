@@ -32,7 +32,8 @@ extra defines are reported at lower severity.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -89,6 +90,22 @@ class Discrepancy:
     tu: Optional[str] = None
     cmake_only: Optional[list] = None  # present in A, absent in B  -> must add
     bazel_only: Optional[list] = None  # present in B, absent in A  -> usually ok
+
+
+@dataclass
+class DiffNotes:
+    """What the diff observes but never counts as a discrepancy, reported in the
+    summary beside the verdict. Never affects `converged`.
+
+    The flag comparison is one-directional (a CMake flag missing on Bazel is an
+    error; a flag only Bazel has is tolerated), so a converged diff can hide
+    flags the Bazel side ADDED -- a `-w` or `-Wno-error=` is never an error.
+    These counters make them visible: flag -> number of compared TU pairs
+    (compile; one pair per CMake TU variant, see _diff_variants) or aligned
+    executables (link) where Bazel has it and CMake does not, after the
+    reviewer's ignore lists and the toolchain's tolerated defaults."""
+    bazel_only_flags: Counter = field(default_factory=Counter)
+    bazel_only_link_flags: Counter = field(default_factory=Counter)
 
 
 def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
@@ -154,13 +171,17 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
 
 
 def _diff_link_flags(name: str, ta: "TargetView", tb: "TargetView",
-                     cfg: "MigrationConfig") -> List[Discrepancy]:
+                     cfg: "MigrationConfig",
+                     notes: Optional[DiffNotes] = None) -> List[Discrepancy]:
     """Asymmetric link-flag subset for one aligned executable/shared-lib: every
     CMake link flag must be present on the Bazel side; extra Bazel link flags
-    are tolerated. Reviewer-approved differences (cfg.link_flag_ignored) are
-    dropped from both sides first. Mirrors the compile-flag check."""
+    are tolerated (and recorded in `notes`). Reviewer-approved differences
+    (cfg.link_flag_ignored) are dropped from both sides first. Mirrors the
+    compile-flag check."""
     a_lf = {f for f in ta.link_flags if not cfg.link_flag_ignored(f)}
     b_lf = {f for f in tb.link_flags if not cfg.link_flag_ignored(f)}
+    if notes is not None:
+        notes.bazel_only_link_flags.update(b_lf - a_lf)
     if a_lf - b_lf:
         return [Discrepancy(
             kind=Kind.LINK_FLAGS_DIFF.value,
@@ -295,18 +316,24 @@ def _best_match(target: str, a: TranslationUnit, b_vs: List[TranslationUnit],
 
 
 def _diff_variants(target: str, a_vs: List[TranslationUnit],
-                   b_vs: List[TranslationUnit],
-                   cfg: "MigrationConfig") -> List[Discrepancy]:
+                   b_vs: List[TranslationUnit], cfg: "MigrationConfig",
+                   notes: Optional[DiffNotes] = None) -> List[Discrepancy]:
     """Compare every CMake variant of one source against its BEST-matching Bazel
     variant (fewest errors, then warnings, then distance; see _rank).
     Every CMake variant must be matched by some Bazel variant, so nothing is
     suppressed: a variant Bazel lacks shows up as that variant's discrepancies
     against its closest match. An extra Bazel-only variant is tolerated, like
     any extra Bazel flag. With one variant per side this is exactly one
-    _diff_tu call."""
+    _diff_tu call. The Bazel-only flags of each chosen pair are recorded in
+    `notes`."""
     out: List[Discrepancy] = []
     for a in a_vs:
-        out.extend(_best_match(target, a, b_vs, cfg)[0])
+        discs, b = _best_match(target, a, b_vs, cfg)
+        out.extend(discs)
+        if notes is not None:
+            a_fl = {f for f in a.flags if not cfg.flag_ignored(f)}
+            b_fl = {f for f in b.flags if not cfg.flag_ignored(f)}
+            notes.bazel_only_flags.update(_display_bazel_only(b_fl - a_fl))
     return out
 
 
@@ -363,7 +390,11 @@ def _all_source_keys(views: Dict[str, TargetView], cfg: "MigrationConfig") -> se
 
 
 def diff_models(a: CanonicalModel, b: CanonicalModel,
-                cfg: Optional["MigrationConfig"] = None) -> List[Discrepancy]:
+                cfg: Optional["MigrationConfig"] = None,
+                notes: Optional[DiffNotes] = None) -> List[Discrepancy]:
+    """Compare the CMake model `a` with the Bazel model `b`. Returns the
+    discrepancy worklist; if `notes` is given, it is filled with what the diff
+    observed but does not count (see DiffNotes) for summarize() to report."""
     out: List[Discrepancy] = []
     if cfg is None:
         cfg = MigrationConfig()
@@ -407,7 +438,8 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
         out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                "<libraries>", "source compiled in bazel but not cmake", tu=src))
     for src in sorted(set(a_union) & set(b_union)):
-        out.extend(_diff_variants("<libraries>", a_union[src], b_union[src], cfg))
+        out.extend(_diff_variants("<libraries>", a_union[src], b_union[src],
+                                  cfg, notes))
 
     # ---- executables: identity-aligned, own TUs + own flags ----------------
     for name in sorted(a_exes - b_exes):
@@ -436,12 +468,12 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
             out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                    name, "source compiled in bazel but not cmake", tu=src))
         for src in sorted(set(amap) & set(bmap)):
-            out.extend(_diff_variants(name, amap[src], bmap[src], cfg))
+            out.extend(_diff_variants(name, amap[src], bmap[src], cfg, notes))
         # link flags: asymmetric subset, same policy as compile flags -- every
         # CMake link flag must be present on the Bazel side; extra Bazel link
         # flags tolerated (toolchain link noise already stripped). Reviewer
         # ignores applied to both sides.
-        out.extend(_diff_link_flags(name, ta, tb, cfg))
+        out.extend(_diff_link_flags(name, ta, tb, cfg, notes))
 
     # ---- Java: project-wide source-SET comparison --------------------------
     # Java compiles a whole source set per action; how those sources are grouped
@@ -489,12 +521,13 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
 
     # ---- tests (opt-in) ----------------------------------------------------
     if cfg.include_tests:
-        out.extend(_diff_tests(a_views, b_views, cfg, a_all, b_all))
+        out.extend(_diff_tests(a_views, b_views, cfg, a_all, b_all, notes))
     return out
 
 
 def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
-                cfg: "MigrationConfig", a_all: set, b_all: set) -> List[Discrepancy]:
+                cfg: "MigrationConfig", a_all: set, b_all: set,
+                notes: Optional[DiffNotes] = None) -> List[Discrepancy]:
     """Apply the COMPILE-PARITY stage to TEST targets. Two checks:
 
       1. TU-SET union of all test sources (like libraries): same test .cc files
@@ -532,7 +565,8 @@ def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
         out.append(Discrepancy(Kind.EXTRA_TEST_TU.value, Severity.WARN.value,
                                "<tests>", "test source compiled in bazel but not cmake", tu=src))
     for src in sorted(set(a_union) & set(b_union)):
-        out.extend(_diff_variants("<tests>", a_union[src], b_union[src], cfg))
+        out.extend(_diff_variants("<tests>", a_union[src], b_union[src],
+                                  cfg, notes))
 
     # 2. test-binary existence by count
     if len(a_tests) != len(b_tests):
@@ -574,10 +608,22 @@ def excluded_summary(a: CanonicalModel, b: CanonicalModel,
             "bazel": by_reason(b, _bazel_renames(a, b, cfg))}
 
 
+def _by_count(c: Counter) -> dict:
+    """Counter -> dict ordered by count (desc), then value: stable JSON."""
+    return {k: n for k, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))}
+
+
+BAZEL_ONLY_NOTE = ("Flag comparison is one-directional: every CMake flag must be "
+                   "on the Bazel side, but these flags only the Bazel side has "
+                   "are never a discrepancy. Review them; converged does not "
+                   "cover them.")
+
+
 def summarize(discs: List[Discrepancy],
               a: Optional[CanonicalModel] = None,
               b: Optional[CanonicalModel] = None,
-              cfg: Optional["MigrationConfig"] = None) -> dict:
+              cfg: Optional["MigrationConfig"] = None,
+              notes: Optional[DiffNotes] = None) -> dict:
     errors = [d for d in discs if d.severity == Severity.ERROR.value]
     result = {
         "total": len(discs),
@@ -588,6 +634,12 @@ def summarize(discs: List[Discrepancy],
     }
     if a is not None and b is not None:
         result["excluded"] = excluded_summary(a, b, cfg or MigrationConfig())
+    if notes is not None:
+        result["bazel_only_flags"] = {
+            "note": BAZEL_ONLY_NOTE,
+            "compile": _by_count(notes.bazel_only_flags),  # flag -> TU pairs
+            "link": _by_count(notes.bazel_only_link_flags),  # flag -> executables
+        }
     return result
 
 
@@ -605,4 +657,6 @@ if __name__ == "__main__":
         cfg = config_mod.load(sys.argv[3]) if len(sys.argv) > 3 else MigrationConfig()
     except ValueError as e:
         sys.exit(f"diff.py: {sys.argv[3]}: {e}")
-    print(json.dumps(summarize(diff_models(a, b, cfg), a, b, cfg), indent=2))
+    notes = DiffNotes()
+    discs = diff_models(a, b, cfg, notes)
+    print(json.dumps(summarize(discs, a, b, cfg, notes), indent=2))
