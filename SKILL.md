@@ -295,10 +295,21 @@ recorded apart, as `test_configure_command`.
 ### Create initial BUILD.bazel files {#create-build-files}
 
 Read `model.<frontend>.json`. For each production target emit a `cc_library` /
-`cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Library
-grouping need not match the reference (TU-set comparison is
-grouping-agnostic), but keep **executable** names aligned or add a `target_map`
-entry. Write `MODULE.bazel` as needed — before picking rulesets or pinning
+`cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Bazel
+scopes these differently from CMake:
+- `defines`, `includes` and `linkopts` propagate to every dependent, like
+  CMake's `PUBLIC`/`INTERFACE`.
+- `copts`, `local_defines` and `local_includes` apply to the target alone, like
+  `PRIVATE`; `implementation_deps` keeps a dependency's headers from reaching
+  dependents.
+
+So a define or include directory the reference keeps private to one target
+(such as `<target>_EXPORTS`) belongs in `local_defines` or `local_includes`.
+`local_includes` needs rules_cc 0.2.19 or later; on older versions, pass a
+private include directory in `copts` as `-I<path from the workspace root>`.
+Library grouping need not match the reference (TU-set
+comparison is grouping-agnostic), but keep **executable** names aligned or add
+a `target_map` entry. Write `MODULE.bazel` as needed — before picking rulesets or pinning
 versions, read
 [docs/BAZEL-RULES.md](docs/BAZEL-RULES.md) (which rulesets have been exercised
 here, why some were hand-written instead, and why a version must be resolved
