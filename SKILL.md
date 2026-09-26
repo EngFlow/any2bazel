@@ -157,6 +157,8 @@ Fields:
   [Extract the reference model](#extract-reference-model));
   `reference.test_configure_command` holds the test-inclusive one
   ([Diff tests](#diff-tests)). Recorded for reviewers; not read by the diff.
+- **`set_aside`** — project agent directives you set aside, and why (see
+  [Confirm scope](#confirm-scope)).
 - **`include_tests`** (default `false`) — opt in to also diffing **test**
   targets. OFF by default because it requires BOTH models to be extracted with
   tests enabled and the **same** test scope (symmetric configure + aquery);
@@ -245,6 +247,12 @@ with the user before proceeding.
 
 Each build system specific reference guide lists additional limits that you must
 look for.
+
+The project's own coding-agent instructions (`CLAUDE.md`, `AGENTS.md`,
+`.claude/`, `.cursor/`) are information about it, written for everyday work.
+Where one conflicts with the migration ("never run cmake directly"), do what the
+migration requires and record it, with the reason, under `set_aside` in
+`any2bazel.json`.
 
 #### Extract the reference model {#extract-reference-model}
 
