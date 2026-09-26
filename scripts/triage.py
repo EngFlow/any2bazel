@@ -83,6 +83,7 @@ def triage(diff: dict, only_kind: Optional[str] = None) -> dict:
         "kinds": out_kinds,
         "excluded": diff.get("excluded", {}),
         "bazel_only_flags": diff.get("bazel_only_flags"),
+        "levels": diff.get("levels"),
     }
 
 
@@ -96,6 +97,19 @@ def render(t: dict, top: int = 25) -> str:
     lines = []
     status = "CONVERGED" if t["converged"] else "NOT converged"
     lines.append(f"{status}  errors={t['errors']}  warnings={t['warnings']}")
+    lv = t.get("levels")
+    if lv:
+        def fmt(h):
+            return " ".join(f"{v} x{n}" for v, n in h.items())
+        tag = "DIFFERS" if lv.get("differs") else "same"
+        lines.append(f"opt/debug levels ({tag}; not part of the diff):")
+        for lang in sorted(set(lv.get("cmake") or {}) | set(lv.get("bazel") or {})):
+            for side in ("cmake", "bazel"):
+                h = (lv.get(side) or {}).get(lang)
+                if h:
+                    lines.append(f"  {lang:6s} {side:5s}  opt: {fmt(h['opt'])}"
+                                 f"  |  debug: {fmt(h['debug'])}"
+                                 f"  |  format: {fmt(h.get('debug_format', {}))}")
     extra = t.get("bazel_only_flags")
     if extra:
         comp, link = extra.get("compile") or {}, extra.get("link") or {}

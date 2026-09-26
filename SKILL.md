@@ -77,11 +77,13 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
 ### Canonicalization
 
 `canonicalize.py` strips noise before comparing flags. Universal mechanics
-(driver/wrapper paths, `-c`/`-o`, sysroot, reproducibility defines, `-O*`/`-g*`)
-are dropped in code — never your concern. Judgment calls (warning-set or cosmetic
-differences) go in `any2bazel.json`'s `ignore`. Correctness flags (`-std=*`,
-`-fno-exceptions`, `-fno-rtti`, …) must never be ignored — they surface as hard
-errors by design.
+(driver/wrapper paths, `-c`/`-o`, sysroot, reproducibility defines) are dropped
+in code — never your concern. `-O*`/`-g*` are dropped from the per-TU
+comparison too, but the level still matters: `levels` in `diff.json` reports
+each side's, and `differs: true` there is real. Judgment calls (warning-set or
+cosmetic differences) go in `any2bazel.json`'s `ignore`. Correctness flags
+(`-std=*`, `-fno-exceptions`, `-fno-rtti`, …) must never be ignored — they
+surface as hard errors by design.
 
 ## The migration config: `any2bazel.json`
 
@@ -287,10 +289,11 @@ python3 scripts/diff.py model.<frontend>.json model.bazel.json \
 ```
 `diff.json` has `converged` (⇔ zero `error` discrepancies), a `discrepancies`
 worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
-`bazel_only`), an `excluded` map of non-participating targets by role, and
-`bazel_only_flags`: flags only the Bazel side has. Those are never a
-discrepancy (the comparison is one-directional), so a `-w` or `-Wno-error=`
-you add converges silently; review the list before reporting.
+`bazel_only`), an `excluded` map of non-participating targets by role,
+`levels` (optimization/debug level per side), and `bazel_only_flags`: flags
+only the Bazel side has. Those are never a discrepancy (the comparison is
+one-directional), so a `-w` or `-Wno-error=` you add converges silently;
+review the list before reporting.
 `cmake_only` is a historical name: for every frontend it means "present in the
 reference, absent in Bazel".
 Synthetic target names `<libraries>`, `<external>` (and `<tests>` when

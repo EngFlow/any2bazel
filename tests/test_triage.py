@@ -91,6 +91,20 @@ def test_render_without_bazel_only_flags_is_unchanged():
     assert "bazel-only" not in render(triage(DIFF))
 
 
+def test_render_shows_levels():
+    diff = {"converged": True, "errors": 0, "warnings": 0, "discrepancies": [],
+            "excluded": {},
+            "levels": {"note": "...", "differs": True,
+                       "cmake": {"CXX": {"opt": {"-O3": 94}, "debug": {"(none)": 94},
+                                         "debug_format": {"(none)": 94}}},
+                       "bazel": {"CXX": {"opt": {"-O2": 94}, "debug": {"-g0": 94},
+                                         "debug_format": {"(none)": 94}}}}}
+    text = render(triage(diff))
+    assert "opt/debug levels (DIFFERS; not part of the diff):" in text
+    assert "opt: -O3 x94" in text and "opt: -O2 x94" in text
+    assert "format: (none) x94" in text
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

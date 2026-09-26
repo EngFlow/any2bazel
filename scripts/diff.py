@@ -32,6 +32,7 @@ extra defines are reported at lower severity.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -40,7 +41,8 @@ from typing import Dict, List, Optional
 from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES
 from config import MigrationConfig
 from model import (CanonicalModel, TargetKind, TargetRole, TranslationUnit)
-from reconstruct import TargetView, reconstruct
+from reconstruct import (TargetView, _is_header_processing,
+                         _source_from_compile_args, reconstruct)
 
 
 def _display_bazel_only(flags) -> list:
@@ -608,6 +610,82 @@ def excluded_summary(a: CanonicalModel, b: CanonicalModel,
             "bazel": by_reason(b, _bazel_renames(a, b, cfg))}
 
 
+# Optimization / debug level flags. canonicalize.py drops -O*/-g* from the
+# per-TU comparison (build type is a build-wide setting, and diffing it per TU
+# would be noise), so levels_summary reads them from the RAW argv instead.
+_OPT_LEVEL = re.compile(r"^-O([0-3sgz]|fast)?$")
+# Debug LEVEL (how much is emitted: -g1 has no locals, -g3 adds macros) and
+# debug FORMAT (-gdwarf-N) are separate: `-g3 -gdwarf-4` and `-g1 -gdwarf-4`
+# share a format and differ in level.
+_DEBUG_LEVEL = re.compile(r"^-g([0-3]|gdb[0-3]?|line-tables-only)?$")
+_DEBUG_FORMAT = re.compile(r"^-gdwarf(-[0-9]+)?$")
+_COMPILE_LEVEL_MNEMONICS = {"CppCompile", "ObjcCompile"}
+_LANG_BY_EXT = {".c": "C", ".m": "OBJC", ".mm": "OBJCXX"}
+
+
+def _compared_compile_args(model: CanonicalModel, cfg: "MigrationConfig",
+                           renames: Optional[Dict[str, str]] = None):
+    """Yield (language, raw argv) for each compile action the diff compares:
+    participating roles, minus config-excluded targets (judged on the name
+    the diff compares under, see _bazel_renames), minus Bazel
+    header-processing actions."""
+    renames = renames or {}
+    roles = set(PARTICIPATING_ROLES)
+    if cfg.include_tests:
+        roles.add(TargetRole.TEST)
+    for name, t in sorted(model.targets.items()):
+        if t.role not in roles or cfg.target_excluded(renames.get(name, name)):
+            continue
+        for act in t.actions:
+            if act.mnemonic not in _COMPILE_LEVEL_MNEMONICS:
+                continue
+            args = act.arguments
+            src = _source_from_compile_args(args)
+            if not src or _is_header_processing(args):
+                continue
+            ext = src[src.rfind("."):] if "." in src else ""
+            yield _LANG_BY_EXT.get(ext, "CXX"), args
+
+
+def _compile_levels(model: CanonicalModel, cfg: "MigrationConfig",
+                    renames: Optional[Dict[str, str]] = None) -> dict:
+    """language -> {"opt", "debug", "debug_format": {flag: n}} over the
+    compared compile actions. The LAST flag of each kind wins, as it does for
+    the compiler; "(none)" means no flag. A -gdwarf-N with no level flag
+    enables debug info at the default level, so it counts as "-g"."""
+    out: Dict[str, Dict[str, Counter]] = {}
+    for lang_name, args in _compared_compile_args(model, cfg, renames):
+        lang = out.setdefault(lang_name, {"opt": Counter(), "debug": Counter(),
+                                          "debug_format": Counter()})
+        opt = [x for x in args if _OPT_LEVEL.match(x)]
+        dbg = [x for x in args if _DEBUG_LEVEL.match(x)]
+        fmt = [x for x in args if _DEBUG_FORMAT.match(x)]
+        lang["opt"][opt[-1] if opt else "(none)"] += 1
+        lang["debug"][dbg[-1] if dbg else ("-g" if fmt else "(none)")] += 1
+        lang["debug_format"][fmt[-1] if fmt else "(none)"] += 1
+    return {lang: {k: _by_count(c) for k, c in h.items()}
+            for lang, h in sorted(out.items())}
+
+
+LEVELS_NOTE = ("-O*/-g* are dropped from the per-TU comparison, so a different "
+               "optimization or debug level never shows up as a discrepancy. "
+               "This is what each side actually compiles at (TU counts).")
+
+
+def levels_summary(a: CanonicalModel, b: CanonicalModel,
+                   cfg: "MigrationConfig") -> dict:
+    """Optimization level, debug level and debug format of each side, per
+    language, with a `differs` flag: true when, for a language both sides
+    compile, the SET of values of any of the three differs (counts alone may
+    differ because TUs are missing). Only targets the diff compares count."""
+    la = _compile_levels(a, cfg)
+    lb = _compile_levels(b, cfg, _bazel_renames(a, b, cfg))
+    differs = any(set(la[lang][k]) != set(lb[lang][k])
+                  for lang in set(la) & set(lb)
+                  for k in ("opt", "debug", "debug_format"))
+    return {"note": LEVELS_NOTE, "cmake": la, "bazel": lb, "differs": differs}
+
+
 def _by_count(c: Counter) -> dict:
     """Counter -> dict ordered by count (desc), then value: stable JSON."""
     return {k: n for k, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))}
@@ -634,6 +712,7 @@ def summarize(discs: List[Discrepancy],
     }
     if a is not None and b is not None:
         result["excluded"] = excluded_summary(a, b, cfg or MigrationConfig())
+        result["levels"] = levels_summary(a, b, cfg or MigrationConfig())
     if notes is not None:
         result["bazel_only_flags"] = {
             "note": BAZEL_ONLY_NOTE,
