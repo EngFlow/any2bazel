@@ -110,6 +110,7 @@ whether its frontend reads it:
   "dep_map": { "Catch2Main": "catch2_main" },
   "exclude_targets": ["benchmark", "some_tool"],
   "include_tests": false,
+  "reference": { "configure_command": "cmake -S . -B build -G Ninja" },
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
@@ -145,6 +146,11 @@ Fields:
   third-party/vendored code Bazel pulls as an external module, or tooling out
   of scope. The **only** lever for `missing_tu`/`missing_target` on whole
   subtrees. Excluded targets still appear under `excluded.config_excluded`.
+- **`reference.configure_command`** — the exact configure command the
+  reference model came from (see
+  [Extract the reference model](#extract-reference-model));
+  `reference.test_configure_command` holds the test-inclusive one
+  ([Diff tests](#diff-tests)). Recorded for reviewers; not read by the diff.
 - **`include_tests`** (default `false`) — opt in to also diffing **test**
   targets. OFF by default because it requires BOTH models to be extracted with
   tests enabled and the **same** test scope (symmetric configure + aquery);
@@ -241,6 +247,14 @@ python3 scripts/extract_<frontend>.py <…> <repo_root> model.<frontend>.json
 ```
 Note the platform and options the reference build was configured with; the
 Bazel side must mirror them.
+
+Configure the reference build with the project's **documented default**
+options: turning anything off (a product, the tests, distribution flags)
+changes what "migrated" means, so surface it when
+[confirming scope](#confirm-scope). Record the exact command as
+`any2bazel.json`'s `reference.configure_command` and never change it after the
+first diff; the test-inclusive configure for [Diff tests](#diff-tests) is
+recorded apart, as `test_configure_command`.
 
 ### Create initial BUILD.bazel files
 
