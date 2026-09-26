@@ -121,6 +121,8 @@ class DiffNotes:
     bazel_only_defines: Counter = field(default_factory=Counter)
     ndebug_bazel_added: int = 0    # compared TU pairs: Bazel defines, CMake not
     ndebug_bazel_missing: int = 0  # compared TU pairs: CMake defines, Bazel not
+    # cmake_name -> bazel_name, executables aligned by unambiguous basename
+    aligned_by_basename: Dict[str, str] = field(default_factory=dict)
 
 
 def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
@@ -256,14 +258,50 @@ def _apply_target_map(views: Dict[str, TargetView],
     return renamed
 
 
+def _label_basename(name: str) -> str:
+    """'gems:BinRec' -> 'BinRec'; ':bssl' -> 'bssl' (Bazel names are labels)."""
+    return name.rsplit(":", 1)[-1]
+
+
+def _align_by_basename(a_views: dict, b_views: dict,
+                       mapped: frozenset = frozenset()) -> Dict[str, str]:
+    """cmake_name -> bazel_name for every CMake executable with no exact-name
+    counterpart whose name is the basename of EXACTLY ONE unaligned Bazel
+    executable (CMake keys executables by bare name, Bazel by package-qualified
+    label, so without this every executable needed a target_map entry). Two
+    Bazel executables sharing the basename are ambiguous and left alone: that
+    case, and genuine renames, still need target_map. External-repo labels
+    ('@...') never align, and neither does a CMake name in `mapped` (a
+    target_map key): its explicit entry decides, even if it names a Bazel
+    target that does not exist. Values need only a `.kind`: model targets
+    and reconstructed views both work."""
+    by_base: Dict[str, List[str]] = {}
+    for name, v in b_views.items():
+        if (v.kind == TargetKind.EXECUTABLE and name not in a_views
+                and not name.startswith("@")):
+            by_base.setdefault(_label_basename(name), []).append(name)
+    return {name: by_base[name][0] for name, v in sorted(a_views.items())
+            if v.kind == TargetKind.EXECUTABLE and name not in b_views
+            and name not in mapped and len(by_base.get(name, ())) == 1}
+
+
 def _bazel_renames(a: CanonicalModel, b: CanonicalModel,
                    cfg: "MigrationConfig") -> Dict[str, str]:
     """Bazel label -> the name it is compared under, for every Bazel target the
-    diff renames (target_map). The ONE place that decision is made: the
-    comparison and the summaries apply it the same way, so an exclude_targets
-    entry (a CMake name) reaches a renamed Bazel target everywhere."""
-    return {bazel: cmake for cmake, bazel in cfg.target_map.items()
-            if bazel in b.targets}
+    diff renames: target_map entries first, then the automatic alignment of
+    executables by unambiguous label basename (see _align_by_basename), which
+    never overrides a target_map key. The ONE place that decision is made:
+    the comparison and the summaries apply it the same way, so an
+    exclude_targets entry (a CMake name) reaches a renamed Bazel target
+    everywhere."""
+    renames = {bazel: cmake for cmake, bazel in cfg.target_map.items()
+               if bazel in b.targets}
+    renamed = {renames.get(label, label): t for label, t in b.targets.items()}
+    label_of = {name: label for label, name in renames.items()}
+    for cmake, name in _align_by_basename(a.targets, renamed,
+                                          frozenset(cfg.target_map)).items():
+        renames[label_of.get(name, name)] = cmake
+    return renames
 
 
 _LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
@@ -434,6 +472,11 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     view_map = dict(cfg.target_map)
     view_map.update({name: label for label, name in renames.items()})
     b_views = _apply_target_map(reconstruct(b), view_map)
+    if notes is not None:
+        explicit = set(cfg.target_map.values())
+        notes.aligned_by_basename.update(
+            {name: label for label, name in renames.items()
+             if label not in explicit})
     a_names = _participating(a_views, cfg)
     b_names = _participating(b_views, cfg)
 
@@ -802,6 +845,7 @@ def summarize(discs: List[Discrepancy],
             "link": _by_count(notes.bazel_only_link_flags),  # flag -> executables
             "defines": _by_count(notes.bazel_only_defines),  # define -> TU pairs
         }
+        result["aligned_by_basename"] = dict(sorted(notes.aligned_by_basename.items()))
     return result
 
 

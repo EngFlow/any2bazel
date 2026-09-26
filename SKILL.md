@@ -80,8 +80,10 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
   path**, so names and grouping don't matter — a rename or object-library
   fold-in converges with no mapping. Only **external** link deps are checked;
   internal dep names are noise.
-- **Executables** align by **name** (a missing exe is a real gap); use
-  `target_map` for renames.
+- **Executables** align by **name** (a missing exe is a real gap), or with the
+  one Bazel executable whose label basename matches (`BinRec` ↔ `gems:BinRec`;
+  see `aligned_by_basename` in `diff.json`). Use `target_map` for renames and
+  for a basename two packages share.
 
 ### Canonicalization
 
@@ -131,8 +133,10 @@ Fields:
   reproducible; `diff.py` refuses an entry that is neither a flag nor a flag's
   value.
 - **`target_map`** — `reference_name → bazel_name` for intentionally renamed
-  **executables**. Bazel targets are keyed by full label, so the value is
-  usually `:name` (e.g. `"bssl": ":bssl"`). Libraries need no mapping.
+  **executables**, or when two Bazel packages share the basename. The value is
+  the label without `//`: `:name` at the root, `pkg:name` elsewhere (e.g.
+  `"bssl": "tool:bssl"`). Same-named executables align without an entry;
+  libraries need no mapping.
 - **`dep_map`** — `reference_dep_name → bazel_dep_name` for an **external link
   dep** spelled differently per build (e.g. `Catch2Main` vs `catch2_main`). An
   explicit, recorded rename — not a fuzzy match — so a residual `missing_dep` is
