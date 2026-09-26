@@ -46,6 +46,23 @@ python3 "$SKILL_DIR/scripts/extract_cmake.py" <build> <repo_root> model.cmake.js
 The project flags passed to `cmake` define the platform/options the Bazel
 aquery must mirror.
 
+## Writing the BUILD files
+
+What is specific to CMake when
+[creating the BUILD files](../SKILL.md#create-build-files).
+
+### Build type
+
+`--compilation_mode` is not a translation of `CMAKE_BUILD_TYPE`: Release is
+`-O3 -DNDEBUG` where Bazel's `opt` is `-O2 -DNDEBUG`, and Debug is `-g` where
+Bazel's default `fastbuild` has neither. A project may set its own default
+build type in `CMakeLists.txt` even when none is passed. Read the reference's
+level (`levels` in `diff.json`, or `CMAKE_<LANG>_FLAGS_<CONFIG>` in the cache)
+and pin it in `.bazelrc`, e.g. `build -c opt` plus `build --copt=-O3`. `opt`
+also turns assertions off where the reference keeps them (`ndebug` in
+`diff.json`); `build --copt=-UNDEBUG` undoes the toolchain's `-DNDEBUG`, not
+one in a rule's `copts`.
+
 ## CMake-specific comparison notes
 
 - **Target names** in `target_map` and `exclude_targets` keys are CMake target
