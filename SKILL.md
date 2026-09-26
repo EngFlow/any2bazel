@@ -127,12 +127,11 @@ whether its frontend reads it:
 ```
 
 Fields:
-- **`bazel_args`** — the extra **flags** aquery must run with to mirror the
-  real build (see [Extract the Bazel action graph](#extract-bazel-graph)), e.g.
-  `["--config=release"]` or `["-c", "opt"]`; never a command
-  (`["aquery", "mnemonic(...)", ...]` is wrong). Recorded so the comparison is
-  reproducible; `diff.py` refuses an entry that is neither a flag nor a flag's
-  value.
+- **`bazel_args`** — the extra **flags** aquery must run with (see
+  [Extract the Bazel action graph](#extract-bazel-graph)): only what the
+  project's documented build passes, as in the example (BoringSSL expects
+  `-fno-exceptions` at top level). Never a command (`["aquery", ...]`):
+  `diff.py` refuses it. Recorded so the comparison is reproducible.
 - **`target_map`** — `reference_name → bazel_name` for intentionally renamed
   **executables**, or when two Bazel packages share the basename. The value is
   the label without `//`: `:name` at the root, `pkg:name` elsewhere (e.g.
@@ -275,6 +274,10 @@ instead of being a warning nobody reads.
 > - Use the **same platform/options** as the reference build in
 >   [Extract the reference model](#extract-reference-model), or the two sides
 >   aren't comparable.
+> - For settings **you** add to mirror the reference (e.g. Release's level),
+>   use `.bazelrc` `build` lines, not a named `--config`. Parity must hold for
+>   the project's documented build command: a plain `bazel build //...` unless
+>   the project documents flags, and only those go in `bazel_args`.
 > - **Always** call aquery with `--features=-compiler_param_file` and
 >   `--features=-linker_param_file` to disable use of param files. Param files
 >   are never generated during `aquery` calls, so when they're in use they'll
