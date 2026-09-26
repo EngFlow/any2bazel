@@ -234,17 +234,79 @@ _LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
                   TargetKind.INTERFACE}
 
 
+def _add_variants(out: Dict[str, List[TranslationUnit]], tus,
+                  cfg: "MigrationConfig") -> None:
+    """Add TUs to a source-keyed map of DISTINCT variants (see _union_tus)."""
+    for tu in tus:
+        variants = out.setdefault(cfg.map_source(tu.key()), [])
+        if tu not in variants:
+            variants.append(tu)
+
+
 def _union_tus(views: Dict[str, TargetView], names,
-               cfg: "MigrationConfig") -> Dict[str, TranslationUnit]:
+               cfg: "MigrationConfig") -> Dict[str, List[TranslationUnit]]:
     """Pool TUs of the given target views into one source-keyed map (the TU-SET
     comparison): grouping/renames/fold-ins don't matter -- every compiled source
     lands in one flat map keyed by repo-relative path. Keys are run through
     cfg.map_source so generated-source grouping asymmetries (e.g. CMake's single
-    AUTOMOC bundle vs Bazel's per-header moc_*.cpp) collapse to one token."""
-    out: Dict[str, TranslationUnit] = {}
-    for n in names:
-        for tu in views[n].tus:
-            out.setdefault(cfg.map_source(tu.key()), tu)
+    AUTOMOC bundle vs Bazel's per-header moc_*.cpp) collapse to one token.
+
+    Each key holds every DISTINCT variant of that source: one source compiled
+    into several libraries with different flags (a lite and a full build of the
+    same file, a hardened variant) is several TUs, and _diff_variants compares
+    all of them. Names are visited in sorted order so the result never depends
+    on set iteration order (i.e. on PYTHONHASHSEED)."""
+    out: Dict[str, List[TranslationUnit]] = {}
+    for n in sorted(names):
+        _add_variants(out, views[n].tus, cfg)
+    return out
+
+
+def _tu_distance(a: TranslationUnit, b: TranslationUnit,
+                 cfg: "MigrationConfig") -> int:
+    """Size of the symmetric difference of two TUs' define, flag and include
+    sets, after the reviewer's ignores. Unlike the discrepancies, this counts
+    flags only one side has, so an exact variant beats a noisy one (-w,
+    -Wno-error=...) that happens to produce the same discrepancies."""
+    ad = {d for d in a.defines if not cfg.define_ignored(d)}
+    bd = {d for d in b.defines if not cfg.define_ignored(d)}
+    af = {f for f in a.flags if not cfg.flag_ignored(f)}
+    bf = {f for f in b.flags if not cfg.flag_ignored(f)}
+    ai = set(_norm_includes(a.includes, cfg))
+    bi = set(_norm_includes(b.includes, cfg))
+    return len(ad ^ bd) + len(af ^ bf) + len(ai ^ bi)
+
+
+def _rank(discs: List[Discrepancy], distance: int) -> tuple:
+    """Order candidate pairings: fewest errors, then fewest warnings, then the
+    smallest distance between the two TUs (see _tu_distance), then a stable
+    text form so ties never depend on iteration order."""
+    errors = sum(1 for d in discs if d.severity == Severity.ERROR.value)
+    return (errors, len(discs) - errors, distance,
+            json.dumps([asdict(d) for d in discs], sort_keys=True))
+
+
+def _best_match(target: str, a: TranslationUnit, b_vs: List[TranslationUnit],
+                cfg: "MigrationConfig"):
+    """(discrepancies, chosen Bazel TU) for CMake TU `a` against its
+    best-ranked Bazel variant (see _rank)."""
+    return min(((_diff_tu(target, a, b, cfg), b) for b in b_vs),
+               key=lambda pair: _rank(pair[0], _tu_distance(a, pair[1], cfg)))
+
+
+def _diff_variants(target: str, a_vs: List[TranslationUnit],
+                   b_vs: List[TranslationUnit],
+                   cfg: "MigrationConfig") -> List[Discrepancy]:
+    """Compare every CMake variant of one source against its BEST-matching Bazel
+    variant (fewest errors, then warnings, then distance; see _rank).
+    Every CMake variant must be matched by some Bazel variant, so nothing is
+    suppressed: a variant Bazel lacks shows up as that variant's discrepancies
+    against its closest match. An extra Bazel-only variant is tolerated, like
+    any extra Bazel flag. With one variant per side this is exactly one
+    _diff_tu call."""
+    out: List[Discrepancy] = []
+    for a in a_vs:
+        out.extend(_best_match(target, a, b_vs, cfg)[0])
     return out
 
 
@@ -272,7 +334,7 @@ def _union_java_sources(views: Dict[str, TargetView], names) -> Dict[str, str]:
     (Maven's 2 groups vs Bazel's 1) is irrelevant; the SOURCE SET is what must
     match. First occurrence wins for the displayed original path."""
     out: Dict[str, str] = {}
-    for n in names:
+    for n in sorted(names):
         for g in views[n].compile_groups:
             for src in g.sources:
                 out.setdefault(_java_src_key(src), src)
@@ -345,7 +407,7 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
         out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                "<libraries>", "source compiled in bazel but not cmake", tu=src))
     for src in sorted(set(a_union) & set(b_union)):
-        out.extend(_diff_tu("<libraries>", a_union[src], b_union[src], cfg))
+        out.extend(_diff_variants("<libraries>", a_union[src], b_union[src], cfg))
 
     # ---- executables: identity-aligned, own TUs + own flags ----------------
     for name in sorted(a_exes - b_exes):
@@ -358,8 +420,10 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
         ta, tb = a_views[name], b_views[name]
         # TU keys go through cfg.map_source (see _union_tus) so codegen grouping
         # asymmetries collapse to a shared token on both sides.
-        amap = {cfg.map_source(k): v for k, v in ta.tu_map().items()}
-        bmap = {cfg.map_source(k): v for k, v in tb.tu_map().items()}
+        amap: Dict[str, List[TranslationUnit]] = {}
+        bmap: Dict[str, List[TranslationUnit]] = {}
+        _add_variants(amap, ta.tus, cfg)
+        _add_variants(bmap, tb.tus, cfg)
         # Presence is judged against the whole other side (a_all/b_all), not just
         # this exe's own TUs: a source this exe compiles may live in a library on
         # the other side (or vice versa) -- that's a grouping difference, not a
@@ -372,7 +436,7 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
             out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                    name, "source compiled in bazel but not cmake", tu=src))
         for src in sorted(set(amap) & set(bmap)):
-            out.extend(_diff_tu(name, amap[src], bmap[src], cfg))
+            out.extend(_diff_variants(name, amap[src], bmap[src], cfg))
         # link flags: asymmetric subset, same policy as compile flags -- every
         # CMake link flag must be present on the Bazel side; extra Bazel link
         # flags tolerated (toolchain link noise already stripped). Reviewer
@@ -468,7 +532,7 @@ def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
         out.append(Discrepancy(Kind.EXTRA_TEST_TU.value, Severity.WARN.value,
                                "<tests>", "test source compiled in bazel but not cmake", tu=src))
     for src in sorted(set(a_union) & set(b_union)):
-        out.extend(_diff_tu("<tests>", a_union[src], b_union[src], cfg))
+        out.extend(_diff_variants("<tests>", a_union[src], b_union[src], cfg))
 
     # 2. test-binary existence by count
     if len(a_tests) != len(b_tests):
