@@ -46,6 +46,30 @@ def test_groups_by_kind_with_histogram():
     assert kinds["missing_dep"]["cmake_only"][0] == ("z", 1)
 
 
+def test_details_surfaced_per_kind():
+    # the detail line tells the reader HOW to read a kind's histogram: an
+    # includes_diff for a toolchain_includes root the reference lost lives
+    # under bazel_only, and only its detail says so
+    diff = {"converged": False, "errors": 2, "warnings": 0, "discrepancies": [
+        {"kind": "includes_diff", "severity": "error", "target": "<libraries>",
+         "tu": "a.c", "detail": "cmake include root missing on bazel side",
+         "cmake_only": ["/sdk/include/fortify"], "bazel_only": []},
+        {"kind": "includes_diff", "severity": "error", "target": "<libraries>",
+         "tu": "b.c", "detail": "toolchain include root (toolchain_includes) not on "
+         "the cmake side: stale config, or the reference lost it",
+         "cmake_only": [], "bazel_only": ["/sdk/staging/usr/include"]},
+    ]}
+    t = triage(diff)
+    k = t["kinds"][0]
+    assert dict(k["details"]) == {
+        "cmake include root missing on bazel side": 1,
+        "toolchain include root (toolchain_includes) not on the cmake side: "
+        "stale config, or the reference lost it": 1}
+    text = render(t)
+    assert "toolchain include root (toolchain_includes)" in text
+    assert "1  /sdk/staging/usr/include" in text
+
+
 def test_kinds_sorted_by_frequency():
     t = triage(DIFF)
     counts = [k["count"] for k in t["kinds"]]

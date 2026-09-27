@@ -522,6 +522,126 @@ def test_include_map_collapses_bazel_duplicate_roots():
     assert summarize(diff_models(a, b, cfg))["converged"]
 
 
+def _tc_models(cmake_inc, bazel_inc):
+    """CMake/Bazel single-TU models differing only in include roots."""
+    a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"] + cmake_inc, is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"] + bazel_inc, is_bazel=True),
+               is_bazel=True)
+    return a, b
+
+
+def test_toolchain_include_implicit_on_bazel_required_on_cmake():
+    # A wrapped cross toolchain: the reference spells the wrapper's root on
+    # every TU (-I<sdk>/usr/include via CMAKE_C_FLAGS); Bazel's aquery argv
+    # never has it, because the wrapper adds -idirafter at execution time.
+    # Declared as toolchain-provided, the root is excused on the Bazel side.
+    a, b = _tc_models(["-I", "/sdk/staging/usr/include", "-I", "/work/proj/include"],
+                      ["-I", "/work/proj/include"])
+    assert not summarize(diff_models(a, b))["converged"]  # unaided: looks like a gap
+    cfg = MigrationConfig(toolchain_includes=("/sdk/staging/usr/include",))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
+def test_toolchain_include_absent_on_cmake_is_an_error():
+    # THE difference from include_prefixes: the config asserts the reference
+    # carries the root, so the reference LOSING it (or a stale assertion) is
+    # caught. include_prefixes deletes the root from both sides and never
+    # notices.
+    a, b = _tc_models(["-I", "/work/proj/include"], ["-I", "/work/proj/include"])
+    cfg = MigrationConfig(toolchain_includes=("/sdk/staging/usr/include",))
+    discs = diff_models(a, b, cfg)
+    d = next(x for x in discs if x.kind == "includes_diff")
+    assert d.severity == "error", d
+    assert d.bazel_only == ["/sdk/staging/usr/include"] and d.cmake_only == [], d
+    assert "toolchain_includes" in d.detail
+    # the blind spot, for contrast
+    cfg = MigrationConfig(ignore_include_prefixes=("/sdk/staging/usr/include",))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
+def test_toolchain_include_does_not_swallow_a_root_beneath_it():
+    # <staging>/usr/include/json-c is its own search directory: the toolchain
+    # root above it excuses only itself (directory identity, not prefix), so
+    # an unmapped json-c root absent on the Bazel side IS reported --
+    # include_prefixes on the parent would have deleted it unseen.
+    a, b = _tc_models(["-I", "/sdk/staging/usr/include",
+                       "-I", "/sdk/staging/usr/include/json-c"], [])
+    cfg = MigrationConfig(toolchain_includes=("/sdk/staging/usr/include",))
+    discs = diff_models(a, b, cfg)
+    d = next(x for x in discs if x.kind == "includes_diff")
+    assert d.cmake_only == ["/sdk/staging/usr/include/json-c"], d
+    assert len([x for x in discs if x.kind == "includes_diff"]) == 1, discs
+    cfg = MigrationConfig(ignore_include_prefixes=("/sdk/staging/usr/include",))
+    assert summarize(diff_models(a, b, cfg))["converged"]  # the blind spot
+
+
+def test_toolchain_include_composes_with_include_map():
+    # The json-c root spelled differently per side: an include_map entry
+    # claims it (longer than the toolchain root, so it is its own directory
+    # either way), rewrites both spellings to one token and verifies
+    # presence; the toolchain root still governs itself.
+    a, b = _tc_models(["-I", "/sdk/staging/usr/include",
+                       "-I", "/sdk/staging/usr/include/json-c"],
+                      ["-I", "/work/proj/external/staging/include/json-c"])
+    cfg = MigrationConfig(
+        toolchain_includes=("/sdk/staging/usr/include",),
+        include_map=(("/sdk/staging/usr/include/json-c", "@json-c"),
+                     ("external/staging/include/json-c", "@json-c")))
+    assert summarize(diff_models(a, b, cfg))["converged"]
+    # ... and the map still catches json-c genuinely absent on the Bazel side
+    a2, b2 = _tc_models(["-I", "/sdk/staging/usr/include",
+                         "-I", "/sdk/staging/usr/include/json-c"], [])
+    discs = diff_models(a2, b2, cfg)
+    assert [x.cmake_only for x in discs if x.kind == "includes_diff"] == [["@json-c"]], discs
+    # A map whose from-prefix is SHORTER than the toolchain root cannot
+    # rewrite the toolchain root out of the required-on-cmake check (the
+    # toolchain root is decided first, on the exact directory) ...
+    cfg = MigrationConfig(toolchain_includes=("/sdk/staging/usr/include",),
+                          include_map=(("/sdk/staging", "@staging"),))
+    a3, b3 = _tc_models(["-I", "/work/proj/include"], ["-I", "/work/proj/include"])
+    assert any(x.kind == "includes_diff" and x.bazel_only == ["/sdk/staging/usr/include"]
+               for x in diff_models(a3, b3, cfg))
+    # ... nor out of being excused on the Bazel side
+    a4, b4 = _tc_models(["-I", "/sdk/staging/usr/include"], [])
+    assert summarize(diff_models(a4, b4, cfg))["converged"]
+
+
+def test_toolchain_include_composes_with_include_prefixes():
+    # Both levers at once: the toolchain root is decided first, so a prefix
+    # ignore that also matches it neither deletes it from the required check
+    # nor stops it excusing the Bazel side; the prefix still deletes the
+    # OTHER roots under it (here an empty sysroot dir with nothing to verify).
+    cfg = MigrationConfig(toolchain_includes=("/sdk/staging/usr/include",),
+                          ignore_include_prefixes=("/sdk/",))
+    a, b = _tc_models(["-I", "/sdk/staging/usr/include",
+                       "-I", "/sdk/toolchain/usr/include"], [])
+    assert summarize(diff_models(a, b, cfg))["converged"]
+    a2, b2 = _tc_models(["-I", "/sdk/toolchain/usr/include"], [])
+    discs = diff_models(a2, b2, cfg)
+    assert [x.bazel_only for x in discs if x.kind == "includes_diff"] == \
+        [["/sdk/staging/usr/include"]], discs
+
+
+def test_toolchain_include_matches_by_directory_identity():
+    # Spelling differences that name the same directory (trailing slash, `..`
+    # segments) match; a Bazel toolchain that ALSO passes the root explicitly
+    # (a feature flag_set) is fine; a sibling that merely shares the prefix
+    # string is not the same directory.
+    cfg = MigrationConfig(toolchain_includes=("/sdk/staging/usr/include/",))
+    assert cfg.toolchain_includes == ("/sdk/staging/usr/include",)
+    a, b = _tc_models(["-I", "/sdk/staging/usr/lib/../include/"], [])
+    assert summarize(diff_models(a, b, cfg))["converged"]
+    a, b = _tc_models(["-I", "/sdk/staging/usr/include"],
+                      ["-isystem", "/sdk/staging/usr/include"])
+    assert summarize(diff_models(a, b, cfg))["converged"]
+    a, b = _tc_models(["-I", "/sdk/staging/usr/include-fixed"], [])
+    discs = diff_models(a, b, cfg)
+    assert [x.cmake_only for x in discs if x.cmake_only] == \
+        [["/sdk/staging/usr/include-fixed"]], discs      # not excused ...
+    assert [x.bazel_only for x in discs if x.bazel_only] == \
+        [["/sdk/staging/usr/include"]], discs            # ... and the real root is missing
+
+
 def test_exclude_targets_suppresses_structural_diffs():
     # A whole target present only in cmake (e.g. vendored third-party) produces
     # missing_tu/missing_target unless excluded. exclude_targets is the only
@@ -568,6 +688,7 @@ def test_config_loads_all_fields_from_json():
             "include_prefixes": ["third_party/"],
             "include_map": [{"from": "external/absl+", "to": "@absl"}],
         },
+        "toolchain_includes": ["/sdk/staging/usr/include/"],
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(obj, f)
@@ -585,6 +706,8 @@ def test_config_loads_all_fields_from_json():
     assert cfg.link_flag_ignored("-Wl,--gc-sections")  # prefix match
     assert cfg.include_ignored("third_party/gtest/include")
     assert cfg.map_include("external/absl+/base") == "@absl/base"  # rewrite
+    assert cfg.toolchain_root("/sdk/staging/usr/include") == "/sdk/staging/usr/include"
+    assert cfg.toolchain_root("/sdk/staging/usr/include/json-c") is None  # identity, not prefix
 
 
 def _test_models(cmake_test_srcs, bazel_test_srcs, n_cmake_bins=1, n_bazel_bins=1):
