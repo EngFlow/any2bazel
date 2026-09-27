@@ -725,6 +725,138 @@ def test_shared_static_twin_representative_is_deterministic():
     assert len(outs) == 1, outs
 
 
+
+# ---- shared/static twins: a source compiled several ways matches ANY variant
+
+def _twin_models(shared_raw, static_raw, bazel_raws, src="foo/a.cpp"):
+    """CMake's shared/static twin: add_library(foo SHARED ${SOURCES}) +
+    add_library(foo-static STATIC ${SOURCES}), each compiling `src` with its
+    own argv. Bazel: one cc_library per entry of bazel_raws (label, argv)."""
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("foo", TargetKind.SHARED, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw(src, shared_raw, is_bazel=False)]))
+    a.add(Target("foo-static", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw(src, static_raw, is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    for label, raw in bazel_raws:
+        b.add(Target(label, TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw(src, raw, is_bazel=True)]))
+    return a, b
+
+
+def test_twin_bazel_tu_matching_the_static_variant_converges():
+    # The SHARED twin carries -Dfoo_EXPORTS and -fPIC; the STATIC twin
+    # neither. Bazel's non-PIC cc_library matches the static twin exactly.
+    # With one representative per source (`foo` sorts before `foo-static`)
+    # this was a defines_diff unless *_EXPORTS was suppressed.
+    a, b = _twin_models(["-Dfoo_EXPORTS", "-DX=1", "-fPIC"], ["-DX=1"],
+                        [(":foo", ["-DX=1"])])
+    discs = diff_models(a, b)
+    assert discs == [], discs
+    assert summarize(discs)["converged"]
+
+
+def test_twin_bazel_tu_matching_the_shared_variant_converges():
+    # The mirror: Bazel builds the PIC object with the shared twin's argv.
+    a, b = _twin_models(["-Dfoo_EXPORTS", "-DX=1", "-fPIC"], ["-DX=1"],
+                        [(":foo", ["-Dfoo_EXPORTS", "-DX=1", "-fPIC"])])
+    assert diff_models(a, b) == []
+
+
+def test_twin_pic_only_bazel_tu_converges_without_ignoring_exports():
+    # Bazel compiles PIC (-fPIC) but has no EXPORTS marker. The static twin
+    # is satisfied (extra Bazel flags are tolerated), so no ignore.defines
+    # entry for foo_EXPORTS is needed.
+    a, b = _twin_models(["-Dfoo_EXPORTS", "-DX=1", "-fPIC"], ["-DX=1"],
+                        [(":foo", ["-DX=1", "-fPIC"])])
+    assert diff_models(a, b) == []
+
+
+def test_twin_bazel_matches_neither_variant_reports_closest():
+    # Bazel drops a define both twins carry (-DX=1): neither variant is
+    # satisfied. The report is against the CLOSEST variant (fewest missing
+    # tokens: the static twin, 1 token vs 2) and names both the chosen CMake
+    # target and the Bazel target.
+    a, b = _twin_models(["-Dfoo_EXPORTS", "-DX=1", "-fPIC"], ["-DX=1"],
+                        [(":foo", ["-DY=2"])])
+    discs = diff_models(a, b)
+    errs = [d for d in discs if d.severity == "error"]
+    assert len(errs) == 1 and errs[0].kind == "defines_diff", discs
+    assert errs[0].cmake_only == ["X=1"], errs[0]
+    assert errs[0].bazel_only == ["Y=2"], errs[0]
+    assert errs[0].target == "<libraries>" and errs[0].tu == "foo/a.cpp"
+    assert "foo-static" in errs[0].detail and "static_library" in errs[0].detail, errs[0].detail
+    assert "bazel TU from :foo" in errs[0].detail, errs[0].detail
+    assert not summarize(discs)["converged"]
+
+
+def test_twin_closest_tie_prefers_the_same_kind():
+    # Equally far from both twins (one missing token each): a PIC Bazel TU is
+    # reported against the SHARED twin, a non-PIC one against the STATIC twin.
+    shared, static = ["-Dfoo_EXPORTS", "-DX=1", "-fPIC"], ["-DSTATIC_ONLY", "-DX=1"]
+    a, b = _twin_models(shared, static, [(":foo", ["-DX=1", "-fPIC"])])
+    d = [d for d in diff_models(a, b) if d.severity == "error"]
+    assert len(d) == 1 and d[0].cmake_only == ["foo_EXPORTS"], d
+    assert "cmake variants: foo [shared_library]" in d[0].detail, d[0].detail
+    a, b = _twin_models(shared, static, [(":foo", ["-DX=1"])])
+    d = [d for d in diff_models(a, b) if d.severity == "error"]
+    assert len(d) == 1 and d[0].cmake_only == ["STATIC_ONLY"], d
+    assert "cmake variants: foo-static [static_library]" in d[0].detail, d[0].detail
+
+
+def test_twin_every_bazel_variant_must_match_one_cmake_variant():
+    # Bazel mirrors the twin (two cc_library targets): each Bazel TU is
+    # checked on its own. Both fine -> converged; one wrong -> exactly that
+    # one is reported, naming its Bazel target.
+    shared, static = ["-Dfoo_EXPORTS", "-DX=1", "-fPIC"], ["-DX=1"]
+    a, b = _twin_models(shared, static, [(":foo", shared), (":foo_static", static)])
+    assert diff_models(a, b) == []
+    a, b = _twin_models(shared, static, [(":foo", shared), (":foo_static", ["-DZ"])])
+    errs = [d for d in diff_models(a, b) if d.severity == "error"]
+    assert len(errs) == 1 and "bazel TU from :foo_static" in errs[0].detail, errs
+
+
+def test_single_variant_detail_is_unchanged():
+    # No twin on either side: the detail text stays exactly as before.
+    a = _model(tu_from_raw("src/a.cpp", ["-DFOO=1"], is_bazel=False))
+    b = _model(tu_from_raw("src/a.cpp", [], is_bazel=True), is_bazel=True)
+    d = diff_models(a, b)
+    assert len(d) == 1 and d[0].detail == "defines differ", d
+
+
+def test_twin_ignore_defines_lever_still_applies():
+    # A shared-only library (no static twin) whose Bazel cc_library omits the
+    # *_EXPORTS marker still needs ignore.defines.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("plugin", TargetKind.SHARED, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("v.c", ["-Dplugin_EXPORTS", "-fPIC"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target(":plugin", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("v.c", ["-fPIC"], is_bazel=True)]))
+    d = diff_models(a, b)
+    assert [x.kind for x in d] == ["defines_diff"] and d[0].cmake_only == ["plugin_EXPORTS"], d
+    cfg = MigrationConfig(ignore_defines={"plugin_EXPORTS"})
+    assert summarize(diff_models(a, b, cfg))["converged"]
+
+
+def test_test_tu_union_matches_any_variant_when_opted_in():
+    # The test-TU union shares the code path: a test source compiled in two
+    # test binaries with different defines is matched by either.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("t1", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("t/x.cc", ["-DA"], is_bazel=False)]))
+    a.add(Target("t2", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("t/x.cc", ["-DB"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("t1", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("t/x.cc", ["-DB"], is_bazel=True)]))
+    b.add(Target("t2", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("t/x.cc", ["-DB"], is_bazel=True)]))
+    cfg = MigrationConfig(include_tests=True)
+    discs = [d for d in diff_models(a, b, cfg) if d.kind != "test_binary_count"]
+    assert discs == [], discs
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

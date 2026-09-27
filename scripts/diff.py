@@ -18,7 +18,10 @@ Produces a worklist of discrepancies for the fix loop. Each iteration of the
 migrate loop calls this; an empty worklist (for a full round) means "done".
 Parity has two stages, both reported here:
   COMPILE PARITY    -- per-TU flag/define/include equivalence (project-wide
-                       TU-set) + external link-dependency closure.
+                       TU-set; a source the reference compiles several ways,
+                       e.g. in a shared/static twin, is matched against ANY of
+                       its variants -- see _union_tus) + external
+                       link-dependency closure.
   LINK CONSISTENCY  -- per name-aligned executable/shared-lib, equivalent link
                        flags (link_flags_diff).
 
@@ -34,7 +37,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES
 from config import MigrationConfig
@@ -224,21 +227,121 @@ _LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
                   TargetKind.INTERFACE}
 
 
+@dataclass
+class TUVariant:
+    """One compilation of a source by one target: the TU plus who compiled it.
+    A source compiled by several targets of a side (CMake's shared/static
+    twins; a Bazel cc_library built both PIC and non-PIC) has several."""
+    tu: TranslationUnit
+    target: str
+    kind: str          # TargetKind value of the owning target
+
+    def signature(self):
+        return (self.tu.defines, self.tu.includes, self.tu.flags)
+
+
 def _union_tus(views: Dict[str, TargetView], names,
-               cfg: "MigrationConfig") -> Dict[str, TranslationUnit]:
+               cfg: "MigrationConfig") -> Dict[str, List[TUVariant]]:
     """Pool TUs of the given target views into one source-keyed map (the TU-SET
     comparison): grouping/renames/fold-ins don't matter -- every compiled source
     lands in one flat map keyed by repo-relative path. Keys are run through
     cfg.map_source so generated-source grouping asymmetries (e.g. CMake's single
-    AUTOMOC bundle vs Bazel's per-header moc_*.cpp) collapse to one token."""
-    # Deterministic: `names` is usually a set, and the first TU wins below, so
-    # a source compiled by two targets with different flags (a shared/static
-    # twin: -Dfoo_EXPORTS, -fPIC) would otherwise be represented by whichever
-    # target Python's hash seed enumerates first -- a diff that flips per run.
-    out: Dict[str, TranslationUnit] = {}
+    AUTOMOC bundle vs Bazel's per-header moc_*.cpp) collapse to one token.
+
+    EVERY VARIANT of a source is kept, in sorted-target order (sorted: `names`
+    is usually a set, and the report must not depend on the hash seed).
+    CMake's shared/static twin (add_library(foo SHARED) + add_library(
+    foo-static STATIC) from one source list) compiles each file twice with
+    different argv (-Dfoo_EXPORTS, -fPIC, sometimes project defines), and a
+    Bazel cc_library compiles it once, PIC or not as the toolchain decides --
+    or twice when both a binary and a cc_shared_library consume it. Keeping
+    one representative would compare the Bazel TU against an arbitrary twin,
+    so migrations would rename targets or suppress *_EXPORTS markers to land
+    on the twin they match. Instead the comparison (_diff_tu_variants)
+    accepts a Bazel TU that satisfies ANY CMake variant. Two targets
+    compiling a source with identical canonical argv contribute one variant
+    (the first in sorted order names it)."""
+    out: Dict[str, List[TUVariant]] = {}
+    seen: Dict[str, set] = {}
     for n in sorted(names):
         for tu in views[n].tus:
-            out.setdefault(cfg.map_source(tu.key()), tu)
+            key = cfg.map_source(tu.key())
+            v = TUVariant(tu, n, views[n].kind.value)
+            sig = v.signature()
+            if sig in seen.setdefault(key, set()):
+                continue
+            seen[key].add(sig)
+            out.setdefault(key, []).append(v)
+    return out
+
+
+def _pic(v: TUVariant) -> bool:
+    """Is this variant the position-independent one? A CMake SHARED target's
+    objects are PIC by construction; otherwise the argv says (-fPIC/-fpic).
+    Used only as a tie-break when two variants are equally close."""
+    return (v.kind == TargetKind.SHARED.value
+            or any(f in ("-fPIC", "-fpic", "-fPIE", "-fpie") for f in v.tu.flags))
+
+
+def _variant_distance(discs: List[Discrepancy]) -> Tuple[int, int]:
+    """How far a Bazel TU is from one CMake variant, from _diff_tu's findings:
+    (tokens the Bazel side is MISSING -- the errors -- , tokens it has EXTRA at
+    warn level). An error without a cmake_only list counts as one token."""
+    missing = sum(len(d.cmake_only or []) or 1 for d in discs
+                  if d.severity == Severity.ERROR.value)
+    extra = sum(len(d.bazel_only or []) for d in discs
+                if d.severity != Severity.ERROR.value)
+    return missing, extra
+
+
+def _diff_tu_variants(target: str, a_vars: List[TUVariant], b_var: TUVariant,
+                      cfg: "MigrationConfig", name_variants: bool) -> List[Discrepancy]:
+    """Compare ONE Bazel TU against every CMake variant of the same source.
+
+    The Bazel TU converges if it satisfies the asymmetric checks (_diff_tu)
+    against AT LEAST ONE variant: nothing is reported then, whichever twin it
+    was. Otherwise the findings against the CLOSEST variant are reported --
+    the one with the fewest missing tokens, then the fewest extra ones, then
+    the one of the same kind as the Bazel TU (PIC objects belong to the shared
+    twin, non-PIC to the static one), then the first in sorted-target order,
+    so the report is deterministic. With `name_variants` (either side has
+    more than one variant of this source) the detail names both the chosen
+    CMake target and the Bazel target the TU came from, so the reader knows
+    which argv pair to look at; a plain one-to-one source keeps the bare
+    detail text.
+    """
+    best = None
+    for av in a_vars:
+        discs = _diff_tu(target, av.tu, b_var.tu, cfg)
+        if not discs:
+            return []
+        missing, extra = _variant_distance(discs)
+        key = (missing, extra, _pic(av) != _pic(b_var))
+        if best is None or key < best[0]:
+            best = (key, av, discs)
+    _, av, discs = best
+    if name_variants:
+        which = (f"closest of {len(a_vars)} cmake variants" if len(a_vars) > 1
+                 else "cmake variant")
+        suffix = (f" ({which}: {av.target} [{av.kind}]; "
+                  f"bazel TU from {b_var.target})")
+        for d in discs:
+            d.detail += suffix
+    return discs
+
+
+def _diff_tu_unions(target: str, a_union: Dict[str, List[TUVariant]],
+                    b_union: Dict[str, List[TUVariant]],
+                    cfg: "MigrationConfig") -> List[Discrepancy]:
+    """The TU-set comparison for the sources both sides compile: every Bazel
+    variant must match some CMake variant (_diff_tu_variants). A CMake
+    variant no Bazel TU matches is not a finding on its own -- Bazel builds
+    a source once (PIC or not) where CMake's twin builds it twice."""
+    out: List[Discrepancy] = []
+    for src in sorted(set(a_union) & set(b_union)):
+        multi = len(a_union[src]) > 1 or len(b_union[src]) > 1
+        for bv in b_union[src]:
+            out.extend(_diff_tu_variants(target, a_union[src], bv, cfg, multi))
     return out
 
 
@@ -325,6 +428,8 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     b_all = _all_source_keys(b_views, cfg)
 
     # ---- libraries: project-wide TU-set comparison -------------------------
+    # Each side's union keeps every variant of a source (shared/static twins);
+    # a Bazel TU passes if it matches ANY CMake variant (_diff_tu_variants).
     a_union = _union_tus(a_views, a_libs, cfg)
     b_union = _union_tus(b_views, b_libs, cfg)
     for src in sorted(set(a_union) - b_all):
@@ -333,8 +438,7 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     for src in sorted(set(b_union) - a_all):
         out.append(Discrepancy(Kind.EXTRA_TU.value, Severity.WARN.value,
                                "<libraries>", "source compiled in bazel but not cmake", tu=src))
-    for src in sorted(set(a_union) & set(b_union)):
-        out.extend(_diff_tu("<libraries>", a_union[src], b_union[src], cfg))
+    out.extend(_diff_tu_unions("<libraries>", a_union, b_union, cfg))
 
     # ---- executables: identity-aligned, own TUs + own flags ----------------
     for name in sorted(a_exes - b_exes):
@@ -456,8 +560,7 @@ def _diff_tests(a_views: Dict[str, TargetView], b_views: Dict[str, TargetView],
     for src in sorted(set(b_union) - a_all):
         out.append(Discrepancy(Kind.EXTRA_TEST_TU.value, Severity.WARN.value,
                                "<tests>", "test source compiled in bazel but not cmake", tu=src))
-    for src in sorted(set(a_union) & set(b_union)):
-        out.extend(_diff_tu("<tests>", a_union[src], b_union[src], cfg))
+    out.extend(_diff_tu_unions("<tests>", a_union, b_union, cfg))
 
     # 2. test-binary existence by count
     if len(a_tests) != len(b_tests):
