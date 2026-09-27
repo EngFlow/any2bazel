@@ -36,7 +36,7 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from canonicalize import canonicalize_flags, canonicalize_link_flags
+from canonicalize import canonicalize_compile, canonicalize_link_flags
 from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
                    TargetKind, TranslationUnit)
 
@@ -238,11 +238,11 @@ def reconstruct_target(t: Target, build_system: BuildSystem,
             src = _source_from_compile_args(act.arguments)
             if not src:
                 continue
-            cdef, cinc, cfl = canonicalize_flags(
+            cdef, cinc, cfl, cquote = canonicalize_compile(
                 list(act.arguments), repo_root, is_bazel=is_bazel)
             view.tus.append(TranslationUnit(
                 source=_rel(src, repo_root), defines=cdef,
-                includes=cinc, flags=cfl))
+                includes=cinc, flags=cfl, quote_only=cquote))
         elif act.mnemonic in _LINK_MNEMONICS:
             # CppArchive (static lib) has no meaningful link flags; only CppLink.
             if act.mnemonic == "CppLink":

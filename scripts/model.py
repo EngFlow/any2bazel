@@ -122,6 +122,11 @@ class TranslationUnit:
     includes: Tuple[str, ...] = ()   # repo-relative, ORDER PRESERVED (search order)
     flags: Tuple[str, ...] = ()      # other copts, canonicalized
     language: str = "CXX"
+    # Roots of `includes` this TU reaches ONLY through -iquote (quoted
+    # includes): Bazel puts the workspace and genfiles roots there for every
+    # compile, so a reference -I root can look present while `<x.h>` still
+    # fails. Subset of `includes`; empty for a CMake TU in practice.
+    quote_only: Tuple[str, ...] = ()
 
     def key(self) -> str:
         return self.source

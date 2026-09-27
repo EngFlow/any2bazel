@@ -113,7 +113,15 @@ BAZEL_DEFAULT_LINK_PREFIXES = (
     "-fexperimental-",
     "-Wl,-install_name",
     "-Wl,-rpath,__BAZEL",       # bazel sandbox rpaths
+    "-pass-exit-codes",         # gcc driver mechanics (unix toolchain link_flags)
 )
+
+# Compile flags with LAST-WINS semantics in the driver: a project copt
+# `-std=c++11` after a toolchain `-std=c++17` is what the compiler honours,
+# so only the last spelling on a side is its language standard; keeping both
+# would let a Bazel side that carries the reference's -std= *and* a later,
+# different one pass as equivalent.
+_LAST_WINS_PREFIXES = ("-std=",)
 
 # Link flags with no correctness meaning on either side (build-type / debug).
 IGNORABLE_LINK_PREFIXES = (
@@ -203,16 +211,37 @@ def canonicalize_flags(
     - includes: repo-relative, ORDER PRESERVED, dedup-adjacent only
     - other_flags: correctness-relevant only (ignorable + bazel-default dropped),
       sorted for stable comparison
+    (canonicalize_compile also reports which roots are quote-only.)
     """
+    return canonicalize_compile(raw, repo_root, is_bazel=is_bazel)[:3]
+
+
+def canonicalize_compile(
+    raw: List[str],
+    repo_root: str,
+    *,
+    is_bazel: bool,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+    """canonicalize_flags plus a fourth element: the include roots this argv
+    reaches ONLY through `-iquote`. `-I`, `-isystem` and `-idirafter` roots
+    serve `#include <x.h>` and `#include "x.h"` alike; an `-iquote` root
+    serves quoted includes only. Bazel puts the workspace root and the
+    genfiles root on `-iquote` for every compile, so a reference `-I<src>`
+    root looks present on the Bazel side while `<x.h>` still cannot find it
+    (zlib's `#include <zconf.h>`). The differ reports such a root as missing
+    rather than present."""
     defines: List[str] = []
     includes: List[str] = []
+    angle: set = set()
+    quote: set = set()
     other: List[str] = []
 
     i = 0
     n = len(raw)
     # On the Bazel side the first argv token is the compiler/wrapper path
-    # (driver mechanics). CMake File-API fragments don't include it.
-    if is_bazel and n and _is_driver_token(raw[0]):
+    # (driver mechanics), whatever its spelling: `/usr/bin/gcc`, a relative
+    # wrapper script, a bare `clang`. CMake File-API fragments never carry it.
+    if is_bazel and n and not raw[0].startswith("-"):
         i = 1
     while i < n:
         tok = raw[i]
@@ -242,10 +271,13 @@ def canonicalize_flags(
 
         # include flavors: -I, -isystem, -iquote, -idirafter (split or joined)
         if tok in ("-I", "-isystem", "-iquote", "-idirafter") and i + 1 < n:
-            includes.append(_to_repo_relative(raw[i + 1], repo_root))
+            root = _to_repo_relative(raw[i + 1], repo_root)
+            includes.append(root)
+            (quote if tok == "-iquote" else angle).add(root)
             i += 2; continue
         if tok.startswith("-I"):
-            includes.append(_to_repo_relative(tok[2:], repo_root)); i += 1; continue
+            root = _to_repo_relative(tok[2:], repo_root)
+            includes.append(root); angle.add(root); i += 1; continue
 
         # drop pure-noise bazel toolchain flags on the bazel side only. NOTE:
         # tolerated-default flags (-fstack-protector, -fdiagnostics-color, ...)
@@ -267,10 +299,16 @@ def canonicalize_flags(
     for inc in includes:
         if not canon_includes or canon_includes[-1] != inc:
             canon_includes.append(inc)
+    # last-wins flags: only the last spelling on this side counts
+    for prefix in _LAST_WINS_PREFIXES:
+        hits = [f for f in other if f.startswith(prefix)]
+        if len(hits) > 1:
+            other = [f for f in other if not f.startswith(prefix)] + [hits[-1]]
     # other flags: order-insensitive for parity
     canon_other = tuple(sorted(set(other)))
+    quote_only = tuple(r for r in canon_includes if r in quote and r not in angle)
 
-    return canon_defines, tuple(canon_includes), canon_other
+    return canon_defines, tuple(canon_includes), canon_other, quote_only
 
 
 def canonicalize_link_flags(raw: List[str], *, is_bazel: bool) -> Tuple[str, ...]:
@@ -290,8 +328,8 @@ def canonicalize_link_flags(raw: List[str], *, is_bazel: bool) -> Tuple[str, ...
     out: List[str] = []
     i = 0
     n = len(raw)
-    if is_bazel and n and _is_link_input(raw[0]):
-        i = 1  # leading linker/wrapper path
+    if is_bazel and n and not raw[0].startswith("-"):
+        i = 1  # leading linker/wrapper path, whatever its spelling
     while i < n:
         tok = raw[i]
         if tok in _LINK_PAIR_FLAGS and i + 1 < n:

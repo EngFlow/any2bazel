@@ -139,6 +139,27 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
             cmake_only=missing,
             bazel_only=[i for i in b_inc if i not in set(a_inc)],
         ))
+    # A root present on both sides but reachable on the Bazel side ONLY
+    # through -iquote is not the same search directory: the reference's -I
+    # serves `#include <x.h>`, Bazel's -iquote does not (Bazel puts the
+    # workspace and genfiles roots on -iquote for every compile, so a
+    # reference `-I<src>` root always *looks* present). Reported apart from
+    # `missing` so the fix reads: make the root angle-capable (`includes`).
+    b_quote = set(_norm_includes(b.quote_only, cfg))
+    a_quote = set(_norm_includes(a.quote_only, cfg))
+    quote_only = [i for i in a_inc
+                  if i in set(b_inc) and i in b_quote and i not in a_quote]
+    if quote_only:
+        out.append(Discrepancy(
+            kind=Kind.INCLUDES_DIFF.value,
+            severity=Severity.ERROR.value,
+            target=target, tu=a.source,
+            detail="cmake include root present on bazel side only as -iquote "
+                   "(quoted includes): `#include <...>` cannot find it there; "
+                   "put it in `includes` or an -I copt",
+            cmake_only=quote_only,
+            bazel_only=[],
+        ))
 
     # other flags: asymmetric subset -- A must be subset of B.
     # Reviewer-approved ignores are dropped from both sides first.

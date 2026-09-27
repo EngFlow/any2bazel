@@ -857,6 +857,68 @@ def test_test_tu_union_matches_any_variant_when_opted_in():
     assert discs == [], discs
 
 
+
+# ---- plain host builds: absolute driver path, -std= twice, -iquote roots ----
+
+def _view_of(model, name):
+    from reconstruct import reconstruct
+    return reconstruct(model)[name]
+
+
+def test_bazel_tool_path_is_never_a_flag():
+    # the auto-configured host toolchain spells the driver absolutely; it
+    # is argv[0] mechanics on both the compile and the link, never a flag
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("pkg:foo", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[Action(mnemonic="CppCompile", arguments=(
+                     "/usr/bin/gcc", "-std=c++17", "-c", "pkg/a.cpp"))]))
+    b.add(_exe("app", ["/usr/bin/gcc", "-o", "bazel-out/bin/app",
+                       "-pass-exit-codes", "-Wl,--gc-sections"], True))
+    assert _view_of(b, "pkg:foo").tus[0].flags == ("-std=c++17",)
+    assert _view_of(b, "app").link_flags == ("-Wl,--gc-sections",)
+    # a CMake fragment never carries a tool; a leading flag is kept
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("foo", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("pkg/a.cpp", ["-std=c++17"], is_bazel=False)]))
+    assert _view_of(a, "foo").tus[0].flags == ("-std=c++17",)
+
+
+def test_std_flag_last_spelling_wins():
+    # the toolchain's -std=c++17 followed by the rule's -std=c++11: the
+    # compiler honours the last one, so that is the Bazel side's standard
+    a = _model(tu_from_raw("src/a.cpp", ["-std=c++11"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-std=c++17", "-Wall", "-std=c++11"], is_bazel=True),
+               is_bazel=True)
+    assert summarize(diff_models(a, b))["converged"]
+    # the other way round the reference's standard is NOT what Bazel compiles
+    b = _model(tu_from_raw("src/a.cpp", ["-std=c++11", "-Wall", "-std=c++17"], is_bazel=True),
+               is_bazel=True)
+    d = diff_models(a, b)
+    assert [x.kind for x in d] == ["flags_diff"] and d[0].cmake_only == ["-std=c++11"], d
+
+
+def test_quote_only_root_does_not_satisfy_a_reference_include_root():
+    # zlib: CMake passes -I<src>; Bazel passes -iquote . for every compile,
+    # which looks like the same root but does not serve `#include <zconf.h>`
+    a = _model(tu_from_raw("a.c", ["-I", "/work/proj", "-DZLIB_BUILD"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("a.c", ["-iquote", ".", "-iquote", "bazel-out/k8-fastbuild/bin",
+                                   "-DZLIB_BUILD"], is_bazel=True), is_bazel=True)
+    d = diff_models(a, b)
+    assert [x.kind for x in d] == ["includes_diff"], d
+    assert d[0].cmake_only == ["."] and "-iquote" in d[0].detail, d[0]
+    assert d[0].severity == Severity.ERROR.value
+    # `includes = ["."]` (-I / -isystem on the same root) satisfies it
+    for extra in (["-I."], ["-isystem", "."]):
+        b = _model(tu_from_raw("a.c", ["-iquote", "."] + extra + ["-DZLIB_BUILD"], is_bazel=True),
+                   is_bazel=True)
+        assert summarize(diff_models(a, b))["converged"], extra
+    # a reference root that is itself -iquote only asks for nothing more
+    a = _model(tu_from_raw("a.c", ["-iquote", "/work/proj"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("a.c", ["-iquote", "."], is_bazel=True), is_bazel=True)
+    assert summarize(diff_models(a, b))["converged"]
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
