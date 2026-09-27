@@ -139,10 +139,31 @@ def _target_id_to_name(codemodel: dict) -> Dict[str, str]:
     return out
 
 
-def _parse_target(tobj: dict, repo_root: str) -> Target:
+def _source_path(path: str, source_dir: Optional[str], repo_root: str) -> str:
+    """Key a codemodel source by its path relative to repo_root.
+
+    The File API spells a source relative to the CMake *top-level source dir*
+    (absolute only when it lives outside it). When the CMake project is not the
+    repo root -- a package vendored under third_party/, a monorepo with several
+    CMake projects -- that spelling never matches the Bazel side, which keys the
+    same file workspace-relative. Anchor it on the codemodel's `paths.source`
+    and re-relativize against repo_root; a source outside repo_root stays
+    absolute (the differ leaves those alone)."""
+    if source_dir and not os.path.isabs(path):
+        path = os.path.normpath(os.path.join(source_dir, path))
+    if os.path.isabs(path) and repo_root:
+        rel = os.path.relpath(path, repo_root)
+        if not rel.startswith(".."):
+            return rel.replace(os.sep, "/")
+    return path.replace(os.sep, "/")
+
+
+def _parse_target(tobj: dict, repo_root: str,
+                  source_dir: Optional[str] = None) -> Target:
     name = tobj["name"]
     kind = _KIND.get(tobj.get("type", ""), TargetKind.UNKNOWN)
-    sources = [s["path"] for s in tobj.get("sources", [])]
+    sources = [_source_path(s["path"], source_dir, repo_root)
+               for s in tobj.get("sources", [])]
 
     # Synthesize one CppCompile Action per source: an argv the differ parses the
     # same way it parses Bazel's. CMake has no real command line, so we build the
@@ -230,6 +251,8 @@ def extract(build_dir: str, repo_root: str,
     reply_dir = os.path.join(build_dir, ".cmake", "api", "v1", "reply")
     codemodel = _find_codemodel(reply_dir)
     id_to_name = _target_id_to_name(codemodel)
+    # top-level CMake source dir; sources are spelled relative to it
+    source_dir = (codemodel.get("paths") or {}).get("source")
 
     model = CanonicalModel(build_system=BuildSystem.CMAKE, repo_root=repo_root)
     include_dirs = set()
@@ -237,7 +260,7 @@ def extract(build_dir: str, repo_root: str,
     for tref in cfg["targets"]:
         with open(os.path.join(reply_dir, tref["jsonFile"])) as f:
             tobj = json.load(f)
-        target = _parse_target(tobj, repo_root)
+        target = _parse_target(tobj, repo_root, source_dir)
         _attach_deps(target, tobj, id_to_name)
         model.add(target)
         for cg in tobj.get("compileGroups", []):

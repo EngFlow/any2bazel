@@ -139,6 +139,23 @@ def test_full_pipeline_converges():
         assert res["errors"] == 0, json.dumps(res, indent=2)
 
 
+def test_cmake_project_below_repo_root_keys_sources_repo_relative():
+    """A CMake project vendored under the repo root (third_party/foo) must key
+    its sources the way the Bazel side does: relative to the REPO root, not to
+    the CMake source dir. The File API spells sources relative to `paths.source`."""
+    with tempfile.TemporaryDirectory() as root:
+        build = _write_cmake_fixture(root)
+        reply = os.path.join(build, ".cmake", "api", "v1", "reply")
+        cm = dict(CODEMODEL)
+        cm["paths"] = {"source": os.path.join(REPO, "third_party", "proj"),
+                       "build": build}
+        with open(os.path.join(reply, "codemodel.json"), "w") as f:
+            json.dump(cm, f)
+        a = extract_cmake.extract(build, REPO)
+        tu = _view(a, "mylib").tus[0]
+        assert tu.source == "third_party/proj/src/a.cpp", tu.source
+
+
 def test_cmake_extracts_canonical_flags():
     with tempfile.TemporaryDirectory() as root:
         build = _write_cmake_fixture(root)
