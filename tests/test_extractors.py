@@ -156,6 +156,65 @@ def test_cmake_project_below_repo_root_keys_sources_repo_relative():
         assert tu.source == "third_party/proj/src/a.cpp", tu.source
 
 
+def test_cmake_subdir_relative_include_roots_are_resolved():
+    """A subdirectory CMakeLists (lua/) doing ADD_DEFINITIONS(-I..) or
+    INCLUDE_DIRECTORIES(..) yields roots that only mean something from the
+    compile's CWD. The File API hands them over verbatim -- `-I..` in a
+    compileCommandFragment, or as an `includes[]` path -- so stored as-is the
+    CMake side says `..` while the Bazel side says `third_party/proj`, and each
+    package needed an include_map entry to converge. Resolve them
+    against the target's source dir and re-relativize against the repo root."""
+    with tempfile.TemporaryDirectory() as root:
+        build = _write_cmake_fixture(root)
+        reply = os.path.join(build, ".cmake", "api", "v1", "reply")
+        cm = dict(CODEMODEL)
+        cm["paths"] = {"source": os.path.join(REPO, "third_party", "proj"),
+                       "build": build}
+        with open(os.path.join(reply, "codemodel.json"), "w") as f:
+            json.dump(cm, f)
+        tgt = json.loads(json.dumps(TARGET_MYLIB))
+        tgt["paths"] = {"source": "lua", "build": "lua"}
+        tgt["sources"] = [{"path": "lua/a.cpp"}]
+        cg = tgt["compileGroups"][0]
+        cg["compileCommandFragments"] = [
+            {"fragment": "-std=c++17 -I.. -isystem ../vendor -I ."}]
+        cg["includes"] = [{"path": ".."},                         # relative
+                          {"path": "/work/proj/third_party/proj/lua/.."},
+                          {"path": "/opt/sdk/include", "isSystem": True}]
+        with open(os.path.join(reply, "target-mylib.json"), "w") as f:
+            json.dump(tgt, f)
+        a = extract_cmake.extract(build, REPO)
+        # the raw argv is rewritten only in the SPELLING of the relative roots
+        raw = a.targets["mylib"].actions[0].arguments
+        assert "-Ithird_party/proj" in raw, raw
+        assert ("-isystem", "third_party/proj/vendor") in zip(raw, raw[1:]), raw
+        assert ".." not in raw and "." not in raw, raw
+        assert "-std=c++17" in raw
+        tu = _view(a, "mylib").tus[0]
+        assert tu.source == "third_party/proj/lua/a.cpp", tu.source
+        assert "third_party/proj" in tu.includes, tu.includes      # -I.. / [..]
+        assert "third_party/proj/lua" in tu.includes, tu.includes  # -I .
+        assert "third_party/proj/vendor" in tu.includes, tu.includes
+        assert "/opt/sdk/include" in tu.includes, tu.includes      # abs, kept
+        assert not any(i.startswith(".") for i in tu.includes), tu.includes
+
+
+def test_cmake_relative_include_roots_kept_without_paths():
+    """A reply with no codemodel `paths` (older fixtures) has nothing to anchor
+    on; a relative root stays verbatim rather than being resolved against a
+    guessed directory."""
+    with tempfile.TemporaryDirectory() as root:
+        build = _write_cmake_fixture(root)
+        reply = os.path.join(build, ".cmake", "api", "v1", "reply")
+        tgt = json.loads(json.dumps(TARGET_MYLIB))
+        tgt["compileGroups"][0]["compileCommandFragments"] = [
+            {"fragment": "-std=c++17 -I.."}]
+        with open(os.path.join(reply, "target-mylib.json"), "w") as f:
+            json.dump(tgt, f)
+        a = extract_cmake.extract(build, REPO)
+        assert "-I.." in a.targets["mylib"].actions[0].arguments
+
+
 def test_cmake_extracts_canonical_flags():
     with tempfile.TemporaryDirectory() as root:
         build = _write_cmake_fixture(root)

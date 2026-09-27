@@ -158,12 +158,75 @@ def _source_path(path: str, source_dir: Optional[str], repo_root: str) -> str:
     return path.replace(os.sep, "/")
 
 
+# Include-root flags whose argument is a DIRECTORY that the compiler resolves
+# against its CWD. Joined (-I..) or split (-I ..) forms both occur in fragments.
+_INCLUDE_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter")
+
+
+def _include_root(path: str, target_source_dir: Optional[str],
+                  repo_root: str) -> str:
+    """Spell a RELATIVE include root the way the Bazel side spells it.
+
+    A subdirectory CMakeLists that does INCLUDE_DIRECTORIES(..) or
+    ADD_DEFINITIONS(-I..) yields a root spelled relative to that directory.
+    CMake defines a relative include dir as relative to
+    CMAKE_CURRENT_SOURCE_DIR; the raw -I.. flag is the same intent spelled by
+    hand (it only ever names a real header root for in-source builds, where
+    the compiler's CWD is the source tree -- OpenWrt's default). Stored
+    verbatim it can never match Bazel's workspace-relative `third_party/<pkg>`,
+    and every such package needed an include_map entry for `..`. Resolve it
+    against the target's source dir, normalize (`lua/..` -> package root) and
+    re-relativize against repo_root, exactly as sources are keyed. Absolute
+    roots are left alone: canonicalize.py already normalizes those (and
+    `examples/..` collapses there)."""
+    if os.path.isabs(path) or not target_source_dir:
+        return path
+    return _source_path(path, target_source_dir, repo_root)
+
+
+def _resolve_include_tokens(tokens: List[str], target_source_dir: Optional[str],
+                            repo_root: str) -> List[str]:
+    """Rewrite the path of every -I/-isystem/-iquote/-idirafter token in a
+    compileCommandFragments argv through _include_root; everything else is kept
+    verbatim (the model stores raw argv -- only the SPELLING of a CWD-relative
+    path is fixed, since that path is meaningless outside its CWD)."""
+    out: List[str] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok in _INCLUDE_FLAGS and i + 1 < n:
+            out.append(tok)
+            out.append(_include_root(tokens[i + 1], target_source_dir, repo_root))
+            i += 2
+            continue
+        for flag in _INCLUDE_FLAGS:
+            if tok.startswith(flag) and len(tok) > len(flag):
+                tok = flag + _include_root(tok[len(flag):], target_source_dir,
+                                           repo_root)
+                break
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _target_source_dir(tobj: dict, source_dir: Optional[str]) -> Optional[str]:
+    """The directory whose CMakeLists defines this target: the codemodel's
+    top-level `paths.source` joined with the target's own `paths.source`
+    (`.` for the top level, `lua` for lua/CMakeLists.txt). None when the reply
+    carries no `paths` (older fixtures), which keeps relative roots verbatim."""
+    if not source_dir:
+        return None
+    sub = (tobj.get("paths") or {}).get("source") or "."
+    return os.path.normpath(os.path.join(source_dir, sub))
+
+
 def _parse_target(tobj: dict, repo_root: str,
                   source_dir: Optional[str] = None) -> Target:
     name = tobj["name"]
     kind = _KIND.get(tobj.get("type", ""), TargetKind.UNKNOWN)
     sources = [_source_path(s["path"], source_dir, repo_root)
                for s in tobj.get("sources", [])]
+    target_source_dir = _target_source_dir(tobj, source_dir)
 
     # Synthesize one CppCompile Action per source: an argv the differ parses the
     # same way it parses Bazel's. CMake has no real command line, so we build the
@@ -172,12 +235,14 @@ def _parse_target(tobj: dict, repo_root: str,
     for cg in tobj.get("compileGroups", []):
         base: List[str] = []
         for frag in cg.get("compileCommandFragments", []):
-            base.extend(_split_fragment(frag.get("fragment", "")))
+            base.extend(_resolve_include_tokens(
+                _split_fragment(frag.get("fragment", "")),
+                target_source_dir, repo_root))
         for d in cg.get("defines", []):
             base.append("-D" + d["define"])
         for inc in cg.get("includes", []):
             base.append("-isystem" if inc.get("isSystem") else "-I")
-            base.append(inc["path"])
+            base.append(_include_root(inc["path"], target_source_dir, repo_root))
         for idx in cg.get("sourceIndexes", []):
             src = sources[idx]
             argv = tuple(base + ["-c", src])
