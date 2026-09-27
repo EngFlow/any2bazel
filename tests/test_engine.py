@@ -835,6 +835,11 @@ def test_twin_ignore_defines_lever_still_applies():
                  actions=[tu_from_raw("v.c", ["-fPIC"], is_bazel=True)]))
     d = diff_models(a, b)
     assert [x.kind for x in d] == ["defines_diff"] and d[0].cmake_only == ["plugin_EXPORTS"], d
+    # a single variant: no variant suffix -- but the marker is named, with the
+    # two fixes, since every shared-only library meets exactly this finding
+    assert d[0].detail.startswith("defines differ ["), d[0].detail
+    assert "plugin_EXPORTS is the DEFINE_SYMBOL marker" in d[0].detail
+    assert "local_defines" in d[0].detail and "ignore.defines" in d[0].detail
     cfg = MigrationConfig(ignore_defines={"plugin_EXPORTS"})
     assert summarize(diff_models(a, b, cfg))["converged"]
 
@@ -917,6 +922,41 @@ def test_quote_only_root_does_not_satisfy_a_reference_include_root():
     a = _model(tu_from_raw("a.c", ["-iquote", "/work/proj"], is_bazel=False), is_bazel=False)
     b = _model(tu_from_raw("a.c", ["-iquote", "."], is_bazel=True), is_bazel=True)
     assert summarize(diff_models(a, b))["converged"]
+
+
+
+def test_pic_and_non_pic_compiles_of_one_source_are_judged_as_one():
+    # Bazel builds fmt's format.cc twice under -c opt: `.pic.o` for the
+    # cc_shared_library and `.o` for the archive. The reference (shared-only)
+    # compiles it once, with -fPIC. The non-PIC twin must not be a
+    # `-fPIC missing` error, and a finding both twins share is reported once.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("fmt", TargetKind.SHARED, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("src/format.cc", ["-fPIC", "-DFOO=1"], is_bazel=False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target(":fmt", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("src/format.cc", ["-fPIC", "-DFOO=1"], is_bazel=True),
+                          tu_from_raw("src/format.cc", ["-DFOO=1"], is_bazel=True)]))
+    assert summarize(diff_models(a, b))["converged"]
+    # both twins lack FOO: one finding, from the PIC twin, not two
+    b.targets[":fmt"].actions = [tu_from_raw("src/format.cc", ["-fPIC"], is_bazel=True),
+                                 tu_from_raw("src/format.cc", [], is_bazel=True)]
+    d = diff_models(a, b)
+    assert [x.kind for x in d] == ["defines_diff"] and d[0].cmake_only == ["FOO=1"], d
+    # a second compile that differs by MORE than the PIC flag is not the
+    # twin: it is judged on its own, -fPIC included
+    b.targets[":fmt"].actions = [tu_from_raw("src/format.cc", ["-fPIC", "-DFOO=1"], is_bazel=True),
+                                 tu_from_raw("src/format.cc", ["-DFOO=1", "-DBAR"], is_bazel=True)]
+    d = diff_models(a, b)
+    assert sorted(x.kind for x in d) == ["defines_diff", "flags_diff"], d
+    assert [x for x in d if x.kind == "flags_diff"][0].cmake_only == ["-fPIC"]
+
+
+def test_exports_marker_hint_uses_cmake_identifier_mangling():
+    from diff import _export_macro
+    assert _export_macro("fmt-c") == "fmt_c_EXPORTS"
+    assert _export_macro("jansson") == "jansson_EXPORTS"
+    assert _export_macro("lua5.3") == "lua5_3_EXPORTS"
 
 
 if __name__ == "__main__":

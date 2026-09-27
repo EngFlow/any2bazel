@@ -35,11 +35,12 @@ extra defines are reported at lower severity.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
-from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES
+from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES, PIC_FLAGS
 from config import MigrationConfig
 from model import (CanonicalModel, TargetKind, TargetRole, TranslationUnit)
 from reconstruct import TargetView, reconstruct
@@ -301,7 +302,7 @@ def _pic(v: TUVariant) -> bool:
     objects are PIC by construction; otherwise the argv says (-fPIC/-fpic).
     Used only as a tie-break when two variants are equally close."""
     return (v.kind == TargetKind.SHARED.value
-            or any(f in ("-fPIC", "-fpic", "-fPIE", "-fpie") for f in v.tu.flags))
+            or any(f in PIC_FLAGS for f in v.tu.flags))
 
 
 def _variant_distance(discs: List[Discrepancy]) -> Tuple[int, int]:
@@ -348,7 +349,29 @@ def _diff_tu_variants(target: str, a_vars: List[TUVariant], b_var: TUVariant,
                   f"bazel TU from {b_var.target})")
         for d in discs:
             d.detail += suffix
+    # CMake's DEFINE_SYMBOL marker (`<target>_EXPORTS`, on every SHARED/MODULE
+    # target) is the one define a migration meets on every shared-only
+    # library, and the fix is always the same; say so where it is reported
+    marker = _export_macro(av.target)
+    for d in discs:
+        if d.kind == Kind.DEFINES_DIFF.value and marker in (d.cmake_only or []):
+            d.detail += (f" [{marker} is the DEFINE_SYMBOL marker CMake adds to "
+                         f"every SHARED/MODULE target and no static twin matches: "
+                         f"carry it in local_defines, or record it in ignore.defines]")
     return discs
+
+
+def _export_macro(target: str) -> str:
+    """CMake's default DEFINE_SYMBOL for a target: the name as a C identifier
+    (`fmt-c` -> `fmt_c`) plus `_EXPORTS`."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", target) + "_EXPORTS"
+
+
+def _sans_pic(v: TUVariant):
+    """A variant's signature with the position-independence flags removed:
+    the PIC and non-PIC compiles of one Bazel cc_library are equal under it."""
+    d, i, f = v.signature()
+    return d, i, tuple(x for x in f if x not in PIC_FLAGS)
 
 
 def _diff_tu_unions(target: str, a_union: Dict[str, List[TUVariant]],
@@ -361,8 +384,23 @@ def _diff_tu_unions(target: str, a_union: Dict[str, List[TUVariant]],
     out: List[Discrepancy] = []
     for src in sorted(set(a_union) & set(b_union)):
         multi = len(a_union[src]) > 1 or len(b_union[src]) > 1
-        for bv in b_union[src]:
-            out.extend(_diff_tu_variants(target, a_union[src], bv, cfg, multi))
+        results = [(bv, _diff_tu_variants(target, a_union[src], bv, cfg, multi))
+                   for bv in b_union[src]]
+        # Bazel compiles a source twice when both an archive and a shared
+        # library consume it (`.o` and `.pic.o`), and the two compiles
+        # differ ONLY by the PIC flag. Which ones the toolchain builds is
+        # not a BUILD-file decision, so such PIC twins are judged as ONE
+        # compile: the twin closest to the reference speaks for both (a
+        # shared-only reference, every TU -fPIC, gets no `-fPIC missing`
+        # error for the non-PIC archive compile, and no second copy of a
+        # finding both twins share). The PIC twin wins a tie: it is the one
+        # the shared library links.
+        by_twin: Dict[tuple, List[tuple]] = {}
+        for bv, discs in results:
+            by_twin.setdefault(_sans_pic(bv), []).append((bv, discs))
+        for twins in by_twin.values():
+            twins.sort(key=lambda r: (_variant_distance(r[1]), not _pic(r[0])))
+            out.extend(twins[0][1])
     return out
 
 

@@ -123,6 +123,11 @@ BAZEL_DEFAULT_LINK_PREFIXES = (
 # different one pass as equivalent.
 _LAST_WINS_PREFIXES = ("-std=",)
 
+# Position-independence flags: the one difference between the PIC and
+# non-PIC compile of a source Bazel builds for both an archive and a shared
+# library (`.pic.o` / `.o`). diff.py's variant matching reads this set.
+PIC_FLAGS = frozenset({"-fPIC", "-fpic", "-fPIE", "-fpie"})
+
 # Link flags with no correctness meaning on either side (build-type / debug).
 IGNORABLE_LINK_PREFIXES = (
     "-g",
