@@ -12,6 +12,30 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      # Eventually, run tests in Bazel. Some of the test scenarios don't play
+      # well with that today.
+      - name: Create and activate venv
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: pip install pytest -q
+
+      - name: Run Python tests
+        run: pytest tests/
+
   copyright-headers-check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
