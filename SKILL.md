@@ -76,6 +76,12 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
   path**, so names and grouping don't matter — a rename or object-library
   fold-in converges with no mapping. Only **external** link deps are checked;
   internal dep names are noise.
+- **Every variant of a source counts.** When the reference compiles one source
+  several ways (a shared/static twin: the shared objects carry
+  `-D<target>_EXPORTS` and `-fPIC`), a Bazel TU converges if it satisfies
+  **any** variant. Otherwise it is reported against the closest one, and
+  `detail` names that CMake target and the Bazel target. Never rename a Bazel
+  target to steer which twin it is compared with.
 - **Executables** align by **name** (a missing exe is a real gap); use
   `target_map` for renames.
 
@@ -317,8 +323,8 @@ correctness flags).
 |------------------|-----|
 | `missing_target` | add the missing `cc_binary`, or `target_map` a renamed exe, or `exclude_targets` if out of scope |
 | `missing_tu`     | add the source to some library's `srcs`, or `exclude_targets` if it's a vendored/out-of-scope subtree |
-| `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
-| `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
+| `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it. A `<target>_EXPORTS` marker of a shared/static twin needs neither (the static twin already matches); only a shared-only library needs `ignore.defines` for it |
+| `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it. Detail `present on bazel side only as -iquote`: the root is there for `#include "..."` only (Bazel's workspace root), so `#include <...>` will not find it; put it in `includes` |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag CMake repeats at link) |
 | `missing_dep`    | add the missing external/system dep to the target's `deps`/`linkopts`; if it's just a name spelled differently per build (`Catch2Main` vs `catch2_main`, `OpenSSL::SSL` vs `ssl`), add a `dep_map` entry. External deps are captured from both `-l` flags and archive-file inputs (e.g. `external/catch2+/libcatch2_main.a`) |
