@@ -253,9 +253,14 @@ instead of being a warning nobody reads.
 >   through, or record genuinely-irreducible differences in `any2bazel.json`.
 > - Use the **same platform/options** as the CMake configure in step 2, or the
 >   two sides aren't comparable.
+> - **Always** call aquery with `--features=-compiler_param_file` and
+>   `--features=-linker_param_file` to disable use of param files. Param files
+>   are never generated during `aquery` calls, so when they're in use they'll
+>   always point to files that are either stale, or do not exist at all.
 
 ```bash
 bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
+    --features=-compiler_param_file --features=-linker_param_file \
     [--config=<name>] [--copt=... --cxxopt=...] \
     --output=jsonproto > aquery.json
 python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
