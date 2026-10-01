@@ -25,6 +25,7 @@ silently vanish from the Bazel model.
 
 Usage:
     bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
+        --features=-compiler_param_file --features=-linker_param_file \
         --output=jsonproto > aquery.json
     python3 extract_bazel.py aquery.json <repo_root> model.bazel.json
 
