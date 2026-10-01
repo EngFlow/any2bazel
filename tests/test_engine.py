@@ -690,6 +690,41 @@ def test_nonparticipating_roles_are_excluded_not_diffed():
     assert "Nightly" in res["excluded"]["cmake"]["dashboard"]
 
 
+_TWIN_SCRIPT = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from diff import diff_models, summarize
+from model import Action, BuildSystem, CanonicalModel, Target, TargetKind, TargetRole
+def tu(raw):
+    return Action(mnemonic="CppCompile", arguments=tuple(raw + ["-c", "foo/a.cpp"]))
+a = CanonicalModel(build_system=BuildSystem.CMAKE, repo_root="/work/proj")
+a.add(Target("foo", TargetKind.SHARED, role=TargetRole.PRODUCTION,
+             actions=[tu(["-Dfoo_EXPORTS", "-DX=1"])]))
+a.add(Target("foo-static", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+             actions=[tu(["-DX=1"])]))
+b = CanonicalModel(build_system=BuildSystem.BAZEL, repo_root="/work/proj")
+b.add(Target(":foo", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+             actions=[tu(["-DX=1"])]))
+print(json.dumps(summarize(diff_models(a, b)), sort_keys=True))
+"""
+
+
+def test_shared_static_twin_representative_is_deterministic():
+    # CMake builds the same source twice: as a SHARED lib (-Dfoo_EXPORTS) and
+    # as its STATIC twin (no define). The library TU-union keeps ONE
+    # representative per source; which one must not depend on target-name
+    # enumeration order (a set, so hash-seeded per process) or the reported
+    # defines_diff flips between runs. Run the diff under several hash seeds.
+    import subprocess
+    scripts = os.path.join(os.path.dirname(__file__), "..", "scripts")
+    outs = set()
+    for seed in range(8):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        outs.add(subprocess.check_output(
+            [sys.executable, "-c", _TWIN_SCRIPT, scripts], env=env).decode())
+    assert len(outs) == 1, outs
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
