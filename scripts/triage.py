@@ -67,10 +67,16 @@ def triage(diff: dict, only_kind: Optional[str] = None) -> dict:
             continue
         cmake_only = _histogram(discs, k, "cmake_only")
         bazel_only = _histogram(discs, k, "bazel_only")
+        # One kind can carry differently-read findings (includes_diff: a
+        # root missing on the Bazel side, OR a toolchain_includes root the
+        # reference no longer carries -- reported under bazel_only). The
+        # detail says which; surface it so the histogram is read correctly.
+        details = Counter(d.get("detail", "") for d in discs if d.get("kind") == k)
         out_kinds.append({
             "kind": k,
             "severity": by_kind_sev[k],
             "count": by_kind[k],
+            "details": details.most_common(),
             # most_common(): systematic causes float to the top
             "cmake_only": cmake_only.most_common(),
             "bazel_only": bazel_only.most_common(),
@@ -97,6 +103,9 @@ def render(t: dict, top: int = 25) -> str:
     lines.append(f"{status}  errors={t['errors']}  warnings={t['warnings']}")
     for k in t["kinds"]:
         lines.append(f"\n[{k['severity']}] {k['kind']} x{k['count']}")
+        for detail, n in k.get("details", []):
+            if detail:
+                lines.append(f"  {n:5d}  {detail}")
         for label, hist, cap in (
                 ("cmake_only (add on bazel / accept in config)", k["cmake_only"], None),
                 ("bazel_only (usually tolerated)", k["bazel_only"], top)):

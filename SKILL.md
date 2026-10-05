@@ -102,6 +102,7 @@ reads it today):
   "dep_map": { "Catch2Main": "catch2_main" },
   "exclude_targets": ["benchmark", "some_tool"],
   "include_tests": false,
+  "toolchain_includes": ["/opt/sdk/usr/include"],
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
@@ -154,6 +155,17 @@ Fields:
   wins). `include_prefixes` just deletes the path (a blind spot) — use only when
   there's no counterpart to map to. Search **order** is not enforced (presence
   only) — see `docs/FUTURE-include-order-collision-check.md`.
+- **`toolchain_includes`** (top level) — include roots the Bazel toolchain adds
+  **at execution time** (a compiler wrapper's `-idirafter <sdk>/usr/include`,
+  sysroot builtin dirs), so `aquery` never shows them while the reference spells
+  them out on every TU. An **assertion, not a suppression**: each root is
+  *required* on every CMake TU (absence is an `includes_diff` error) and counts
+  as present on the Bazel side. Matched by directory identity, not prefix, so a
+  root beneath it (`<sdk>/usr/include/json-c`) is still verified. Don't guess
+  the roots — ask the driver, with the command and env the Bazel toolchain uses:
+  `python3 scripts/probe_toolchain.py [--env K=V] -- <compiler>` prints its
+  search lists, injected include flags and a snippet to paste. A plain host
+  build whose reference passes no such roots needs none.
 
 The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
@@ -318,7 +330,7 @@ correctness flags).
 | `missing_target` | add the missing `cc_binary`, or `target_map` a renamed exe, or `exclude_targets` if out of scope |
 | `missing_tu`     | add the source to some library's `srcs`, or `exclude_targets` if it's a vendored/out-of-scope subtree |
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
-| `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
+| `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it; a root the compiler wrapper/sysroot adds itself goes in `toolchain_includes`. Under `bazel_only` with a `toolchain_includes` detail: the reference no longer carries a declared root |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
 | `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag CMake repeats at link) |
 | `missing_dep`    | add the missing external/system dep to the target's `deps`/`linkopts`; if it's just a name spelled differently per build (`Catch2Main` vs `catch2_main`, `OpenSSL::SSL` vs `ssl`), add a `dep_map` entry. External deps are captured from both `-l` flags and archive-file inputs (e.g. `external/catch2+/libcatch2_main.a`) |
@@ -404,7 +416,8 @@ build brings (no action graph to extract, traversal-order-dependent output,
 ```bash
 python3 tests/test_engine.py && python3 tests/test_extractors.py \
     && python3 tests/test_maven.py && python3 tests/test_extract_npm.py \
-    && python3 tests/test_triage.py && python3 tests/test_configure.py
+    && python3 tests/test_triage.py && python3 tests/test_configure.py \
+    && python3 tests/test_probe_toolchain.py
 ```
 
 Extractor tests run against fixtures that mirror the documented File API,

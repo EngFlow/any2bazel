@@ -28,12 +28,19 @@ file holds the JUDGMENT CALLS a migration must make and that deserve review:
                  Applied at DIFF time and to BOTH sides, so tuning them and
                  re-diffing needs no re-extraction.
 
+  * toolchain_includes : include roots the BAZEL TOOLCHAIN supplies without
+                 them appearing in aquery's argv (a compiler wrapper's runtime
+                 -idirafter, the sysroot's builtin dirs). Not a suppression:
+                 the reference is REQUIRED to carry each one, and only the
+                 Bazel side is excused. See MigrationConfig.toolchain_includes.
+
 Because it's a file, every suppression is an explicit, reviewable, version-
 controlled line -- a durable record of why a given difference was accepted.
 
 Example any2bazel.json:
     {
       "target_map": { },
+      "toolchain_includes": ["/opt/sdk/staging/usr/include"],
       "ignore": {
         "defines": ["BORINGSSL_DISPATCH_TEST"],
         "flags":   ["-Wctad-maybe-unsupported", "-fvisibility=hidden"],
@@ -46,8 +53,9 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 CONFIG_FILENAME = "any2bazel.json"
 
@@ -81,6 +89,30 @@ class MigrationConfig:
     # 'external/absl+' and 'bazel-out/.../external/absl+' twin both -> '@absl').
     # Longest from-prefix wins. Applied before ignore_include_prefixes.
     include_map: tuple = ()  # tuple of (from_prefix, to_token)
+    # Include roots the BAZEL TOOLCHAIN provides IMPLICITLY -- a compiler
+    # wrapper that adds `-idirafter <sdk>/usr/include` when it runs, the
+    # sysroot's builtin dirs (cxx_builtin_include_directories) -- which the
+    # reference build spells out explicitly on every TU (e.g. in
+    # CMAKE_C_FLAGS) but which `bazel aquery` can never show, because they are
+    # added at EXECUTION time. The asymmetric lever for that:
+    #   * CMake side: each root is REQUIRED on every TU. Its absence is an
+    #     includes_diff error (the config asserts a fact about the reference;
+    #     if the reference stops carrying the root the assertion is stale, or
+    #     the reference regressed, and either way someone must look).
+    #   * Bazel side: the root counts as present; it is dropped from the
+    #     comparison instead of being demanded of the argv.
+    # This is the opposite of ignore_include_prefixes, which deletes the root
+    # from BOTH sides and so never notices the reference losing it.
+    # Matching is by DIRECTORY IDENTITY (normalized path equality), not by
+    # prefix: a root beneath a toolchain root -- `<sdk>/usr/include/json-c`
+    # under `<sdk>/usr/include` -- is a different search directory with its
+    # own meaning and is compared on its own merits (mapped by include_map if
+    # spelled differently per side, else required verbatim). A prefix match
+    # would swallow it exactly the way include_prefixes does. Populate from the
+    # toolchain, not from memory: scripts/probe_toolchain.py prints the
+    # search list the (wrapped) compiler actually uses. A plain host build
+    # whose reference passes no such roots needs none.
+    toolchain_includes: tuple = ()
     # Source-path PREFIX REWRITES for TRANSLATION-UNIT keys, applied to both
     # sides before the TU-set comparison -- the compile-source analogue of
     # include_map. Same (from_prefix, to_token) shape, longest-prefix-wins.
@@ -111,6 +143,12 @@ class MigrationConfig:
     # compared as their own project-wide TU-set union (like libraries), plus a
     # test-binary existence/count check. See PARTICIPATING_ROLES in diff.py.
     include_tests: bool = False
+
+    def __post_init__(self):
+        # Normalize the declared toolchain roots once, so the identity test
+        # in toolchain_root() is plain equality against canonical spellings.
+        self.toolchain_includes = tuple(
+            r for r in (_norm_root(t) for t in self.toolchain_includes) if r)
 
     def flag_ignored(self, flag: str) -> bool:
         return (flag in self.ignore_flags
@@ -157,8 +195,27 @@ class MigrationConfig:
     def include_ignored(self, include: str) -> bool:
         return any(include.startswith(p) for p in self.ignore_include_prefixes)
 
+    def toolchain_root(self, include: str) -> Optional[str]:
+        """The declared toolchain root that `include` IS (the same directory,
+        after path normalization), or None. Deliberately not a prefix match --
+        see the toolchain_includes field: a subdirectory of a toolchain root is
+        its own search directory and must be compared, not excused."""
+        norm = _norm_root(include)
+        return norm if norm in self.toolchain_includes else None
+
     def target_excluded(self, name: str) -> bool:
         return name in self.exclude_targets
+
+
+def _norm_root(path: str) -> str:
+    """Canonical spelling of an include directory for identity comparison:
+    POSIX separators, `.`/`..` segments collapsed, no trailing slash. The same
+    normalization canonicalize.py applies to the models' include paths, so a
+    config entry and a model root that name one directory compare equal."""
+    p = (path or "").strip().replace(os.sep, "/")
+    if not p:
+        return ""
+    return posixpath.normpath(p)
 
 
 def load(path: str) -> MigrationConfig:
@@ -181,6 +238,7 @@ def load(path: str) -> MigrationConfig:
             (e["from"], e["to"]) for e in ig.get("include_map", [])),
         source_map=tuple(
             (e["from"], e["to"]) for e in ig.get("source_map", [])),
+        toolchain_includes=tuple(obj.get("toolchain_includes", []) or ()),
         exclude_targets=set(obj.get("exclude_targets", [])),
         bazel_args=tuple(obj.get("bazel_args", [])),
         include_tests=bool(obj.get("include_tests", False)),

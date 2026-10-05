@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from canonicalize import BAZEL_TOLERATED_FLAG_PREFIXES
 from config import MigrationConfig
@@ -110,12 +110,17 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
         ))
 
     # includes: PRESENCE check (order currently NOT enforced -- see below).
-    # Two normalizations, applied to both sides first:
-    #   1. include_map: rewrite differing spellings of the same dep root to a
+    # Three normalizations, applied to both sides first:
+    #   1. toolchain_includes: a root the Bazel toolchain supplies at execution
+    #      time (wrapper -idirafter, sysroot builtin dir) is set aside on both
+    #      sides -- excused from the Bazel argv, but REQUIRED on the CMake side
+    #      (checked below). Decided first, on the exact directory, so neither
+    #      lever below can rewrite or delete it out from under the check.
+    #   2. include_map: rewrite differing spellings of the same dep root to a
     #      canonical token, so the check is PRESERVED (the dep must still be
     #      present). Collapse adjacent dups the rewrite produces (Bazel's
     #      external/X and bazel-out/.../external/X both -> the token).
-    #   2. include_ignored: drop blind-spot prefixes entirely.
+    #   3. include_ignored: drop blind-spot prefixes entirely.
     #
     # We require every CMake include root to be PRESENT on the Bazel side, but
     # do NOT (yet) enforce relative ORDER. Order only changes the build when the
@@ -124,8 +129,8 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
     # verifier exists, enforcing order produced benign false positives (e.g.
     # boringssl: project `include` vs vendored gtest roots, disjoint headers,
     # reordered). See docs/FUTURE-include-order-collision-check.md.
-    a_inc = _norm_includes(a.includes, cfg)
-    b_inc = _norm_includes(b.includes, cfg)
+    a_inc, a_tool = _norm_includes(a.includes, cfg)
+    b_inc, _ = _norm_includes(b.includes, cfg)
     missing = [i for i in a_inc if i not in set(b_inc)]
     if missing:
         out.append(Discrepancy(
@@ -135,6 +140,23 @@ def _diff_tu(target: str, a: TranslationUnit, b: TranslationUnit,
             detail="cmake include root missing on bazel side",
             cmake_only=missing,
             bazel_only=[i for i in b_inc if i not in set(a_inc)],
+        ))
+    # toolchain_includes is an ASSERTION about the reference: every declared
+    # root must be on this CMake TU. One that is not means the config is stale
+    # or the reference lost the root -- and the Bazel side, which was excused
+    # from it above, now carries a search directory the reference does not.
+    # Reported under bazel_only (implicitly present there, absent in CMake);
+    # ignore.include_prefixes would have deleted it from both sides silently.
+    absent = [t for t in cfg.toolchain_includes if t not in a_tool]
+    if absent:
+        out.append(Discrepancy(
+            kind=Kind.INCLUDES_DIFF.value,
+            severity=Severity.ERROR.value,
+            target=target, tu=a.source,
+            detail="toolchain include root (toolchain_includes) not on the "
+                   "cmake side: stale config, or the reference lost it",
+            cmake_only=[],
+            bazel_only=absent,
         ))
 
     # other flags: asymmetric subset -- A must be subset of B.
@@ -173,18 +195,34 @@ def _diff_link_flags(name: str, ta: "TargetView", tb: "TargetView",
     return []
 
 
-def _norm_includes(includes, cfg) -> tuple:
-    """Apply include_map rewrites then drop ignored prefixes, collapsing the
-    consecutive duplicates a rewrite can create (e.g. external/X and its
-    bazel-out twin both map to the same token). Order preserved."""
+def _norm_includes(includes, cfg) -> Tuple[tuple, frozenset]:
+    """Normalize one side's include roots for comparison. Returns
+    (roots, toolchain_roots):
+
+      roots           -- include_map rewrites applied, then ignored prefixes
+                         dropped, consecutive duplicates a rewrite can create
+                         collapsed (external/X and its bazel-out twin both map
+                         to one token). Order preserved.
+      toolchain_roots -- the cfg.toolchain_includes entries this TU carries
+                         explicitly (normalized spelling). Set aside BEFORE
+                         the map/ignore steps, on directory identity, so a
+                         toolchain root can neither be rewritten to a token
+                         nor deleted by a prefix; _diff_tu requires each
+                         declared root in the CMake side's set.
+    """
     out = []
+    tool = set()
     for inc in includes:
+        root = cfg.toolchain_root(inc)
+        if root is not None:
+            tool.add(root)
+            continue
         mapped = cfg.map_include(inc)
         if cfg.include_ignored(mapped) or cfg.include_ignored(inc):
             continue
         if not out or out[-1] != mapped:
             out.append(mapped)
-    return tuple(out)
+    return tuple(out), frozenset(tool)
 
 
 # Roles the parity diff actually compares. Everything else (dashboard,
