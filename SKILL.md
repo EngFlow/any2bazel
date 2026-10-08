@@ -186,10 +186,10 @@ flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
 
 ## Procedure
 
-> **Script paths vs. project paths.** The `scripts/…` and `tests/…` paths below
-> are relative to **this skill's own directory** (where this `SKILL.md` lives) —
-> NOT the project being migrated. When running inside a target repo, invoke them
-> by absolute path, e.g.
+> **Script paths vs. project paths.** The `scripts/…` paths below are relative
+> to **this skill's own directory** (where this `SKILL.md` lives) — NOT the
+> project being migrated. When running inside a target repo, invoke them by
+> absolute path, e.g.
 > `python3 "$SKILL_DIR/scripts/extract_cmake.py" …` where `$SKILL_DIR` is this
 > skill's install location (e.g. `~/.claude/skills/any2bazel`). The artifacts
 > you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
@@ -399,16 +399,8 @@ build brings (no action graph to extract, traversal-order-dependent output,
 `node_modules` as both toolchain and foreign Bazel package):
 [docs/CASE-vscode-migration.md](docs/CASE-vscode-migration.md).
 
-## Tests
+## Updating this skill
 
-```bash
-python3 tests/test_engine.py && python3 tests/test_extractors.py \
-    && python3 tests/test_maven.py && python3 tests/test_extract_npm.py \
-    && python3 tests/test_triage.py && python3 tests/test_configure.py
-```
-
-Extractor tests run against fixtures that mirror the documented File API,
-aquery, Maven argfile, and npm-NDJSON schemas. When a real project surfaces a
-schema detail the extractors mishandle (fragment quoting, `external/` repo paths
-in aquery, multi-config), fix the extractor and capture that output as a new
-fixture.
+To change this skill or its scripts, read
+[CONTRIBUTING.md](CONTRIBUTING.md) first. It covers testing and presubmit
+requirements.
