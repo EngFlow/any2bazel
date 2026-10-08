@@ -17,22 +17,17 @@ driven by a deterministic diff, so each round is cheap and the LLM only does the
 creative work (generating and fixing BUILD files), never the mechanical
 comparison.
 
-## Frontends and maturity
+## Prerequisites
 
-All frontends extract into one shared **action-based model**; a language/
-mnemonic-aware differ compares each against a Bazel `aquery` model.
+All migrations require these tools. If any are missing, stop and ask the user to
+install them.
 
-| Frontend | Reference source | Diffs | Status |
-|----------|------------------|-------|--------|
-| **CMake** | File API codemodel-v2 | C/C++ compile + link parity | **Mature** — the validated path, detailed below |
-| **Maven** | forked `javac` argfiles | Java source-set parity | **Early** — argv-floor only |
-| **VSCode / npm** | esbuild/tsc/`child_process` instrumentation | standalone TS emit check | **Experimental** — not wired into the main loop |
+- `python3`
+- `bazel` or `bazelisk`
+- `curl` or `wget`
+- `jq`
 
-**Trust and detail the CMake path.** The numbered procedure below is the
-CMake→Bazel loop. The Maven and npm frontends share the model and differ but are
-newer captures; see *Other frontends* at the end for how they differ.
-
-## Core idea
+## Migration strategy overview
 
 Each build system is made to emit a structured description of what it *actually
 builds*, normalized into one **canonical action model**, then compared:
@@ -66,7 +61,7 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
   correctness-relevant CMake flag must be present on the Bazel side; extra Bazel
   flags are tolerated. No artifact/symbol diff or test execution yet.
 
-## How targets are matched
+### How targets are matched
 
 - **Roles:** each target gets a `role` (`production`, `test`, `dashboard`,
   `aggregate`, `codegen`, `unknown`). Only `production` is diffed; the rest are
@@ -79,7 +74,7 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
 - **Executables** align by **name** (a missing exe is a real gap); use
   `target_map` for renames.
 
-## Canonicalization
+### Canonicalization
 
 `canonicalize.py` strips noise before comparing flags. Universal mechanics
 (driver/wrapper paths, `-c`/`-o`, sysroot, reproducibility defines, `-O*`/`-g*`)
@@ -159,6 +154,21 @@ The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
 cmake/bazel.
 
+## Frontends and maturity
+
+All frontends extract into one shared **action-based model**; a language/
+mnemonic-aware differ compares each against a Bazel `aquery` model.
+
+| Frontend | Reference source | Diffs | Status |
+|----------|------------------|-------|--------|
+| **CMake** | File API codemodel-v2 | C/C++ compile + link parity | **Mature** — the validated path, detailed below |
+| **Maven** | forked `javac` argfiles | Java source-set parity | **Early** — argv-floor only |
+| **VSCode / npm** | esbuild/tsc/`child_process` instrumentation | standalone TS emit check | **Experimental** — not wired into the main loop |
+
+**Trust and detail the CMake path.** The numbered procedure below is the
+CMake→Bazel loop. The Maven and npm frontends share the model and differ but are
+newer captures; see *Other frontends* at the end for how they differ.
+
 ## Scope (MVP — check before running)
 
 Supported: static/shared/object libraries and executables. Compile-parity stage:
@@ -178,13 +188,7 @@ flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
 - **VSCode / npm**: not integrated into this parity loop (`diff_ts.py` is a
   standalone TS emit check only).
 
-## Prerequisites
-- `python3`; `bazel`/`bazelisk`
-- CMake path: `cmake` ≥ 3.14 (File API)
-- Maven path: `mvn` (forked-compile capable)
-- VSCode/npm path: `node` (the instrumentation preload)
-
-## Procedure
+## Migration loop steps
 
 > **Script paths vs. project paths.** The `scripts/…` paths below are relative
 > to **this skill's own directory** (where this `SKILL.md` lives) — NOT the
