@@ -74,8 +74,9 @@ deterministic diff drives the loop — an LLM does only the creative work
 
 ## Contributing
 
-Contributions are welcome. Please send any feedback and changes to the main
-repo at https://github.com/EngFlow/any2bazel.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+contribution flows and requirements. Please send any feedback and changes to the
+main repo at https://github.com/EngFlow/any2bazel.
 
 [license]: https://img.shields.io/badge/license-Apache%202.0-blue.svg
 [license-url]: LICENSE
