@@ -13,3 +13,6 @@ model.*.json
 aquery.json
 diff.json
 actions.ndjson
+
+# Don't track module lockfiles for examples.
+/examples/**/MODULE.bazel.lock
