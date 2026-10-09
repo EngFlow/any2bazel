@@ -256,6 +256,59 @@ def test_bazel_link_input_static_archive_inferred_as_dep():
     assert summarize(diff_models(a, b))["converged"], diff_models(a, b)
 
 
+def test_framework_link_flag_inferred_as_external_dep():
+    # macOS `-framework <name>` is a two-token linker flag that should be
+    # inferred as an external dep, just like `-l<name>`.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("CoreFoundation", external=True),
+                       Dependency("Security", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    link = Action(mnemonic="CppLink",
+                  arguments=("/usr/bin/clang++", "-o", "app",
+                             "-framework", "CoreFoundation",
+                             "-framework", "Security"))
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", ["-DFOO=1"], is_bazel=True), link]))
+    assert summarize(diff_models(a, b))["converged"], diff_models(a, b)
+
+
+def test_framework_dep_missing_is_error():
+    # A framework present on the CMake side but absent from the Bazel link
+    # argv must be reported as a missing_dep error.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", [], is_bazel=False)],
+                 deps=[Dependency("CoreFoundation", external=True),
+                       Dependency("SystemConfiguration", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    link = Action(mnemonic="CppLink",
+                  arguments=("/usr/bin/clang++", "-o", "app",
+                             "-framework", "CoreFoundation"))
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", [], is_bazel=True), link]))
+    discs = diff_models(a, b)
+    assert any(d.kind == "missing_dep" and d.cmake_only == ["SystemConfiguration"]
+               for d in discs)
+
+
+def test_framework_and_l_flags_combined():
+    # Both `-framework <name>` and `-l<name>` on the same link line.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", [], is_bazel=False)],
+                 deps=[Dependency("CoreFoundation", external=True),
+                       Dependency("z", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    link = Action(mnemonic="CppLink",
+                  arguments=("/usr/bin/clang++", "-o", "app",
+                             "-framework", "CoreFoundation", "-lz"))
+    b.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("m.cpp", [], is_bazel=True), link]))
+    assert summarize(diff_models(a, b))["converged"], diff_models(a, b)
+
+
 def test_external_dep_name_aligned_by_dep_map():
     # CMake records the archive basename ('Catch2Main'); Bazel the target/file
     # name ('catch2_main'). An explicit dep_map aligns them -> converges.

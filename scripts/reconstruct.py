@@ -193,6 +193,7 @@ def _infer_deps_from_link(actions, existing) -> List[Dependency]:
     (Bazel only annotates argv + inputs, no resolved dep list like CMake).
 
       * argv `-l<name>`            -> external system lib
+      * argv `-framework <name>`   -> external macOS framework
       * argv archive file token    -> external if under external/, else internal
       * declared INPUT lib file    -> archive/solib fed to the linker by path
                                        rather than -l (the common Bazel case);
@@ -206,7 +207,13 @@ def _infer_deps_from_link(actions, existing) -> List[Dependency]:
     for act in actions:
         if act.mnemonic not in _LINK_MNEMONICS:
             continue
-        for a in act.arguments:
+        args = iter(act.arguments)
+        for a in args:
+            if a == "-framework":
+                name = next(args, "")
+                if name and name not in have:
+                    deps.append(Dependency(name, external=True)); have.add(name)
+                continue
             if a.startswith("-l"):
                 name = a[2:]
                 if name and name not in have:
