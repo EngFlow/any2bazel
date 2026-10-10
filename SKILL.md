@@ -33,23 +33,22 @@ Each build system is made to emit a structured description of what it *actually
 builds*, normalized into one **canonical action model**, then compared:
 
 ```
-CMake File API codemodel  ──extract_cmake.py──┐
-                                              ├─► reconstruct.py ─► diff.py ─► worklist / converged?
-Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
-                                                       │
-                          any2bazel.json (migration decisions)
+Reference build           ──extract_<frontend>.py──┐
+                                                   ├─► reconstruct.py ─► diff.py ─► worklist / converged?
+Bazel aquery jsonproto    ──extract_bazel.py───────┘        ▲
+                                                            │
+                               any2bazel.json (migration decisions)
 ```
 
-- **CMake side = File API codemodel-v2** (not `compile_commands.json`, which
-  lacks link info). **Bazel side = `bazel aquery`**. Both expose compile *and*
-  link actions.
+- **Reference side** = the structured action description the reference build
+  exposes (see [Identify reference](#identify-reference)). **Bazel side =
+  `bazel aquery`**. Both expose compile *and* link actions.
 - **The model stores raw ACTIONS** (argv floor + annotations); all
   canonicalization/interpretation happens in the differ (`reconstruct.py` +
   `canonicalize.py` + `diff.py`), keyed on the model's `build_system` tag (for
   noise) and each action's mnemonic (for grouping). See
   `docs/DESIGN-action-based-ir.md`.
-- **Parity has two stages**, both reported by one diff run ("steps" below = the
-  numbered procedure; these are the *stages* of what's checked):
+- **Parity has two stages**, both reported by one diff run:
   - **Compile parity** — every TU compiled with equivalent flags/defines/
     includes (project-wide TU-set), and the external link-dependency closure
     matches.
@@ -58,8 +57,8 @@ Bazel aquery jsonproto    ──extract_bazel.py──┘        ▲
     the TUs.
 
   Done when both stages converge. The comparison is **asymmetric**: every
-  correctness-relevant CMake flag must be present on the Bazel side; extra Bazel
-  flags are tolerated. No artifact/symbol diff or test execution yet.
+  correctness-relevant reference flag must be present on the Bazel side; extra
+  Bazel flags are tolerated. No artifact/symbol diff or test execution yet.
 
 ### How targets are matched
 
@@ -86,14 +85,13 @@ errors by design.
 ## The migration config: `any2bazel.json`
 
 Lives at the **migrated project's repo root**, committed alongside the BUILD
-files as the durable record of migration decisions. The filename still carries
-the old project name; it applies to the CMake→Bazel path (the only frontend that
-reads it today):
+files as the durable record of migration decisions. Each reference guide notes
+whether its frontend reads it:
 
 ```json
 {
   "bazel_args": ["--config=macos", "--copt=-fno-exceptions"],
-  "target_map": { "some_cmake_exe": ":some_bazel_exe" },
+  "target_map": { "some_reference_exe": ":some_bazel_exe" },
   "dep_map": { "Catch2Main": "catch2_main" },
   "exclude_targets": ["benchmark", "some_tool"],
   "include_tests": false,
@@ -115,16 +113,16 @@ reads it today):
 
 Fields:
 - **`bazel_args`** — the extra args aquery must run with to mirror the real
-  build (see step 4). Recorded so the comparison is reproducible; read by the
-  operator, not the diff.
-- **`target_map`** — `cmake_name → bazel_name` for intentionally renamed
+  build (see [Extract the Bazel action graph](#extract-bazel-graph)). Recorded so
+  the comparison is reproducible; read by the operator, not the diff.
+- **`target_map`** — `reference_name → bazel_name` for intentionally renamed
   **executables**. Bazel targets are keyed by full label, so the value is
   usually `:name` (e.g. `"bssl": ":bssl"`). Libraries need no mapping.
-- **`dep_map`** — `cmake_dep_name → bazel_dep_name` for an **external link
-  dep** spelled differently per build (CMake's archive basename `Catch2Main`
-  vs Bazel's `catch2_main`, or `OpenSSL::SSL` vs `ssl`). An explicit, recorded
-  rename — not a fuzzy match — so a residual `missing_dep` is a genuine gap.
-- **`exclude_targets`** — CMake target names dropped entirely from the diff:
+- **`dep_map`** — `reference_dep_name → bazel_dep_name` for an **external link
+  dep** spelled differently per build (e.g. `Catch2Main` vs `catch2_main`). An
+  explicit, recorded rename — not a fuzzy match — so a residual `missing_dep` is
+  a genuine gap.
+- **`exclude_targets`** — reference target names dropped entirely from the diff:
   third-party/vendored code Bazel pulls as an external module, or tooling out
   of scope. The **only** lever for `missing_tu`/`missing_target` on whole
   subtrees. Excluded targets still appear under `excluded.config_excluded`.
@@ -133,117 +131,116 @@ Fields:
   tests enabled and the **same** test scope (symmetric configure + aquery);
   turning it on against a tests-off extraction fabricates findings. When on,
   test sources are compared as their own project-wide TU-set union (like
-  libraries) and a coarse test-binary count check runs. See step 8.
+  libraries) and a coarse test-binary count check runs. See
+  [Diff tests](#diff-tests).
 - **`ignore.{defines,flags,flags_prefixes}`** — reviewer-approved compile
   flag/define differences. `flags`/`defines` match exact tokens; `flags_prefixes`
   by prefix.
 - **`ignore.{link_flags,link_flags_prefixes}`** — reviewer-approved LINK flag
   differences (per-executable link-flag diff, same asymmetric-subset policy as
-  compile flags). Common case: CMake repeats compile/codegen flags
-  (`-fvisibility=hidden`, `-fno-common`) on the link line where they're benign,
-  while Bazel doesn't.
+  compile flags). Common case: the reference repeats compile/codegen flags on
+  the link line where they're benign, while Bazel doesn't.
 - **`ignore.include_map` / `ignore.include_prefixes`** — for an include root
-  spelled differently per side (a dep in-tree under CMake, external under Bazel).
-  **Prefer `include_map`**: it rewrites both sides' spellings to a canonical
-  token and still verifies presence (several `from`s may map to one `to`; longest
-  wins). `include_prefixes` just deletes the path (a blind spot) — use only when
-  there's no counterpart to map to. Search **order** is not enforced (presence
-  only) — see `docs/FUTURE-include-order-collision-check.md`.
+  spelled differently per side (e.g. a dep in-tree in the reference, external
+  under Bazel). **Prefer `include_map`**: it rewrites both sides' spellings to a
+  canonical token and still verifies presence (several `from`s may map to one
+  `to`; longest wins). `include_prefixes` just deletes the path (a blind spot) —
+  use only when there's no counterpart to map to. Search **order** is not
+  enforced (presence only) — see `docs/FUTURE-include-order-collision-check.md`.
 
 The `ignore` and `target_map`/`exclude_targets` lists are applied at **diff
 time** to **both sides**, so you can tune them and re-diff without re-running
-cmake/bazel.
+the reference build or bazel.
 
-## Frontends and maturity
-
-All frontends extract into one shared **action-based model**; a language/
-mnemonic-aware differ compares each against a Bazel `aquery` model.
-
-| Frontend | Reference source | Diffs | Status |
-|----------|------------------|-------|--------|
-| **CMake** | File API codemodel-v2 | C/C++ compile + link parity | **Mature** — the validated path, detailed below |
-| **Maven** | forked `javac` argfiles | Java source-set parity | **Early** — argv-floor only |
-| **VSCode / npm** | esbuild/tsc/`child_process` instrumentation | standalone TS emit check | **Experimental** — not wired into the main loop |
-
-**Trust and detail the CMake path.** The numbered procedure below is the
-CMake→Bazel loop. The Maven and npm frontends share the model and differ but are
-newer captures; see *Other frontends* at the end for how they differ.
-
-## Scope (MVP — check before running)
-
-Supported: static/shared/object libraries and executables. Compile-parity stage:
-plain C/C++ sources, compile flags, defines, include presence; external deps as
-abstract identities. Link-consistency stage: per-executable/shared-lib link
-flags. Tests are opt-in (`include_tests`) and get the compile-parity stage only
-(procedure step 8).
-
-**NOT yet supported — stop and tell the user if the project has these:**
-- Custom commands / generated code (`configure_file`, protoc, `add_custom_command`)
-- Per-test-binary identity alignment, and include search **order** (presence
-  only) — both have planned follow-ups
-- Packaging / install rules
-- Automatic external-dependency resolution (find_package → bzlmod)
-- **Maven**: coordinate-identity deps (`group:artifact:version`, scope) and Java
-  flag canonicalization — argv-floor only.
-- **VSCode / npm**: not integrated into this parity loop (`diff_ts.py` is a
-  standalone TS emit check only).
-
-## Migration loop steps
+## Migration process
 
 > **Script paths vs. project paths.** The `scripts/…` paths below are relative
 > to **this skill's own directory** (where this `SKILL.md` lives) — NOT the
 > project being migrated. When running inside a target repo, invoke them by
 > absolute path, e.g.
-> `python3 "$SKILL_DIR/scripts/extract_cmake.py" …` where `$SKILL_DIR` is this
+> `python3 "$SKILL_DIR/scripts/extract_bazel.py" …` where `$SKILL_DIR` is this
 > skill's install location (e.g. `~/.claude/skills/any2bazel`). The artifacts
 > you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
 > `BUILD.bazel`/`MODULE.bazel`, and `any2bazel.json` — live in or beside the
 > target repo.
 >
-> **Working directory:** run `cmake` and `bazel` from the **target repo root**
-> (the Bazel workspace). Only the `$SKILL_DIR/scripts/*.py` helpers live
-> elsewhere.
+> **Working directory:** run the reference build and `bazel` from the **target
+> repo root** (the Bazel workspace). Only the `$SKILL_DIR/scripts/*.py` helpers
+> live elsewhere.
 >
-> **`<repo_root>` placeholder:** the project's source/workspace root — normally
-> the same path as `<src>`. It MUST be **identical** in the `extract_cmake.py`
-> and `extract_bazel.py` calls: both key translation units by their path
-> relative to `<repo_root>`, so a mismatch makes every source look
-> missing/extra and the diff becomes meaningless.
+> **`<repo_root>` placeholder:** the project's source/workspace root. It MUST be
+> **identical** in the reference extractor (`extract_<frontend>.py`) and
+> `extract_bazel.py` calls: both key translation units by their path relative
+> to `<repo_root>`, so a mismatch makes every source look missing/extra and the
+> diff becomes meaningless.
 
-### 1. Confirm scope
-Inspect `CMakeLists.txt`. If you find custom commands, codegen, or
-`find_package` of non-system libs, surface them and confirm before proceeding.
+### Prepare for migration
 
-### 2. Extract the CMake reference model
-Single CMake pass emits both the File API reply and a `--trace` (the latter is
-the only place `configure_file()` outputs are visible — they leave no node in
-the build graph). The optional 4th arg feeds the trace to the extractor, which
-records configure-time generated files in `configured_files`.
+#### Identify the reference build system {#identify-reference}
+
+All frontends extract into one shared **action-based model**; a language/
+mnemonic-aware differ compares each against a Bazel `aquery` model. Each
+frontend has a reference guide with the context unique to that build system.
+Match the marker files at the repo root against the *Detect via* column of
+ the table below.
+- If more than one matches (e.g. a CMake project with a `package.json` for
+  tooling), ask the user which build is the reference.
+- If none match, stop and offer to use the current project as a case study
+  to add support for a new build system frontend.
+
+| Frontend | Detect via | Reference source | Diffs | Status | Guide |
+|----------|------------|------------------|-------|--------|-------|
+| **CMake** | `CMakeLists.txt` | File API codemodel-v2 | C/C++ compile + link parity | **Mature** — the validated path | [REFERENCE-cmake.md](docs/REFERENCE-cmake.md) |
+| **Maven** | `pom.xml` | forked `javac` argfiles | Java source-set parity | **Early** — argv-floor only | [REFERENCE-maven.md](docs/REFERENCE-maven.md) |
+| **VSCode / npm** | `package.json` driving gulp/esbuild/tsc | esbuild/tsc/`child_process` instrumentation | standalone TS emit check | **Experimental** — not wired into the main loop | [REFERENCE-npm.md](docs/REFERENCE-npm.md) |
+
+**Read the matching reference guide in full before continuing**, and don't
+read the others. Later steps defer to it for anything specific to the
+reference build.
+
+#### Confirm scope {#confirm-scope}
+
+Inspect the reference build for anything unsupported. Surface them and confirm
+with the user before proceeding.
+
+**NOT yet supported — warn the user if the project has these:**
+- Custom commands / generated code
+- Per-test-binary identity alignment, and include search **order** (presence
+  only) — both have planned follow-ups
+- Packaging / install rules
+- Automatic external-dependency resolution
+
+Each build system specific reference guide lists additional limits that you must
+look for.
+
+#### Extract the reference model {#extract-reference-model}
+
+Run the reference build's extraction exactly as its reference guide describes.
+Every extractor produces the same canonical model:
 ```bash
-mkdir -p <build>/.cmake/api/v1/query
-touch     <build>/.cmake/api/v1/query/codemodel-v2
-cmake -S <src> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-    --trace-expand --trace-format=json-v1 2> <build>/trace.jsonl   # + project flags
-python3 scripts/extract_cmake.py <build> <repo_root> model.cmake.json <build>/trace.jsonl
+python3 scripts/extract_<frontend>.py <…> <repo_root> model.<frontend>.json
 ```
-> Configure-time generated compile inputs (e.g. CMake's `configure_file` output
-> `zconf.h`) are recorded but **not yet diffed** — the Bazel-side extraction and
-> the content differ are TODO (see `docs/TODO-configure-time-generation.md`).
-> This is distinct from build-time codegen (genrules), which is also unmodeled.
+Note the platform and options the reference build was configured with; the
+Bazel side must mirror them.
 
-### 3. Generate initial BUILD.bazel files  *(LLM step)*
-Read `model.cmake.json`. For each production target emit a `cc_library` /
+### Create initial BUILD.bazel files
+
+Read `model.<frontend>.json`. For each production target emit a `cc_library` /
 `cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Library
-grouping need not match CMake (TU-set comparison is grouping-agnostic), but keep
-**executable** names aligned or add a `target_map` entry. Write `MODULE.bazel`
-as needed — before picking rulesets or pinning versions, read
+grouping need not match the reference (TU-set comparison is
+grouping-agnostic), but keep **executable** names aligned or add a `target_map`
+entry. Write `MODULE.bazel` as needed — before picking rulesets or pinning
+versions, read
 [docs/BAZEL-RULES.md](docs/BAZEL-RULES.md) (which rulesets have been exercised
 here, why some were hand-written instead, and why a version must be resolved
 rather than recalled). Put `common --check_direct_dependencies=error` in the
 generated `.bazelrc` so a declared version that MVS overrides fails the build
 instead of being a warning nobody reads.
 
-### 4. Extract the Bazel side
+### Main migration loop {#main-migration-loop}
+
+#### Extract the Bazel action graph {#extract-bazel-graph}
+
 > **Critical: aquery must be invoked the way the project is actually built.**
 > A bare `bazel aquery` omits config-gated and top-level flags and will
 > manufacture hundreds of false discrepancies. Mirror the real build:
@@ -255,8 +252,9 @@ instead of being a warning nobody reads.
 >   -fno-rtti` to be set at the top level, not in libraries). The tool cannot
 >   infer these — get them from the project's build instructions and pass them
 >   through, or record genuinely-irreducible differences in `any2bazel.json`.
-> - Use the **same platform/options** as the CMake configure in step 2, or the
->   two sides aren't comparable.
+> - Use the **same platform/options** as the reference build in
+>   [Extract the reference model](#extract-reference-model), or the two sides
+>   aren't comparable.
 > - **Always** call aquery with `--features=-compiler_param_file` and
 >   `--features=-linker_param_file` to disable use of param files. Param files
 >   are never generated during `aquery` calls, so when they're in use they'll
@@ -269,19 +267,25 @@ bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
     --output=jsonproto > aquery.json
 python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
 ```
+The mnemonics above cover C/C++. If the reference guide specifies a different
+mnemonic set, use that instead.
+
 If analysis fails, fix that first before trusting the diff. If a flag differs
 only because of a build-convention gap (e.g. `-std=gnu++17` vs `-std=c++17`,
 GNU-extensions on/off), that's a judgment call for `any2bazel.json`, not a
 BUILD-file bug.
 
-### 5. Diff
+#### Diff against reference build {#diff}
+
 ```bash
-python3 scripts/diff.py model.cmake.json model.bazel.json \
+python3 scripts/diff.py model.<frontend>.json model.bazel.json \
     <repo_root>/any2bazel.json > diff.json   # 3rd arg optional
 ```
 `diff.json` has `converged` (⇔ zero `error` discrepancies), a `discrepancies`
 worklist (each with `kind`, `severity`, `target`, `tu`, `cmake_only`,
 `bazel_only`), and an `excluded` map of non-participating targets by role.
+`cmake_only` is a historical name: for every frontend it means "present in the
+reference, absent in Bazel".
 Synthetic target names `<libraries>`, `<external>` (and `<tests>` when
 `include_tests`) denote the unioned library-TU, external-dep, and test-TU
 comparisons.
@@ -294,11 +298,12 @@ are easiest to reason about once the TUs underneath agree.
 
 `error`-severity kinds (above) block convergence and are what you fix. The diff
 also emits **WARN-only** kinds that don't block `converged` — `extra_tu` /
-`extra_target` (compiled/built on the Bazel side but not CMake) and
+`extra_target` (compiled/built on the Bazel side but not the reference) and
 `extra_test_tu` — note them but they need no action unless they point to
 something you didn't intend to add.
 
-### 6. Triage
+#### Triage findings {#triage}
+
 ```bash
 python3 scripts/triage.py diff.json                 # grouped summary
 python3 scripts/triage.py diff.json --kind flags_diff   # drill into one kind
@@ -312,7 +317,15 @@ is systematic — one fix (a copt, an include, a `target_map`/`ignore`/`copts`
 entry) clears it in bulk; a value on one TU is local. Always triage before
 hand-reading the worklist.
 
-### 7. Fix  *(LLM step)*, then loop
+#### Fix findings {#fix}
+
+> [!IMPORTANT]
+> This is the step where you may modify and create build files.
+
+All per-iteration judgment goes into the generated `BUILD.bazel`, `MODULE.bazel`, `.bzl`,
+and `any2bazel.json` (reviewed). `$SKILL_DIR/scripts/` are deterministic and must
+**not** be edited per-run.
+
 For each `error`, decide: real defect → fix the BUILD file; accepted difference
 → add to `any2bazel.json` `ignore` (only for warning/cosmetic flags, **never**
 correctness flags).
@@ -322,86 +335,46 @@ correctness flags).
 | `missing_target` | add the missing `cc_binary`, or `target_map` a renamed exe, or `exclude_targets` if out of scope |
 | `missing_tu`     | add the source to some library's `srcs`, or `exclude_targets` if it's a vendored/out-of-scope subtree |
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
-| `includes_diff`  | add the missing CMake include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
+| `includes_diff`  | add the missing reference include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
-| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag CMake repeats at link) |
+| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag the reference repeats at link) |
 | `missing_dep`    | add the missing external/system dep to the target's `deps`/`linkopts`; if it's just a name spelled differently per build (`Catch2Main` vs `catch2_main`, `OpenSSL::SSL` vs `ssl`), add a `dep_map` entry. External deps are captured from both `-l` flags and archive-file inputs (e.g. `external/catch2+/libcatch2_main.a`) |
 | `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
 | `test_binary_count` | (tests on, warning) differing number of test executables — investigate which side has the extra/missing binary |
 
-Then re-diff: if you edited `BUILD.bazel`/`MODULE.bazel`, re-run from step 4
-(re-extract the Bazel side); if you only edited `any2bazel.json`, re-run from
-step 5. Repeat until `converged: true`. Report remaining `warn` items and the
-`excluded` roles.
+Kinds specific to a reference build system are listed in its reference guide.
 
-### 8. (Optional) Diff tests
+#### Repeat
+
+If you edited `BUILD.bazel`/`MODULE.bazel`/`.bzl`, re-run from
+[Extract the Bazel action graph](#extract-bazel-graph) (re-extract the Bazel
+side); if you only edited `any2bazel.json`, re-run from
+[Diff against reference build](#diff). Repeat until `converged: true`. Report
+remaining `warn` items and the `excluded` roles.
+
+### (Optional) Diff tests {#diff-tests}
+
 Once production parity is reached, opt into test diffing:
-- Re-extract **both** sides with tests enabled and the **same** scope: CMake
-  configured without `-D..._BUILD_TESTING=OFF`; aquery over `//...` (not a
-  single target). Asymmetric scope fabricates findings.
+- Re-extract **both** sides with tests enabled and the **same** scope: the
+  reference build with tests enabled as its reference guide describes; aquery
+  over `//...` (not a single target). Asymmetric scope fabricates findings.
 - Set `"include_tests": true` in `any2bazel.json`, re-extract both models
-  (steps 2 and 4) with the test-inclusive configure/aquery, then re-run the
-  diff/triage/fix loop (steps 5–7).
+  ([reference](#extract-reference-model) and [Bazel](#extract-bazel-graph))
+  with the test-inclusive configure/aquery, then re-run the
+  [main migration loop](#main-migration-loop).
 - Test sources are compared as a project-wide TU-set union (grouping/naming
   agnostic); a `test_binary_count` warning flags differing numbers of test
   executables. Per-binary identity alignment is a later layer — for now,
   `missing_test_tu` tells you a test source isn't compiled on the Bazel side
   (e.g. an un-ported test binary).
+- Run the main migration loop until all tests converge.
 
-### 9. Report
+### Report results
+
 Summarize: production targets reconciled, rounds taken, suppressions recorded in
 `any2bazel.json` (with rationale), excluded roles (dashboard/codegen) for
 human follow-up, and — if `include_tests` was on — test-source parity and any
 test-binary count gap.
-
-## What you edit
-
-`$SKILL_DIR/scripts/` are deterministic and must **not** be edited per-run. All
-per-iteration judgment goes into the generated `BUILD.bazel`/`MODULE.bazel` and
-`any2bazel.json` (reviewed).
-
-## Other frontends
-
-The Maven and VSCode/npm frontends share the action model and differ but are
-newer captures — treat their output as exploratory, and don't apply the CMake
-`any2bazel.json` machinery to them (they don't read it).
-
-### Maven → Bazel (early)
-Maven has no action graph; the reference is the **forked `javac` argument
-file**. Java compiles a whole source set at once, so it's compared as a
-project-wide union of `.java` sources (grouping/naming agnostic), analogous to
-how libraries are compared. argv-floor only — coordinate deps aren't extracted.
-```bash
-mvn clean compile -Dmaven.compiler.fork=true          # writes <module>/target/*arguments
-python3 scripts/extract_maven.py <module_dir> <repo_root> model.maven.json
-bazel aquery 'mnemonic("Javac", //...)' --output=jsonproto > aquery.json
-python3 scripts/extract_bazel.py aquery.json <repo_root> model.bazel.json
-python3 scripts/diff.py model.maven.json model.bazel.json > diff.json
-```
-Diff kinds: `missing_java_src` / `extra_java_src` (a `.java` compiled on only
-one side).
-
-### VSCode / npm → Bazel (experimental)
-An npm/gulp/esbuild build is instrumented in-process by a Node preload (hooks
-esbuild, the TS language service, and `child_process`), emitting one NDJSON
-record per action. `diff_ts.py` does a **standalone** TS source→emit check; it
-is not part of the main diff loop.
-```bash
-NODE_OPTIONS="--import file://$SKILL_DIR/scripts/npm_instrument/preload.mjs" \
-VSCODE_EMIT_BUILD_IR=$PWD/actions.ndjson \
-    npm run <build-script>
-python3 scripts/extract_npm.py actions.ndjson <repo_root> model.npm.json
-python3 scripts/diff_ts.py model.npm.json model.bazel.json    # standalone check
-```
-The preload must be run from a copy **inside the target repo**
-(`cp scripts/npm_instrument/*.mjs <repo>/.instr/`): `typescript-shim.mjs`
-resolves `typescript` relative to its own location, so running it from this
-repo fails with `ERR_MODULE_NOT_FOUND`.
-
-Worked example, with byte-parity results and the failure modes a bespoke JS
-build brings (no action graph to extract, traversal-order-dependent output,
-`node_modules` as both toolchain and foreign Bazel package):
-[docs/CASE-vscode-migration.md](docs/CASE-vscode-migration.md).
 
 ## Updating this skill
 
