@@ -423,8 +423,12 @@ If you edited `BUILD.bazel`/`MODULE.bazel`/`.bzl`, re-run from
 side); if you only edited `any2bazel.json`, re-run from
 [Diff against reference build](#diff). Repeat until `converged: true`; then,
 once, run `bazel build //...` from a fresh output base: it must succeed, and so
-must `bazel test` over the tests you declared. Report remaining `warn` items and
-the `excluded` roles.
+must `bazel test` over the tests you declared. Then check
+`git status --short --ignored` for files you wrote that the project's
+`.gitignore` hides (a `/build*` rule also matches `build_defs/`): a file git
+ignores is not in the migration anyone commits. Rename it, or add a `!`
+exception to `.gitignore`, and say which. Report remaining `warn` items and the
+`excluded` roles.
 
 ### (Optional) Diff tests {#diff-tests}
 
