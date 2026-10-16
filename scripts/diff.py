@@ -283,6 +283,17 @@ def _participating(views: Dict[str, TargetView], cfg: "MigrationConfig") -> set:
             if t.role in PARTICIPATING_ROLES and not cfg.target_excluded(n)}
 
 
+def _link_only(views: Dict[str, TargetView], cfg: "MigrationConfig") -> set:
+    """Targets that compile nothing of their own but do link: a CMake library
+    assembled from object libraries, or (nearly always) a Bazel
+    cc_shared_library or cc_binary that wraps cc_library deps. Their TUs are
+    compared through the libraries they wrap, but the external libraries THEY
+    link are only on their own link lines, so the link-closure check must read
+    them too."""
+    return {n for n, t in views.items()
+            if t.role == TargetRole.AGGREGATE and not cfg.target_excluded(n)}
+
+
 def _apply_target_map(views: Dict[str, TargetView],
                       target_map: Dict[str, str]) -> Dict[str, TargetView]:
     """Rename Bazel-side target VIEWS into the CMake namespace using a declared
@@ -626,10 +637,15 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # static libs, whose .a is repeated on the link line but which are not a
     # direct structural dependency). Such names are verified via the compile
     # TU-set of that target, so drop them from the external closure.
+    # Link-only targets (see _link_only) take part: in a Bazel migration every
+    # cc_shared_library is one, so without them a library linked only by a
+    # shared library read as missing although it is on that library's line.
     _internal_names = set(a_views) | set(b_views)
-    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a_views, a_names)
+    a_link = a_names | _link_only(a_views, cfg)
+    b_link = b_names | _link_only(b_views, cfg)
+    a_ext = {cfg.dep_map.get(d, d) for d in _external_deps(a_views, a_link)
              if cfg.dep_map.get(d, d) not in _internal_names and d not in _internal_names}
-    b_ext = {d for d in _external_deps(b_views, b_names) if d not in _internal_names}
+    b_ext = {d for d in _external_deps(b_views, b_link) if d not in _internal_names}
     for dep in sorted(a_ext - b_ext):
         out.append(Discrepancy(Kind.MISSING_DEP.value, Severity.ERROR.value,
                                "<external>", "external link dependency missing on bazel side",
