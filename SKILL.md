@@ -25,7 +25,9 @@ install them.
 - `python3`
 - `bazel` or `bazelisk`
 - `curl` or `wget`
-- `jq`
+
+`jq` is handy for reading the JSON outputs, but no script needs it: if it is
+missing, carry on with `python3 -m json.tool`.
 
 ## Migration strategy overview
 
