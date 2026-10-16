@@ -305,6 +305,32 @@ def test_missing_external_link_dep_is_error():
     assert any(d.kind == "missing_dep" and d.severity == "error" for d in discs)
 
 
+def test_external_dep_linked_only_by_a_bazel_shared_library_is_not_missing():
+    # QGIS (any2bazel-lab run 089): provider_mdal is a CMake SHARED library with
+    # its own sources, linking hdf5; under Bazel it is a cc_shared_library that
+    # compiles nothing itself (an aggregate) and carries -lhdf5 on its own link
+    # line. That is the dep, present; it must not read as missing.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("provider_mdal", TargetKind.SHARED, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("src/mdal.cpp", ["-DFOO=1"], is_bazel=False)],
+                 deps=[Dependency("hdf5", external=True)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("mdal_lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("src/mdal.cpp", ["-DFOO=1"], is_bazel=True)]))
+    b.add(Target("provider_mdal.so", TargetKind.SHARED, role=TargetRole.AGGREGATE,
+                 actions=[], deps=[Dependency("hdf5", external=True)]))
+    assert not [d for d in diff_models(a, b) if d.kind == "missing_dep"]
+    # ...and a dep that no target links on the Bazel side still is missing
+    b2 = _bs(CanonicalModel(), is_bazel=True)
+    b2.add(Target("mdal_lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                  actions=[tu_from_raw("src/mdal.cpp", ["-DFOO=1"], is_bazel=True)]))
+    b2.add(Target("provider_mdal.so", TargetKind.SHARED, role=TargetRole.AGGREGATE, actions=[]))
+    assert [d.cmake_only for d in diff_models(a, b2) if d.kind == "missing_dep"] == [["hdf5"]]
+    # ...and a config-excluded link-only target does not supply it
+    cfg = MigrationConfig(exclude_targets={"provider_mdal.so"})
+    assert [d for d in diff_models(a, b, cfg) if d.kind == "missing_dep"]
+
+
 def test_external_dep_naming_an_in_project_target_is_not_missing():
     # A dep flagged external=True whose name matches an in-project target is
     # NOT truly external -- the CMake File-API surfaces cyclically-linked static
