@@ -28,10 +28,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
+from canonicalize import canonicalize_flags
 from config import MigrationConfig
 from diff import Severity, diff_models, summarize
 from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
                    TargetKind, TargetRole)
+from reconstruct import reconstruct
 
 REPO = "/work/proj"
 
@@ -141,6 +143,45 @@ def test_missing_cmake_flag_is_caught():
     # the missing define must be reported on the cmake_only side
     dd = next(d for d in discs if d.kind == "defines_diff")
     assert "NEEDED=1" in dd.cmake_only
+
+
+# A redundant -c inside the project's own flags (CMAKE_C_FLAGS="-c -std=c11";
+# gcc ignores the repetition). -c takes no argument, so it must neither be read
+# as naming the source nor swallow the flag that follows it.
+_STRAY_C_RAW = ["-mcpu=cortex-m4", "-c", "-std=c11", "-Wall"]
+
+
+def test_stray_c_does_not_swallow_next_flag():
+    _, _, flags = canonicalize_flags(_STRAY_C_RAW + ["-c", "src/a.c"], REPO,
+                                     is_bazel=False)
+    assert flags == ("-Wall", "-mcpu=cortex-m4", "-std=c11"), flags
+
+
+def _stray_c_model(bazel_raw=None):
+    """Two-TU target; the CMake side carries the stray -c, the Bazel side
+    `bazel_raw` (None = the CMake model itself)."""
+    raw = _STRAY_C_RAW if bazel_raw is None else bazel_raw
+    m = _bs(CanonicalModel(), is_bazel=bazel_raw is not None)
+    m.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw(s, raw, is_bazel=bazel_raw is not None)
+                          for s in ("src/a.c", "src/b.c")]))
+    return m
+
+
+def test_stray_c_keeps_tus_keyed_by_source():
+    tus = reconstruct(_stray_c_model())["lib"].tu_map()
+    assert sorted(tus) == ["src/a.c", "src/b.c"], sorted(tus)
+
+
+def test_stray_c_flag_is_compared():
+    a = _stray_c_model()
+    ok = _stray_c_model(["-mcpu=cortex-m4", "-std=c11", "-Wall"])
+    assert summarize(diff_models(a, ok))["errors"] == 0
+    missing = _stray_c_model(["-mcpu=cortex-m4", "-Wall"])  # no -std=c11
+    discs = diff_models(a, missing)
+    fd = [d for d in discs if d.kind == "flags_diff"]
+    assert fd and all("-std=c11" in d.cmake_only for d in fd), discs
+    assert not summarize(discs)["converged"]
 
 
 def test_extra_bazel_define_is_warn_not_error():
