@@ -104,15 +104,15 @@ AQUERY = {
 }
 
 
-def _write_cmake_fixture(root):
+def _write_cmake_fixture(root, codemodel=CODEMODEL, target=TARGET_MYLIB):
     reply = os.path.join(root, "build", ".cmake", "api", "v1", "reply")
     os.makedirs(reply)
     with open(os.path.join(reply, "index-0.json"), "w") as f:
         json.dump({"objects": [{"kind": "codemodel", "jsonFile": "codemodel.json"}]}, f)
     with open(os.path.join(reply, "codemodel.json"), "w") as f:
-        json.dump(CODEMODEL, f)
+        json.dump(codemodel, f)
     with open(os.path.join(reply, "target-mylib.json"), "w") as f:
-        json.dump(TARGET_MYLIB, f)
+        json.dump(target, f)
     return os.path.join(root, "build")
 
 
@@ -148,6 +148,26 @@ def test_cmake_extracts_canonical_flags():
         assert "FOO=1" in tu.defines
         assert "include" in tu.includes          # made repo-relative
         assert "-std=c++17" in tu.flags
+
+
+def test_cmake_sources_resolve_against_top_level_source_dir():
+    # `cmake -S sub/proj` with repo_root one level up: the File API gives
+    # in-tree sources relative to the TOP-LEVEL SOURCE DIR (paths.source), not
+    # to repo_root, and out-of-tree sources absolute. TU keys must still be
+    # repo-relative, else every source looks missing/extra against Bazel.
+    codemodel = dict(CODEMODEL, paths={"source": REPO + "/sub/proj",
+                                       "build": REPO + "/sub/proj/build"})
+    target = dict(TARGET_MYLIB,
+                  sources=[{"path": "src/a.cpp"}, {"path": "/opt/sdk/s.c"}],
+                  compileGroups=[dict(TARGET_MYLIB["compileGroups"][0],
+                                      sourceIndexes=[0, 1])])
+    with tempfile.TemporaryDirectory() as root:
+        build = _write_cmake_fixture(root, codemodel, target)
+        a = extract_cmake.extract(build, REPO)
+        tus = _view(a, "mylib").tu_map()
+        assert sorted(tus) == ["/opt/sdk/s.c", "sub/proj/src/a.cpp"], sorted(tus)
+        compile_inputs = [act.inputs for act in a.targets["mylib"].actions]
+        assert (REPO + "/sub/proj/src/a.cpp",) in compile_inputs, compile_inputs
 
 
 def test_bazel_infers_kind_and_drops_defaults():
