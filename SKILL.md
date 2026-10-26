@@ -159,6 +159,8 @@ Fields:
   ([Diff tests](#diff-tests)). Recorded for reviewers; not read by the diff.
 - **`set_aside`** — project agent directives you set aside, and why (see
   [Confirm scope](#confirm-scope)).
+- **`scope_findings`** — scope findings and your decisions, when no one could
+  answer (see [Confirm scope](#confirm-scope)).
 - **`include_tests`** (default `false`) — opt in to also diffing **test**
   targets. OFF by default because it requires BOTH models to be extracted with
   tests enabled and the **same** test scope (symmetric configure + aquery);
@@ -235,7 +237,10 @@ reference build.
 #### Confirm scope {#confirm-scope}
 
 Inspect the reference build for anything unsupported. Surface them and confirm
-with the user before proceeding.
+with the user before proceeding. If no one can answer (non-interactive), record
+the findings and your decision under `scope_findings` in `any2bazel.json` and
+proceed, unless an item on the not-yet-supported list below applies: without an
+answer, stop there and report it.
 
 **NOT yet supported — warn the user if the project has these:**
 - Build-time custom commands / generated code. Configure-time generated
