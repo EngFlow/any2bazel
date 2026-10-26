@@ -256,7 +256,7 @@ changes what "migrated" means, so surface it when
 first diff; the test-inclusive configure for [Diff tests](#diff-tests) is
 recorded apart, as `test_configure_command`.
 
-### Create initial BUILD.bazel files
+### Create initial BUILD.bazel files {#create-build-files}
 
 Read `model.<frontend>.json`. For each production target emit a `cc_library` /
 `cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Library
@@ -269,6 +269,9 @@ here, why some were hand-written instead, and why a version must be resolved
 rather than recalled). Put `common --check_direct_dependencies=error` in the
 generated `.bazelrc` so a declared version that MVS overrides fails the build
 instead of being a warning nobody reads.
+
+The reference guide covers what is specific to translating its build system
+(for CMake: the build type).
 
 ### Main migration loop {#main-migration-loop}
 
