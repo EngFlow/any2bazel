@@ -976,6 +976,104 @@ def test_executables_still_aligned_by_identity():
     assert any(d.kind == "missing_target" for d in discs)
 
 
+def test_executable_aligns_by_unique_label_basename():
+    # CMake keys executables by bare name, Bazel by package-qualified label;
+    # an unambiguous basename needs no target_map entry.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    b = _bs(CanonicalModel(), is_bazel=True)
+    for name in ("BinRec", "Hash3D"):
+        a.add(Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw(f"gems/{name}.c", ["-DX"], False)]))
+    b.add(Target("gems:BinRec", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("gems/BinRec.c", ["-DX"], True)]))
+    b.add(Target(":Hash3D", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("gems/Hash3D.c", ["-DX"], True)]))
+    notes = DiffNotes()
+    discs = diff_models(a, b, notes=notes)
+    res = summarize(discs, notes=notes)
+    assert res["converged"] and discs == [], discs
+    assert res["aligned_by_basename"] == {"BinRec": "gems:BinRec", "Hash3D": ":Hash3D"}
+
+
+def test_ambiguous_basename_is_not_aligned():
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x/tool.c", [], False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    for pkg in ("x", "y"):
+        b.add(Target(f"{pkg}:tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("x/tool.c", [], True)]))
+    kinds = sorted(d.kind for d in diff_models(a, b))
+    assert kinds == ["extra_target", "extra_target", "missing_target"], kinds
+    # target_map resolves the ambiguity
+    discs = diff_models(a, b, MigrationConfig(target_map={"tool": "x:tool"}))
+    assert [d.kind for d in discs] == ["extra_target"], discs
+
+
+def test_target_map_wins_over_basename_alignment():
+    # A target_map entry consumes the Bazel executable, so it is no longer a
+    # basename candidate for the same-named CMake executable.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    for name in ("tool", "tool_v2"):
+        a.add(Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("x/tool.c", [], False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("x:tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x/tool.c", [], True)]))
+    notes = DiffNotes()
+    discs = diff_models(a, b, MigrationConfig(target_map={"tool_v2": "x:tool"}),
+                        notes)
+    assert [(d.kind, d.target) for d in discs] == [("missing_target", "tool")], discs
+    assert notes.aligned_by_basename == {}
+
+
+def test_a_target_map_key_never_aligns_by_basename():
+    # An entry naming a Bazel target that does not exist consumes nothing;
+    # the CMake name must still not fall back to basename alignment.
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x/tool.c", [], False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("x:tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x/tool.c", [], True)]))
+    notes = DiffNotes()
+    cfg = MigrationConfig(target_map={"tool": "y:tool_renamed"})
+    kinds = sorted(d.kind for d in diff_models(a, b, cfg, notes))
+    assert kinds == ["extra_target", "missing_target"], kinds
+    assert notes.aligned_by_basename == {}
+
+
+def test_auto_aligned_exclusion_is_shared_by_diff_and_summaries():
+    # CMake app, Bazel pkg:app, aligned by basename; exclude_targets names
+    # app. The diff skips it, and so must the excluded list and the levels.
+    def m(name, raw, is_bazel):
+        model = _bs(CanonicalModel(), is_bazel)
+        model.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("src/a.cpp", ["-O2"], is_bazel)]))
+        model.add(Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("app/m.cpp", raw, is_bazel)]))
+        return model
+    a, b = m("app", ["-O2"], False), m("pkg:app", ["-O0"], True)
+    cfg = MigrationConfig(exclude_targets={"app"})
+    notes = DiffNotes()
+    res = summarize(diff_models(a, b, cfg, notes), a, b, cfg, notes)
+    assert res["discrepancies"] == [], res
+    assert res["aligned_by_basename"] == {"app": "pkg:app"}, res
+    assert res["excluded"]["bazel"] == {"config_excluded": ["pkg:app"]}, res
+    assert not res["levels"]["differs"], res["levels"]
+    assert res["ndebug"]["bazel"] == {"(none)": 1}, res["ndebug"]
+
+
+def test_basename_never_aligns_a_library_or_an_exact_match():
+    a = _bs(CanonicalModel(), is_bazel=False)
+    a.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("app.c", [], False)]))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("pkg:app", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("app.c", [], True)]))
+    assert any(d.kind == "missing_target" for d in diff_models(a, b))
+
+
 def _exe(name, link_raw, is_bazel, src="tool/m.cpp"):
     return Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
                   actions=[tu_from_raw(src, ["-DFOO=1"], is_bazel=is_bazel),
