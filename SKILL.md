@@ -298,10 +298,12 @@ recorded apart, as `test_configure_command`.
 ### Create initial BUILD.bazel files {#create-build-files}
 
 Read `model.<frontend>.json`. For each production target emit a `cc_library` /
-`cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Library
-grouping need not match the reference (TU-set comparison is
-grouping-agnostic), but keep **executable** names aligned or add a `target_map`
-entry. Write `MODULE.bazel` as needed — before picking rulesets or pinning
+`cc_binary` with `srcs`, `hdrs`, `copts`, `defines`, `includes`, `deps`. Bazel's
+`defines` propagate to every dependent; a define the reference keeps private to
+one target (CMake's `PRIVATE`, such as `<target>_EXPORTS`) belongs in
+`local_defines`. Library grouping need not match the reference (TU-set
+comparison is grouping-agnostic), but keep **executable** names aligned or add
+a `target_map` entry. Write `MODULE.bazel` as needed — before picking rulesets or pinning
 versions, read
 [docs/BAZEL-RULES.md](docs/BAZEL-RULES.md) (which rulesets have been exercised
 here, why some were hand-written instead, and why a version must be resolved
