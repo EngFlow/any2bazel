@@ -301,6 +301,106 @@ def test_bazel_extracts_link_flags_from_cpplink():
         assert foo is not None and not foo.external, t.deps
 
 
+def test_cmake_link_interface_flags_become_link_flags():
+    # Flags a dependency carries on its LINK INTERFACE arrive in the File API's
+    # "libraries" fragments, not "flags". They must reach the link-flag
+    # comparison; library positioning/rpath flags must not.
+    import extract_cmake as ec
+    from model import Target, TargetKind
+    tobj = {"link": {"commandFragments": [
+        {"fragment": "-rdynamic", "role": "flags"},
+        {"fragment": "-Xlinker -export-dynamic", "role": "libraries"},
+        {"fragment": "-fopenmp", "role": "libraries"},
+        {"fragment": "-Wl,-rpath,/work/proj/build/lib", "role": "libraries"},
+        {"fragment": "-Wl,--rpath,/work/proj/build/lib", "role": "libraries"},
+        {"fragment": "-Xlinker -rpath -Xlinker /work/proj/build/lib",
+         "role": "libraries"},
+        {"fragment": "-lz", "role": "libraries"},
+        {"fragment": "/usr/lib/libpython3.12.so", "role": "libraries"},
+        {"fragment": "-Wl,--whole-archive", "role": "libraries"},
+        {"fragment": "lib/libplugins.a", "role": "libraries"},
+        {"fragment": "-Wl,--no-whole-archive", "role": "libraries"},
+        {"fragment": "-L/opt/lib", "role": "libraryPath"},
+        # search paths and frameworks under the "libraries" role are not flags
+        {"fragment": "-L/opt/other/lib", "role": "libraries"},
+        {"fragment": "-framework Cocoa", "role": "libraries"},
+    ]}}
+    t = Target("blender", TargetKind.EXECUTABLE)
+    ec._attach_deps(t, tobj, {})
+    from model import BuildSystem
+    from reconstruct import reconstruct_target
+    v = reconstruct_target(t, BuildSystem.CMAKE, REPO)
+    assert v.link_flags == ("-Wl,-export-dynamic", "-fopenmp", "-rdynamic"), v.link_flags
+    assert sorted(d.name for d in v.deps) == ["Cocoa", "plugins", "python3", "z"], \
+        v.deps
+
+
+def test_bazel_solib_rpaths_are_toolchain_noise():
+    # A realistic Bazel CppLink argv: its -Xlinker rpath pairs fold to -Wl,
+    # tokens, which must not surface as Bazel-only link flags.
+    from canonicalize import canonicalize_link_flags
+    argv = ["external/toolchain/cc_wrapper.sh", "-o", "bazel-out/k8-opt/bin/app",
+            "-Xlinker", "-rpath", "-Xlinker", "$ORIGIN/_solib_k8/_U_S_Sfoo",
+            "-Xlinker", "-rpath", "-Xlinker", "$EXEC_ORIGIN/_solib_k8/_U_S_Sfoo",
+            "-Xlinker", "-rpath", "-Xlinker",
+            "@loader_path/../_solib_darwin_arm64/_U_S_Sfoo",
+            "-Lbazel-out/k8-opt/bin/_solib_k8/_U_S_Sfoo", "-lfoo",
+            "bazel-out/k8-opt/bin/_objs/app/main.o", "-Wl,-S", "-pthread",
+            "-Xlinker", "-export-dynamic"]
+    assert canonicalize_link_flags(argv, is_bazel=True) == \
+        ("-Wl,-export-dynamic", "-pthread")
+
+
+def test_project_rpaths_in_linkopts_are_kept_and_compared():
+    # A project's own rpath flags copied into linkopts must survive on the
+    # Bazel side (only the toolchain's _solib_ rpaths are noise), in any
+    # spelling, or they become false cmake-only errors.
+    from canonicalize import canonicalize_link_flags
+    from config import MigrationConfig
+    from diff import _diff_link_flags
+    from reconstruct import TargetView
+    from model import TargetKind, TargetRole
+    preamble = ["cc_wrapper.sh", "-o", "bazel-out/k8-opt/bin/app",
+                "-Xlinker", "-rpath", "-Xlinker", "$ORIGIN/_solib_k8/_U_S_Sfoo"]
+
+    def converges(cmake_flags, bazel_flags):
+        cmake = canonicalize_link_flags(cmake_flags, is_bazel=False)
+        bazel = canonicalize_link_flags(preamble + bazel_flags, is_bazel=True)
+        views = [TargetView("app", TargetKind.EXECUTABLE, TargetRole.PRODUCTION,
+                            link_flags=lf) for lf in (cmake, bazel)]
+        return _diff_link_flags("app", views[0], views[1], MigrationConfig()) == []
+
+    project = ["-Wl,-rpath,$ORIGIN/../lib", "-Wl,-rpath=/opt/lib",
+               "-Wl,-rpath-link,/opt/lib"]
+    assert canonicalize_link_flags(preamble + project, is_bazel=True) == \
+        tuple(sorted(project))
+    assert converges(project, project)
+    # two linker arguments (CMake's LINKER:-rpath,DIR under Clang is exactly
+    # -Xlinker -rpath -Xlinker DIR), and the -Wl, pair spelling
+    for two in (["-Xlinker", "-rpath", "-Xlinker", "/opt/lib"],
+                ["-Wl,-rpath", "-Wl,/opt/lib"],
+                ["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]):
+        assert converges(two, two), two
+    # across spellings: one rpath, however it is written
+    assert converges(["-Xlinker", "-rpath", "-Xlinker", "/x"], ["-Wl,-rpath,/x"])
+    assert converges(["-Wl,-rpath,/x"], ["-Wl,-rpath", "-Wl,/x"])
+    # and a genuinely missing project rpath is still caught
+    assert not converges(["-Xlinker", "-rpath", "-Xlinker", "/opt/lib"], [])
+    # only Bazel's own $ORIGIN/.../_solib_<cpu>/ rpaths are noise, not a
+    # project path that merely contains _solib_
+    assert converges(["-Wl,-rpath,/opt/_solib_/lib"], ["-Wl,-rpath,/opt/_solib_/lib"])
+    assert not converges(["-Wl,-rpath,/opt/_solib_/lib"], [])
+
+
+def test_xlinker_pairs_fold_to_wl_on_both_sides():
+    from canonicalize import canonicalize_link_flags
+    assert canonicalize_link_flags(["-Xlinker", "-export-dynamic"], is_bazel=False) \
+        == ("-Wl,-export-dynamic",)
+    assert canonicalize_link_flags(["cc_wrapper.sh", "-o", "out", "-Xlinker",
+                                    "-export-dynamic"], is_bazel=True) \
+        == ("-Wl,-export-dynamic",)
+
+
 def test_bazel_external_archive_is_external_dep():
     # An archive linked by PATH from external/ (a bzlmod module, e.g. catch2)
     # must be captured as an EXTERNAL dep -- previously dropped (only -l deps

@@ -53,8 +53,9 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
     includes (project-wide TU-set), and the external link-dependency closure
     matches.
   - **Link consistency** — every name-aligned executable links with
-    equivalent link flags. The per-binary stage: the *artifacts* agree, not just
-    the TUs.
+    equivalent link flags, including those a dependency adds through its link
+    interface (`-fopenmp`, `-Xlinker -export-dynamic`). The per-binary stage:
+    the *artifacts* agree, not just the TUs.
 
   Done when both stages converge. The comparison is **asymmetric**: every
   correctness-relevant reference flag must be present on the Bazel side; extra
@@ -366,7 +367,7 @@ correctness flags).
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
 | `includes_diff`  | add the missing reference include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
-| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (a compile flag the reference repeats at link that is not already reported as `link_compile_only_flags`) |
+| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (a compile flag the reference repeats at link that is not already reported as `link_compile_only_flags`). A flag that differs only by a reference build-tree path (`-Wl,--version-script,<build>/x.map`) is still a correctness flag: `ignore.link_flags` that exact spelling only after confirming the Bazel link passes an equivalent script with the same content |
 | `missing_dep`    | add the missing external/system dep to the target's `deps`/`linkopts`; if it's just a name spelled differently per build (`Catch2Main` vs `catch2_main`, `OpenSSL::SSL` vs `ssl`), add a `dep_map` entry. External deps are captured from both `-l` flags and archive-file inputs (e.g. `external/catch2+/libcatch2_main.a`) |
 | `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
 | `test_binary_count` | (tests on, warning) differing number of test executables — investigate which side has the extra/missing binary |
