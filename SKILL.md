@@ -110,6 +110,7 @@ whether its frontend reads it:
   "dep_map": { "Catch2Main": "catch2_main" },
   "exclude_targets": ["benchmark", "some_tool"],
   "include_tests": false,
+  "reference": { "configure_command": "cmake -S . -B build -G Ninja" },
   "ignore": {
     "defines": ["BORINGSSL_DISPATCH_TEST"],
     "flags": ["-fvisibility=hidden"],
@@ -127,12 +128,11 @@ whether its frontend reads it:
 ```
 
 Fields:
-- **`bazel_args`** — the extra **flags** aquery must run with to mirror the
-  real build (see [Extract the Bazel action graph](#extract-bazel-graph)), e.g.
-  `["--config=release"]` or `["-c", "opt"]`; never a command
-  (`["aquery", "mnemonic(...)", ...]` is wrong). Recorded so the comparison is
-  reproducible; `diff.py` refuses an entry that is neither a flag nor a flag's
-  value.
+- **`bazel_args`** — the extra **flags** aquery must run with (see
+  [Extract the Bazel action graph](#extract-bazel-graph)): only what the
+  project's documented build passes, as in the example (BoringSSL expects
+  `-fno-exceptions` at top level). Never a command (`["aquery", ...]`):
+  `diff.py` refuses it. Recorded so the comparison is reproducible.
 - **`target_map`** — `reference_name → bazel_name` for intentionally renamed
   **executables**, or when two Bazel packages share the basename. The value is
   the label without `//`: `:name` at the root, `pkg:name` elsewhere (e.g.
@@ -146,6 +146,11 @@ Fields:
   third-party/vendored code Bazel pulls as an external module, or tooling out
   of scope. The **only** lever for `missing_tu`/`missing_target` on whole
   subtrees. Excluded targets still appear under `excluded.config_excluded`.
+- **`reference.configure_command`** — the exact configure command the
+  reference model came from (see
+  [Extract the reference model](#extract-reference-model));
+  `reference.test_configure_command` holds the test-inclusive one
+  ([Diff tests](#diff-tests)). Recorded for reviewers; not read by the diff.
 - **`include_tests`** (default `false`) — opt in to also diffing **test**
   targets. OFF by default because it requires BOTH models to be extracted with
   tests enabled and the **same** test scope (symmetric configure + aquery);
@@ -243,6 +248,14 @@ python3 scripts/extract_<frontend>.py <…> <repo_root> model.<frontend>.json
 Note the platform and options the reference build was configured with; the
 Bazel side must mirror them.
 
+Configure the reference build with the project's **documented default**
+options: turning anything off (a product, the tests, distribution flags)
+changes what "migrated" means, so surface it when
+[confirming scope](#confirm-scope). Record the exact command as
+`any2bazel.json`'s `reference.configure_command` and never change it after the
+first diff; the test-inclusive configure for [Diff tests](#diff-tests) is
+recorded apart, as `test_configure_command`.
+
 ### Create initial BUILD.bazel files
 
 Read `model.<frontend>.json`. For each production target emit a `cc_library` /
@@ -275,6 +288,10 @@ instead of being a warning nobody reads.
 > - Use the **same platform/options** as the reference build in
 >   [Extract the reference model](#extract-reference-model), or the two sides
 >   aren't comparable.
+> - For settings **you** add to mirror the reference (e.g. Release's level),
+>   use `.bazelrc` `build` lines, not a named `--config`. Parity must hold for
+>   the project's documented build command: a plain `bazel build //...` unless
+>   the project documents flags, and only those go in `bazel_args`.
 > - **Always** call aquery with `--features=-compiler_param_file` and
 >   `--features=-linker_param_file` to disable use of param files. Param files
 >   are never generated during `aquery` calls, so when they're in use they'll
