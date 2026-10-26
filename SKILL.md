@@ -70,6 +70,12 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
   - **How shared libraries link.** A shared library is compared by its TUs
     only; its link flags and the libraries it links are not checked (the
     external-dep check is project-wide). Run a binary that loads each one.
+  - **That it builds.** A command for a TU that fails to compile compares as
+    well as one that works. Done also requires `bazel build //...` to succeed
+    from a fresh output base; name any target you leave out, and why. Every
+    test target you declare must also pass under `bazel test`, with the files
+    it reads declared as `data`: a test that passes only when run from the
+    reference's build directory has not been migrated.
 
 ### How targets are matched
 
@@ -270,7 +276,12 @@ versions, read
 here, why some were hand-written instead, and why a version must be resolved
 rather than recalled). Put `common --check_direct_dependencies=error` in the
 generated `.bazelrc` so a declared version that MVS overrides fails the build
-instead of being a warning nobody reads.
+instead of being a warning nobody reads. A dependency the host lacks can be
+vendored (a pinned module or `http_archive`, or `rules_foreign_cc` for a
+non-Bazel build); a TU left uncompiled for a missing dependency is a gap in the
+migration, not a property of the machine. Don't install it into the host
+instead (`make install`, `/usr/local`, `/opt`): the build then passes only on
+the machine you prepared, and a clean checkout on a fresh one fails.
 
 **Values read from the repository** (`git describe`, a commit hash) are lost
 silently: a genrule cannot see `.git` from the sandbox, and the binary reports
@@ -410,8 +421,14 @@ Kinds specific to a reference build system are listed in its reference guide.
 If you edited `BUILD.bazel`/`MODULE.bazel`/`.bzl`, re-run from
 [Extract the Bazel action graph](#extract-bazel-graph) (re-extract the Bazel
 side); if you only edited `any2bazel.json`, re-run from
-[Diff against reference build](#diff). Repeat until `converged: true`. Report
-remaining `warn` items and the `excluded` roles.
+[Diff against reference build](#diff). Repeat until `converged: true`; then,
+once, run `bazel build //...` from a fresh output base: it must succeed, and so
+must `bazel test` over the tests you declared. Then check
+`git status --short --ignored` for files you wrote that the project's
+`.gitignore` hides (a `/build*` rule also matches `build_defs/`): a file git
+ignores is not in the migration anyone commits. Rename it, or add a `!`
+exception to `.gitignore`, and say which. Report remaining `warn` items and the
+`excluded` roles.
 
 ### (Optional) Diff tests {#diff-tests}
 
@@ -432,7 +449,8 @@ Once production parity is reached, opt into test diffing:
 
 ### Report results
 
-Summarize: production targets reconciled, rounds taken, suppressions recorded in
+Summarize: production targets reconciled, the clean-build result (and any
+target left out, with the reason), rounds taken, suppressions recorded in
 `any2bazel.json` (with rationale), excluded roles (dashboard/codegen) for
 human follow-up, and — if `include_tests` was on — test-source parity and any
 test-binary count gap.
