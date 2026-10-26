@@ -271,6 +271,11 @@ rather than recalled). Put `common --check_direct_dependencies=error` in the
 generated `.bazelrc` so a declared version that MVS overrides fails the build
 instead of being a warning nobody reads.
 
+**Values read from the repository** (`git describe`, a commit hash) are lost
+silently: a genrule cannot see `.git` from the sandbox, and the binary reports
+an "unknown version". Feed them through `--workspace_status_command` to a
+`stamp = 1` rule.
+
 The reference guide covers what is specific to translating its build system
 (for CMake: the build type and configure-time generated files).
 
