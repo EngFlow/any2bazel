@@ -55,7 +55,9 @@ aquery must mirror.
   `catch2_main` / `ssl`.
 - **Link flags**: CMake repeats compile/codegen flags (`-fvisibility=hidden`,
   `-fno-common`) on the link line, where they're benign, while Bazel doesn't.
-  This is the common `ignore.link_flags` case.
+  The differ reports warnings, `-D`/`-U` and the common front-end `-f` flags
+  as `link_compile_only_flags`; any other benign one is an `ignore.link_flags`
+  case.
 
 ## Tests
 

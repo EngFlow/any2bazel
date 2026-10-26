@@ -325,9 +325,11 @@ reason about once the TUs underneath agree.
 also emits **WARN-only** kinds that don't block `converged` — `extra_tu` /
 `extra_target` (compiled/built on the Bazel side but not the reference) and
 `extra_test_tu` — note them but they need no action unless they point to
-something you didn't intend to add. The WARN `configured_files_not_compared`
-does need action: byte-compare each listed file against the one your Bazel
-build generates.
+something you didn't intend to add. `link_compile_only_flags` (warnings,
+`-w`, `-pedantic`, `-D`/`-U`, and front-end flags such as `-fexceptions`,
+`-fno-common` and `-fvisibility=` that CMake repeats on link lines) needs none
+either. The WARN `configured_files_not_compared` does need action: byte-compare
+each listed file against the one your Bazel build generates.
 
 #### Triage findings {#triage}
 
@@ -364,7 +366,7 @@ correctness flags).
 | `defines_diff`   | add each `cmake_only` define to `defines`, or `ignore.defines` it |
 | `includes_diff`  | add the missing reference include root to `includes`; for a dep whose root is spelled differently each side, `ignore.include_map` it (preferred) or `ignore.include_prefixes` it |
 | `flags_diff`     | add each `cmake_only` flag to `copts`, or `ignore.flags` it |
-| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (e.g. a compile flag the reference repeats at link) |
+| `link_flags_diff`| add each `cmake_only` flag to the target's `linkopts`, or `ignore.link_flags` it if benign (a compile flag the reference repeats at link that is not already reported as `link_compile_only_flags`) |
 | `missing_dep`    | add the missing external/system dep to the target's `deps`/`linkopts`; if it's just a name spelled differently per build (`Catch2Main` vs `catch2_main`, `OpenSSL::SSL` vs `ssl`), add a `dep_map` entry. External deps are captured from both `-l` flags and archive-file inputs (e.g. `external/catch2+/libcatch2_main.a`) |
 | `missing_test_tu`| (tests on) add the test source to a `cc_test`, or `exclude_targets` if out of scope |
 | `test_binary_count` | (tests on, warning) differing number of test executables — investigate which side has the extra/missing binary |
