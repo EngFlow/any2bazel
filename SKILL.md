@@ -186,8 +186,9 @@ the reference build or bazel.
 > `python3 "$SKILL_DIR/scripts/extract_bazel.py" …` where `$SKILL_DIR` is this
 > skill's install location (e.g. `~/.claude/skills/any2bazel`). The artifacts
 > you *produce* — `model.*.json`, `aquery.json`, `diff.json`, the generated
-> `BUILD.bazel`/`MODULE.bazel`, and `any2bazel.json` — live in or beside the
-> target repo.
+> `BUILD.bazel`/`MODULE.bazel`, and `any2bazel.json` — live in the target repo:
+> put the parity artifacts at its root beside `any2bazel.json`, gitignored with
+> a comment naming the command that regenerates them, not in a temp directory.
 >
 > **Working directory:** run the reference build and `bazel` from the **target
 > repo root** (the Bazel workspace). Only the `$SKILL_DIR/scripts/*.py` helpers
