@@ -231,8 +231,12 @@ def _union_tus(views: Dict[str, TargetView], names,
     lands in one flat map keyed by repo-relative path. Keys are run through
     cfg.map_source so generated-source grouping asymmetries (e.g. CMake's single
     AUTOMOC bundle vs Bazel's per-header moc_*.cpp) collapse to one token."""
+    # Deterministic: `names` is usually a set, and the first TU wins below, so
+    # a source compiled by two targets with different flags (a shared/static
+    # twin: -Dfoo_EXPORTS, -fPIC) would otherwise be represented by whichever
+    # target Python's hash seed enumerates first -- a diff that flips per run.
     out: Dict[str, TranslationUnit] = {}
-    for n in names:
+    for n in sorted(names):
         for tu in views[n].tus:
             out.setdefault(cfg.map_source(tu.key()), tu)
     return out
