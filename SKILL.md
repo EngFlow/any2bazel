@@ -279,6 +279,10 @@ instead of being a warning nobody reads.
 >   `--features=-linker_param_file` to disable use of param files. Param files
 >   are never generated during `aquery` calls, so when they're in use they'll
 >   always point to files that are either stale, or do not exist at all.
+>   Some toolchains refuse this: analysis fails with "unconditionally implies
+>   feature 'linker_param_file'" (the toolchain rules_cc autodetects on Linux
+>   does). Then drop that flag, and check that no action's `arguments` in the
+>   output hold an `@….params` entry: if none does, nothing is hidden.
 
 ```bash
 bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
