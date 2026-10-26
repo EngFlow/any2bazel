@@ -29,7 +29,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from config import MigrationConfig
-from diff import Severity, diff_models, summarize
+from diff import DiffNotes, Severity, diff_models, summarize
 from model import (Action, BuildSystem, CanonicalModel, Dependency, Target,
                    TargetKind, TargetRole)
 
@@ -141,6 +141,122 @@ def test_missing_cmake_flag_is_caught():
     # the missing define must be reported on the cmake_only side
     dd = next(d for d in discs if d.kind == "defines_diff")
     assert "NEEDED=1" in dd.cmake_only
+
+
+def test_undefine_cancels_earlier_defines_last_wins():
+    from canonicalize import canonicalize_flags
+    def canon(raw):
+        d, _, f = canonicalize_flags(raw, REPO, is_bazel=False)
+        return d, f
+    # a -U cancels earlier defines, and stays a flag iff it is the last word
+    assert canon(["-DNDEBUG", "-UNDEBUG"]) == ((), ("-UNDEBUG",))
+    assert canon(["-D", "X=1", "-U", "X", "-DY"]) == (("Y=1",), ("-UX",))
+    assert canon(["-U_FORTIFY_SOURCE"]) == ((), ("-U_FORTIFY_SOURCE",))
+    # a later -D clears it, whatever preceded the -U
+    assert canon(["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=1"]) == \
+        (("_FORTIFY_SOURCE=1",), ())
+    assert canon(["-D_FORTIFY_SOURCE=1", "-U_FORTIFY_SOURCE",
+                  "-D_FORTIFY_SOURCE=2"]) == (("_FORTIFY_SOURCE=2",), ())
+    assert canon(["-UNDEBUG", "-DNDEBUG"]) == (("NDEBUG=1",), ())
+    # function-like macros are matched by their name, in both orders
+    assert canon(["-DF(x)=x", "-UF"]) == ((), ("-UF",))
+    assert canon(["-UF", "-DF(x)=x"]) == (("F(x)=x",), ())
+    # a later -D replaces earlier definitions of the name, -U or not
+    assert canon(["-DF(x)=1", "-DF(x)=2"]) == (("F(x)=2",), ())
+    assert canon(["-DF(x)=1", "-UF", "-DF(x)=2"]) == (("F(x)=2",), ())
+    # a define with no value is value 1, for the compiler and for the diff
+    assert canon(["-DX=1", "-DX"]) == canon(["-DX", "-DX=1"]) == (("X=1",), ())
+    assert canon(["-DF(x)"]) == (("F(x)=1",), ())
+    assert canon(["-DX="]) == (("X=",), ())  # defined as empty: not 1
+
+
+def test_valueless_define_equals_value_one_across_sides():
+    a = _model(tu_from_raw("src/a.cpp", ["-DX", "-DX=1"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DX=1", "-DX"], is_bazel=True),
+               is_bazel=True)
+    assert diff_models(a, b) == []
+
+
+def test_define_canonicalization_agrees_with_the_preprocessor():
+    # Differential check against the C preprocessor, skipped when no compiler
+    # is installed: for fixed-seed random -D/-U sequences over object-like and
+    # function-like names (joined and split forms, with and without values,
+    # repeats), two sequences must canonicalize to the same define set exactly
+    # when `cc -E` expands a probe source identically. Known limitation, left
+    # out of the pool: a function-like macro that differs only by parameter
+    # names (F(x)=x vs F(y)=y) preprocesses the same but reports a difference.
+    import random
+    import shutil
+    import subprocess
+    from canonicalize import canonicalize_flags
+    cc = next((c for c in ("cc", "gcc", "clang") if shutil.which(c)), None)
+    if cc is None:
+        return
+    pool = []
+    for n in ("A", "B"):
+        pool += [(f"-D{n}",), (f"-D{n}=1",), (f"-D{n}=2",), (f"-D{n}=",),
+                 ("-D", n), ("-D", f"{n}=2"), (f"-U{n}",), ("-U", n)]
+    pool += [("-DF(x)",), ("-DF(x)=x",), ("-DF(x)=1",), ("-D", "F(x)=x+1"),
+             ("-DF=3",), ("-UF",), ("-U", "F")]
+    src = "".join(f"#ifdef {n}\n{n} is [{n}]\n#else\n{n} undef\n#endif\n"
+                  for n in ("A", "B"))
+    src += "#ifdef F\nF is [F(7)] [F]\n#else\nF undef\n#endif\n"
+    rng = random.Random(7)
+    seqs = sorted({tuple(t for _ in range(rng.randint(0, 5))
+                         for t in rng.choice(pool)) for _ in range(300)})
+    by_output, by_defines = {}, {}
+    for s in seqs:
+        out = subprocess.run([cc, "-E", "-P", "-x", "c", "-", *s], input=src,
+                             capture_output=True, text=True, check=True).stdout
+        defines = canonicalize_flags(list(s), REPO, is_bazel=False)[0]
+        by_output.setdefault(" ".join(out.split()), set()).add(defines)
+        by_defines.setdefault(defines, set()).add(" ".join(out.split()))
+    split = {o: d for o, d in by_output.items() if len(d) > 1}
+    merged = {d: o for d, o in by_defines.items() if len(o) > 1}
+    assert not split, f"same preprocessing, different define sets: {split}"
+    assert not merged, f"same define set, different preprocessing: {merged}"
+
+
+def test_redefinition_with_and_without_undefine_converges():
+    # Both preprocess to F(x) == 2; only the Bazel side has the -U between.
+    a = _model(tu_from_raw("src/a.cpp", ["-DF(x)=1", "-DF(x)=2"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DF(x)=1", "-UF", "-DF(x)=2"],
+                           is_bazel=True), is_bazel=True)
+    assert diff_models(a, b) == []
+
+
+def test_fortify_override_in_copts_converges_both_ways():
+    # `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2` copied into copts: under -c opt
+    # Bazel's toolchain has already passed -D_FORTIFY_SOURCE=1 -DNDEBUG. Both
+    # sides compile with exactly _FORTIFY_SOURCE=2, so nothing may differ.
+    override = ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=2"]
+    preamble = ["-D_FORTIFY_SOURCE=1", "-DNDEBUG"]
+    for cmake_raw, bazel_raw in ((["-DNDEBUG"] + override, preamble + override),
+                                 (preamble + override, ["-DNDEBUG"] + override)):
+        a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+        b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+        assert diff_models(a, b) == [], (cmake_raw, bazel_raw)
+
+
+def test_bazel_undefine_after_opt_ndebug_matches_a_reference_without_it():
+    # `build --copt=-UNDEBUG` after -c opt's -DNDEBUG: assertions on, like a
+    # reference that never defines NDEBUG. No define differs.
+    a = _model(tu_from_raw("src/a.cpp", ["-O2"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-O2", "-DNDEBUG", "-UNDEBUG"],
+                           is_bazel=True), is_bazel=True)
+    assert diff_models(a, b) == []
+
+
+def test_bazel_undefine_is_caught_against_a_reference_with_ndebug():
+    # The reverse: the reference turns assertions off, Bazel turns them back on.
+    a = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG", "-UNDEBUG"], is_bazel=True),
+               is_bazel=True)
+    discs = diff_models(a, b)
+    assert [(d.kind, d.severity, d.cmake_only) for d in discs] == \
+        [("defines_diff", "error", ["NDEBUG=1"])], discs
 
 
 def test_extra_bazel_define_is_warn_not_error():
@@ -445,7 +561,7 @@ def test_a_cmake_variant_missing_on_bazel_is_caught():
     discs = diff_models(a, b)
     errs = [d for d in discs if d.severity == Severity.ERROR.value]
     assert len(errs) == 1 and errs[0].kind == "defines_diff", errs
-    assert errs[0].cmake_only == ["FULL"], errs
+    assert errs[0].cmake_only == ["FULL=1"], errs
 
 
 def test_an_extra_bazel_variant_is_tolerated():
@@ -469,7 +585,7 @@ def test_tied_pairings_prefer_the_smaller_difference():
         tu_from_raw("gen/b1.cc", [], True)]))
     discs = diff_models(a, b, MigrationConfig(source_map=(("gen/", "@gen"),)))
     assert [(d.cmake_only, d.bazel_only) for d in discs] == \
-        [(["LIB1"], []), (["LIB2"], [])], discs
+        [(["LIB1=1"], []), (["LIB2=1"], [])], discs
 
 
 def test_tied_pairings_prefer_the_exact_variant_over_a_noisy_one():
@@ -514,6 +630,279 @@ def test_multi_variant_verdict_does_not_depend_on_hash_seed():
             outs.add(out)
     assert len(outs) == 1, "diff output varies with PYTHONHASHSEED"
     assert json.loads(outs.pop())["converged"]
+
+
+def test_bazel_only_flags_are_reported_but_never_block():
+    # The comparison is one-directional: flags only Bazel has never produce a
+    # discrepancy, so a converged diff must still SAY they exist.
+    cmake_raw = ["-std=c++17", "-Werror"]
+    bazel_raw = ["-std=c++17", "-Werror", "-Wno-error=parentheses", "-w",
+                 "-fstack-protector"]  # the last: tolerated toolchain default
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    notes = DiffNotes()
+    discs = diff_models(a, b, notes=notes)
+    res = summarize(discs, a, b, notes=notes)
+    assert res["converged"] and discs == [], res
+    assert res["bazel_only_flags"]["compile"] == {"-Wno-error=parentheses": 1, "-w": 1}
+    assert res["bazel_only_flags"]["link"] == {}
+
+
+def test_bazel_only_flags_respect_ignore_and_count_per_tu():
+    cmake_raw = ["-std=c++17"]
+    bazel_raw = ["-std=c++17", "-fno-strict-aliasing", "-Wno-unused"]
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    for m, raw, bz in ((a, cmake_raw, False), (b, bazel_raw, True)):
+        m.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw(f"src/{n}.cpp", raw, bz)
+                              for n in ("a", "b", "c")]))
+    notes = DiffNotes()
+    summarize(diff_models(a, b, MigrationConfig(ignore_flags={"-Wno-unused"}), notes))
+    assert dict(notes.bazel_only_flags) == {"-fno-strict-aliasing": 3}
+
+
+def test_bazel_only_link_flags_are_reported():
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", ["-pthread"], False))
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(_exe("app", ["-pthread", "-Wl,--export-dynamic"], True))
+    notes = DiffNotes()
+    res = summarize(diff_models(a, b, notes=notes), notes=notes)
+    assert res["converged"], res
+    assert res["bazel_only_flags"]["link"] == {"-Wl,--export-dynamic": 1}
+
+
+def test_bazel_only_flags_are_collected_from_tests_when_opted_in():
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("t_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("test/t.cpp", ["-std=c++17"], False)]))
+    b.add(Target("t:t_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("test/t.cpp", ["-std=c++17", "-w"], True)]))
+    notes = DiffNotes()
+    discs = diff_models(a, b, MigrationConfig(include_tests=True), notes)
+    assert summarize(discs)["converged"], discs
+    assert dict(notes.bazel_only_flags) == {"-w": 1}
+
+
+def test_bazel_only_flags_come_from_the_exact_variant_when_one_exists():
+    # Two Bazel variants of x.cc, one exact and one adding -w; the notes must
+    # reflect the chosen (exact) pair, not the noisy one.
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("l", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x.cc", ["-std=c++17"], False)]))
+    for name, raw in (("a:noisy", ["-std=c++17", "-w", "-Wno-error=foo"]),
+                      ("b:exact", ["-std=c++17"])):
+        b.add(Target(name, TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("x.cc", raw, True)]))
+    notes = DiffNotes()
+    assert diff_models(a, b, notes=notes) == []
+    assert dict(notes.bazel_only_flags) == {}
+
+
+def test_summary_without_notes_has_no_bazel_only_field():
+    a = _model(tu_from_raw("src/a.cpp", ["-O2"], is_bazel=False), is_bazel=False)
+    assert "bazel_only_flags" not in summarize(diff_models(a, a))
+
+
+def test_levels_reported_when_diff_is_blind_to_them():
+    # CMake Release compiles at -O3; Bazel -c opt at -O2. -O* is dropped from
+    # the per-TU diff, so the diff converges -- the levels summary must not.
+    a = _model(tu_from_raw("src/a.cpp", ["-O3", "-DNDEBUG"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-O2", "-g0", "-DNDEBUG"], is_bazel=True),
+               is_bazel=True)
+    res = summarize(diff_models(a, b), a, b)
+    assert res["converged"], res
+    lv = res["levels"]
+    assert lv["differs"]
+    assert lv["cmake"] == {"CXX": {"opt": {"-O3": 1}, "debug": {"(none)": 1},
+                                   "debug_format": {"(none)": 1}}}
+    assert lv["bazel"] == {"CXX": {"opt": {"-O2": 1}, "debug": {"-g0": 1},
+                                   "debug_format": {"(none)": 1}}}
+
+
+def test_levels_last_flag_wins_and_split_by_language():
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("src/a.c", ["-g", "-O2", "-O0"], False),
+        tu_from_raw("src/b.cc", ["-g"], False)]))
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("src/a.c", ["-O0", "-g"], True),
+        tu_from_raw("src/b.cc", ["-g"], True),
+        # a Bazel header-processing action is not a TU and is not counted
+        Action("CppCompile", ("-xc++-header", "-fsyntax-only", "-O2",
+                              "-c", "src/b.h"))]))
+    lv = summarize(diff_models(a, b), a, b)["levels"]
+    assert lv["cmake"]["C"] == {"opt": {"-O0": 1}, "debug": {"-g": 1}, "debug_format": {"(none)": 1}}
+    assert lv["cmake"]["CXX"] == {"opt": {"(none)": 1}, "debug": {"-g": 1}, "debug_format": {"(none)": 1}}
+    assert lv["bazel"] == lv["cmake"]
+    assert not lv["differs"]
+
+
+def test_levels_language_on_one_side_only_does_not_set_differs():
+    # `differs` compares levels for languages BOTH sides compile; a language
+    # only one side has is a missing-TU matter, reported but not a level diff.
+    a = _model(tu_from_raw("src/a.c", ["-O2"], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-O3"], is_bazel=True), is_bazel=True)
+    lv = summarize(diff_models(a, b), a, b)["levels"]
+    assert set(lv["cmake"]) == {"C"} and set(lv["bazel"]) == {"CXX"}, lv
+    assert lv["differs"] is False
+
+
+def test_debug_level_and_format_are_tracked_separately():
+    # -g3 emits macro information that -g1 does not; sharing -gdwarf-4 must
+    # not hide that. A format flag alone enables debug info at level -g.
+    a = _model(tu_from_raw("src/a.cpp", ["-g3", "-gdwarf-4"], is_bazel=False),
+               is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", ["-g1", "-gdwarf-4"], is_bazel=True),
+               is_bazel=True)
+    lv = summarize(diff_models(a, b), a, b)["levels"]
+    assert lv["cmake"]["CXX"]["debug"] == {"-g3": 1}
+    assert lv["bazel"]["CXX"]["debug"] == {"-g1": 1}
+    assert lv["cmake"]["CXX"]["debug_format"] == {"-gdwarf-4": 1}
+    assert lv["differs"]
+    c = _model(tu_from_raw("src/a.cpp", ["-gdwarf-5"], is_bazel=True), is_bazel=True)
+    lc = summarize(diff_models(a, c), a, c)["levels"]["bazel"]["CXX"]
+    assert (lc["debug"], lc["debug_format"]) == ({"-g": 1}, {"-gdwarf-5": 1})
+
+
+def test_levels_skip_a_bazel_target_excluded_under_its_mapped_name():
+    # target_map renames pkg:tool to tool, which is excluded: the diff skips
+    # it, so the levels must not count it either.
+    def m(name, raw, is_bazel):
+        model = _bs(CanonicalModel(), is_bazel)
+        model.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("src/a.cpp", ["-O2"], is_bazel)]))
+        model.add(Target(name, TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("tool/m.cpp", raw, is_bazel)]))
+        return model
+    a, b = m("tool", ["-O2"], False), m("pkg:tool", ["-O0"], True)
+    cfg = MigrationConfig(target_map={"tool": "pkg:tool"}, exclude_targets={"tool"})
+    lv = summarize(diff_models(a, b, cfg), a, b, cfg)["levels"]
+    assert lv["bazel"]["CXX"]["opt"] == {"-O2": 1}, lv
+    assert not lv["differs"], lv
+
+
+def test_levels_count_only_compared_targets():
+    a = _bs(CanonicalModel(), False)
+    a.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("src/a.cpp", ["-O2"], False)]))
+    a.add(Target("vendored", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("third_party/z.c", ["-O3"], False)]))
+    a.add(Target("t_test", TargetKind.EXECUTABLE, role=TargetRole.TEST,
+                 actions=[tu_from_raw("test/t.cpp", ["-O0"], False)]))
+    lv = summarize([], a, a, MigrationConfig(exclude_targets={"vendored"}))["levels"]
+    assert lv["cmake"] == {"CXX": {"opt": {"-O2": 1}, "debug": {"(none)": 1},
+                                   "debug_format": {"(none)": 1}}}
+
+
+def _ndebug_pair(cmake_raw, bazel_raw, cfg=None):
+    a = _model(tu_from_raw("src/a.cpp", cmake_raw, is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", bazel_raw, is_bazel=True), is_bazel=True)
+    notes = DiffNotes()
+    discs = diff_models(a, b, cfg, notes)
+    return summarize(discs, a, b, cfg, notes)
+
+
+def test_ndebug_added_by_bazel_opt_is_reported_though_converged():
+    # -c opt adds -DNDEBUG; the reference keeps assertions. An extra Bazel
+    # define is only a WARN, so the diff converges -- the summary must say it.
+    res = _ndebug_pair(["-O2"], ["-O2", "-DNDEBUG"])
+    assert res["converged"], res
+    nd = res["ndebug"]
+    assert nd["cmake"] == {"(none)": 1} and nd["bazel"] == {"NDEBUG": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (1, 0, True)
+    assert res["bazel_only_flags"]["defines"] == {"NDEBUG=1": 1}
+
+
+def test_ndebug_missing_on_bazel_is_reported_in_the_other_direction():
+    res = _ndebug_pair(["-O3", "-DNDEBUG"], ["-O3"])
+    assert not res["converged"]  # a missing CMake define stays an error
+    nd = res["ndebug"]
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 1, True)
+
+
+def test_ndebug_undefined_again_counts_as_absent():
+    # `build --copt=-UNDEBUG` beside -c opt keeps assertions on: last one wins.
+    res = _ndebug_pair([], ["-DNDEBUG", "-UNDEBUG"])
+    nd = res["ndebug"]
+    assert nd["bazel"] == {"(none)": 1}, nd
+    assert (nd["bazel_added"], nd["differs"]) == (0, False), nd
+    assert res["bazel_only_flags"]["defines"] == {}, res  # agrees with ndebug
+
+
+def test_ndebug_pair_counts_honour_argv_order():
+    # `build --copt=-UNDEBUG` followed by a rule-level -DNDEBUG leaves NDEBUG
+    # defined. The pair counts must agree with the per-side counts.
+    res = _ndebug_pair(["-DNDEBUG"], ["-UNDEBUG", "-DNDEBUG"])
+    nd = res["ndebug"]
+    assert nd["cmake"] == {"NDEBUG": 1} and nd["bazel"] == {"NDEBUG": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 0, False), nd
+
+
+def test_ndebug_turned_back_on_is_missing_and_an_error():
+    # Reference -DNDEBUG; Bazel -DNDEBUG then -UNDEBUG: assertions on.
+    res = _ndebug_pair(["-DNDEBUG"], ["-DNDEBUG", "-UNDEBUG"])
+    assert not res["converged"], res
+    nd = res["ndebug"]
+    assert nd["bazel"] == {"(none)": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 1, True)
+
+
+def test_ndebug_and_defines_collected_through_executables():
+    # The executable path pairs TUs per target, not through <libraries>.
+    def exe(raw, is_bazel):
+        m = _bs(CanonicalModel(), is_bazel)
+        m.add(Target("app", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("tool/m.cpp", raw, is_bazel)]))
+        return m
+    a, b = exe(["-O2"], False), exe(["-O2", "-DNDEBUG", "-DEXTRA"], True)
+    notes = DiffNotes()
+    res = summarize(diff_models(a, b, notes=notes), a, b, notes=notes)
+    assert res["converged"], res
+    assert res["bazel_only_flags"]["defines"] == {"EXTRA=1": 1, "NDEBUG=1": 1}
+    assert (res["ndebug"]["bazel_added"], res["ndebug"]["bazel"]) == (1, {"NDEBUG": 1})
+
+
+def test_ndebug_counts_ignore_the_ignore_list():
+    # An accepted suppression may hide the WARN and the bazel-only define, but
+    # never the assertion-state line.
+    cfg = MigrationConfig(ignore_defines={"NDEBUG"})
+    res = _ndebug_pair([], ["-DNDEBUG", "-DEXTRA=1"], cfg)
+    assert res["converged"] and res["warnings"] == 1, res  # EXTRA=1 only
+    assert res["bazel_only_flags"]["defines"] == {"EXTRA=1": 1}
+    assert res["ndebug"]["bazel_added"] == 1 and res["ndebug"]["differs"]
+
+
+def test_ndebug_differs_follows_the_compared_pairs():
+    # An extra Bazel-only TU without NDEBUG changes the per-side key sets but
+    # is never compared; both pair counts are 0, so nothing differs.
+    a = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG"], is_bazel=False), is_bazel=False)
+    b = _bs(CanonicalModel(), is_bazel=True)
+    b.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("src/a.cpp", ["-DNDEBUG"], True),
+        tu_from_raw("src/extra.cpp", [], True)]))
+    notes = DiffNotes()
+    nd = summarize(diff_models(a, b, notes=notes), a, b, notes=notes)["ndebug"]
+    assert nd["bazel"] == {"NDEBUG": 1, "(none)": 1}, nd
+    assert (nd["bazel_added"], nd["bazel_missing"], nd["differs"]) == (0, 0, False)
+
+
+def test_ndebug_skips_a_bazel_target_excluded_under_its_mapped_name():
+    a = _model(tu_from_raw("src/a.cpp", [], is_bazel=False), is_bazel=False)
+    b = _model(tu_from_raw("src/a.cpp", [], is_bazel=True), is_bazel=True)
+    a.add(Target("tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("tool/m.cpp", [], False)]))
+    b.add(Target("pkg:tool", TargetKind.EXECUTABLE, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("tool/m.cpp", ["-DNDEBUG"], True)]))
+    cfg = MigrationConfig(target_map={"tool": "pkg:tool"}, exclude_targets={"tool"})
+    nd = summarize(diff_models(a, b, cfg), a, b, cfg)["ndebug"]
+    assert nd["bazel"] == {"(none)": 1}, nd
+
+
+def test_ndebug_without_notes_reports_sides_only():
+    a = _model(tu_from_raw("src/a.cpp", ["-DNDEBUG"], is_bazel=False), is_bazel=False)
+    nd = summarize(diff_models(a, a), a, a)["ndebug"]
+    assert "bazel_added" not in nd and nd["differs"] is False, nd
 
 
 def test_ignore_flags_and_defines_suppress_diffs():
