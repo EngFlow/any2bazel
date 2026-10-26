@@ -220,6 +220,16 @@ def _apply_target_map(views: Dict[str, TargetView],
     return renamed
 
 
+def _bazel_renames(a: CanonicalModel, b: CanonicalModel,
+                   cfg: "MigrationConfig") -> Dict[str, str]:
+    """Bazel label -> the name it is compared under, for every Bazel target the
+    diff renames (target_map). The ONE place that decision is made: the
+    comparison and the summaries apply it the same way, so an exclude_targets
+    entry (a CMake name) reaches a renamed Bazel target everywhere."""
+    return {bazel: cmake for cmake, bazel in cfg.target_map.items()
+            if bazel in b.targets}
+
+
 _LIBRARY_KINDS = {TargetKind.STATIC, TargetKind.SHARED, TargetKind.OBJECT,
                   TargetKind.INTERFACE}
 
@@ -298,7 +308,12 @@ def diff_models(a: CanonicalModel, b: CanonicalModel,
     # Reconstruct raw actions into comparable views (TUs + link flags + deps),
     # build-system-specific interpretation keyed on each model's tag.
     a_views = reconstruct(a)
-    b_views = _apply_target_map(reconstruct(b), cfg.target_map)
+    renames = _bazel_renames(a, b, cfg)
+    # Target renames come from the shared decision. Explicit target_map entries
+    # also rename DEPENDENCY references, even with no target node to rename.
+    view_map = dict(cfg.target_map)
+    view_map.update({name: label for label, name in renames.items()})
+    b_views = _apply_target_map(reconstruct(b), view_map)
     a_names = _participating(a_views, cfg)
     b_names = _participating(b_views, cfg)
 
@@ -481,15 +496,18 @@ def excluded_summary(a: CanonicalModel, b: CanonicalModel,
     if cfg.include_tests:
         participating.add(TargetRole.TEST)
 
-    def by_reason(model: CanonicalModel) -> dict:
+    def by_reason(model: CanonicalModel, renames: Dict[str, str]) -> dict:
+        # exclusion is decided on the name the diff compares under; the entry
+        # lists the target's own name (a Bazel label keeps its label)
         out: Dict[str, List[str]] = {}
         for name, t in sorted(reconstruct(model).items()):
-            if cfg.target_excluded(name):
+            if cfg.target_excluded(renames.get(name, name)):
                 out.setdefault("config_excluded", []).append(name)
             elif t.role not in participating:
                 out.setdefault(t.role.value, []).append(name)
         return out
-    return {"cmake": by_reason(a), "bazel": by_reason(b)}
+    return {"cmake": by_reason(a, {}),
+            "bazel": by_reason(b, _bazel_renames(a, b, cfg))}
 
 
 def summarize(discs: List[Discrepancy],
