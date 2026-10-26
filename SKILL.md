@@ -52,7 +52,7 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
   - **Compile parity** — every TU compiled with equivalent flags/defines/
     includes (project-wide TU-set), and the external link-dependency closure
     matches.
-  - **Link consistency** — every name-aligned executable/shared-lib links with
+  - **Link consistency** — every name-aligned executable links with
     equivalent link flags. The per-binary stage: the *artifacts* agree, not just
     the TUs.
 
@@ -60,6 +60,15 @@ Bazel aquery jsonproto    ──extract_bazel.py───────┘        
   correctness-relevant reference flag must be present on the Bazel side; extra
   Bazel flags are tolerated (listed in `diff.json` as `bazel_only_flags`). No
   artifact/symbol diff or test execution yet.
+
+  **`converged: true` is parity of command lines, nothing more.** Check
+  separately what it cannot see:
+  - **Generated file contents.** A value that reaches only a generated file
+    (`configure_file` output, genrule output) never appears on a command line.
+    Byte-compare each generated file against the reference build's.
+  - **How shared libraries link.** A shared library is compared by its TUs
+    only; its link flags and the libraries it links are not checked (the
+    external-dep check is project-wide). Run a binary that loads each one.
 
 ### How targets are matched
 
@@ -305,14 +314,16 @@ comparisons.
 The diff reports both parity stages at once: **compile-parity** kinds
 (`missing_tu`, `defines_diff`, `includes_diff`, `flags_diff`, `missing_dep`,
 `missing_target`) and the **link-consistency** kind (`link_flags_diff`, one per
-name-aligned executable/shared library). Fix compile parity first — link flags
-are easiest to reason about once the TUs underneath agree.
+name-aligned executable). Fix compile parity first — link flags are easiest to
+reason about once the TUs underneath agree.
 
 `error`-severity kinds (above) block convergence and are what you fix. The diff
 also emits **WARN-only** kinds that don't block `converged` — `extra_tu` /
 `extra_target` (compiled/built on the Bazel side but not the reference) and
 `extra_test_tu` — note them but they need no action unless they point to
-something you didn't intend to add.
+something you didn't intend to add. The WARN `configured_files_not_compared`
+does need action: byte-compare each listed file against the one your Bazel
+build generates.
 
 #### Triage findings {#triage}
 
