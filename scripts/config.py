@@ -88,9 +88,10 @@ class MigrationConfig:
     # bundles every moc_*.cpp into one mocs_compilation.cpp TU, while Bazel
     # compiles each moc_*.cpp separately. Mapping both spellings to one token
     # (the CMake bundle path AND the Bazel moc/ dir -> "@moc") reconciles them:
-    # the pooled TU maps collapse to the shared token, so presence matches and
-    # the representative TU's flags are still compared (extra Bazel defines stay
-    # benign WARN under the asymmetric-subset rule). Only ever use for codegen
+    # the pooled TU maps collapse to the shared token, so presence matches, and
+    # every mapped TU is still compared against its best-matching counterpart
+    # (diff._diff_variants; extra Bazel defines stay benign WARN under the
+    # asymmetric-subset rule). Only ever use for codegen
     # whose per-TU flags are uniform; never to paper over a real missing source.
     # Unlike include_map, the token REPLACES the whole path (the remainder is
     # dropped) so N generated files collapse to 1 -- see map_source().
