@@ -48,6 +48,11 @@ aquery must mirror.
 
 - **Target names** in `target_map` and `exclude_targets` keys are CMake target
   names (e.g. `"bssl": ":bssl"`).
+- **Project in a subdirectory**: `cmake -S` may be any directory under
+  `<repo_root>` (e.g. one CMake project per firmware image inside a larger
+  Bazel workspace). The File API reports in-tree sources relative to that
+  top-level source dir; the extractor resolves them against the codemodel's
+  `paths.source`, so TU keys stay relative to `<repo_root>`.
 - **`dep_map`**: CMake spells external link deps as an archive basename
   (`Catch2Main`) or an imported target (`OpenSSL::SSL`), while Bazel spells them
   `catch2_main` / `ssl`.
