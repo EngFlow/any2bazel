@@ -93,11 +93,12 @@ def _is_header_processing(args) -> bool:
 
 
 def _source_from_compile_args(args) -> Optional[str]:
-    """The compiled source is the arg to -c (or the lone source arg). Returns
-    None for header inputs -- not translation units."""
+    """The compiled source is the token after -c (or the lone source arg).
+    Returns None for header inputs -- not translation units. A -c followed by a
+    flag is a stray, redundant -c from the project's flags, not the source."""
     src = None
     for i, a in enumerate(args):
-        if a == "-c" and i + 1 < len(args):
+        if a == "-c" and i + 1 < len(args) and not args[i + 1].startswith("-"):
             src = args[i + 1]
             break
     if src is None:

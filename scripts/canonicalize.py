@@ -91,7 +91,7 @@ IGNORABLE_FLAG_PREFIXES = (
 # These are universal facts (a -o names an output; -c means compile-only), never
 # migration decisions, so they're stripped at canonicalization, not configured.
 # Flags that consume the FOLLOWING token (drop both):
-_DRIVER_PAIR_FLAGS = {"-o", "-c", "-isysroot", "--sysroot", "-arch", "-target",
+_DRIVER_PAIR_FLAGS = {"-o", "-isysroot", "--sysroot", "-arch", "-target",
                       "-gcc-toolchain", "-x", "--serialize-diagnostics"}
 
 # Defines the Bazel toolchain injects for reproducible builds (arrive as
@@ -218,9 +218,14 @@ def canonicalize_flags(
         tok = raw[i]
 
         # driver flags that consume the next token (-o out.o, -isysroot /sdk,
-        # -arch arm64, -c src). Pure invocation mechanics -- drop flag + arg.
+        # -arch arm64). Pure invocation mechanics -- drop flag + arg.
         if tok in _DRIVER_PAIR_FLAGS and i + 1 < n:
             i += 2; continue
+        # -c takes no argument, but the extractors put the source right after
+        # it: drop that source too.
+        if tok == "-c":
+            i += 2 if i + 1 < n and not raw[i + 1].startswith("-") else 1
+            continue
         # bare positional driver tokens (compiler path mid-argv, .o output)
         if _is_driver_token(tok):
             i += 1; continue
