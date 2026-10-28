@@ -237,6 +237,19 @@ rather than recalled). Put `common --check_direct_dependencies=error` in the
 generated `.bazelrc` so a declared version that MVS overrides fails the build
 instead of being a warning nobody reads.
 
+Third-party dependencies that are not in the Bazel Central Registry (BCR) must
+be added to a **local BCR registry** inside the repository (e.g. `registry/`
+containing `bazel_registry.json` and `modules/<name>/<version>/...`) and
+depended on via `bazel_dep` in `MODULE.bazel`. Make the local registry available
+to Bazel with `--registry` by adding **two** entries to `.bazelrc` — one for the
+local registry first, and one for the public BCR second (passing `--registry`
+replaces Bazel's default registry list):
+
+```text
+common --registry=file://%workspace%/registry
+common --registry=https://bcr.bazel.build
+```
+
 ### Main migration loop {#main-migration-loop}
 
 #### Extract the Bazel action graph {#extract-bazel-graph}
