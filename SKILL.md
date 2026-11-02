@@ -112,9 +112,12 @@ whether its frontend reads it:
 ```
 
 Fields:
-- **`bazel_args`** — the extra args aquery must run with to mirror the real
-  build (see [Extract the Bazel action graph](#extract-bazel-graph)). Recorded so
-  the comparison is reproducible; read by the operator, not the diff.
+- **`bazel_args`** — the extra **flags** aquery must run with to mirror the
+  real build (see [Extract the Bazel action graph](#extract-bazel-graph)), e.g.
+  `["--config=release"]` or `["-c", "opt"]`; never a command
+  (`["aquery", "mnemonic(...)", ...]` is wrong). Recorded so the comparison is
+  reproducible; check it with Bazel before running aquery (see
+  [Extract the Bazel action graph](#extract-bazel-graph)).
 - **`target_map`** — `reference_name → bazel_name` for intentionally renamed
   **executables**. Bazel targets are keyed by full label, so the value is
   usually `:name` (e.g. `"bssl": ":bssl"`). Libraries need no mapping.
@@ -261,6 +264,8 @@ instead of being a warning nobody reads.
 >   always point to files that are either stale, or do not exist at all.
 
 ```bash
+# bazel_args, as Bazel parses them; it refuses anything that is not an aquery flag
+python3 -c 'import json,os,sys; os.execvp("bazel", ["bazel", "canonicalize-flags", "--for_command=aquery", "--", *json.load(open(sys.argv[1])).get("bazel_args", [])])' any2bazel.json
 bazel aquery 'mnemonic("CppCompile|ObjcCompile|CppLink|CppArchive", //...)' \
     --features=-compiler_param_file --features=-linker_param_file \
     [--config=<name>] [--copt=... --cxxopt=...] \
