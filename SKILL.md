@@ -25,7 +25,6 @@ install them.
 - `python3`
 - `bazel` or `bazelisk`
 - `curl` or `wget`
-- `jq`
 
 ## Migration strategy overview
 
