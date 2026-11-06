@@ -159,6 +159,32 @@ def _model_of(target):
     return m
 
 
+def test_configured_files_reach_the_diff_end_to_end():
+    # The trace -> extract_cmake -> model JSON -> diff path, with the command
+    # spelled in capitals as large projects write it.
+    from serialize import dump_model, load_model
+    with tempfile.TemporaryDirectory() as root:
+        build = _write_cmake_fixture(root)
+        trace = os.path.join(root, "trace.jsonl")
+        with open(trace, "w") as f:
+            f.write(json.dumps({"version": {"major": 1, "minor": 2}}) + "\n")
+            f.write(json.dumps({"cmd": "CONFIGURE_FILE", "file": REPO + "/CMakeLists.txt",
+                                "line": 3, "args": [REPO + "/config.h.in",
+                                                    build + "/config.h"]}) + "\n")
+        path = os.path.join(root, "model.cmake.json")
+        dump_model(extract_cmake.extract(build, REPO, trace), path)
+        a = load_model(path)
+        assert list(a.configured_files) == ["config.h"], a.configured_files
+
+        aq_path = os.path.join(root, "aquery.json")
+        with open(aq_path, "w") as f:
+            json.dump(AQUERY, f)
+        res = summarize(diff_models(a, extract_bazel.extract(aq_path, REPO)))
+        assert res["converged"], res
+        kinds = [d["kind"] for d in res["discrepancies"]]
+        assert kinds == ["configured_files_not_compared"], kinds
+
+
 def test_cmake_extracts_canonical_flags():
     with tempfile.TemporaryDirectory() as root:
         build = _write_cmake_fixture(root)
