@@ -600,6 +600,32 @@ def test_exclude_targets_suppresses_structural_diffs():
     assert "benchmark" in res["excluded"]["cmake"]["config_excluded"]
 
 
+def test_renamed_bazel_target_is_listed_as_excluded():
+    # target_map renames pkg:app to app; exclude_targets names app. The diff
+    # skips it, so the excluded summary must list it on the Bazel side too.
+    a = _bs(CanonicalModel(), is_bazel=False); a.add(_exe("app", [], False))
+    b = _bs(CanonicalModel(), is_bazel=True); b.add(_exe("pkg:app", [], True))
+    cfg = MigrationConfig(target_map={"app": "pkg:app"}, exclude_targets={"app"})
+    res = summarize(diff_models(a, b, cfg), a, b, cfg)
+    assert res["discrepancies"] == [], res
+    assert res["excluded"]["bazel"] == {"config_excluded": ["pkg:app"]}, res
+    assert res["excluded"]["cmake"] == {"config_excluded": ["app"]}, res
+
+
+def test_target_map_still_renames_a_dependency_with_no_target_node():
+    # An external dep spelled foo by CMake and pkg:foo by Bazel, aligned by a
+    # target_map entry; no pkg:foo target exists. The entry must still rename
+    # the dependency reference, as it always has.
+    def m(dep, is_bazel):
+        model = _bs(CanonicalModel(), is_bazel)
+        model.add(Target("lib", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                         deps=[Dependency(dep, external=True)],
+                         actions=[tu_from_raw("src/a.cpp", [], is_bazel)]))
+        return model
+    a, b = m("foo", False), m("pkg:foo", True)
+    assert diff_models(a, b, MigrationConfig(target_map={"foo": "pkg:foo"})) == []
+
+
 def test_config_loads_all_fields_from_json():
     # The skill drives the diff via a any2bazel.json on disk, so loading must
     # populate every lever. Guards against a field added to the dataclass but
