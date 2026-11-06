@@ -100,9 +100,11 @@ class MigrationConfig:
     # Unlike `ignore` (flags/defines), this is the only lever for missing_tu /
     # missing_target on whole subtrees. Each entry is a reviewable decision.
     exclude_targets: Set[str] = field(default_factory=set)
-    # The bazel aquery invocation this migration is compared against, recorded
-    # so the comparison is reproducible. Read by the skill/operator, not by the
-    # diff itself (the diff consumes the already-extracted model).
+    # The FLAGS appended to `bazel aquery` so the Bazel side mirrors the real
+    # build (never the command itself), recorded so the comparison is
+    # reproducible. Read by the skill/operator, not by the diff itself (the
+    # diff consumes the already-extracted model); SKILL.md has Bazel parse
+    # them before aquery.
     bazel_args: tuple = ()
     # Opt-in: also diff TEST targets (role=test). OFF by default because test
     # diffing requires BOTH models to be extracted with tests enabled and the
