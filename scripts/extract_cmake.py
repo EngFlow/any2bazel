@@ -146,17 +146,20 @@ def _parse_target(tobj: dict, repo_root: str) -> Target:
 
     # Synthesize one CppCompile Action per source: an argv the differ parses the
     # same way it parses Bazel's. CMake has no real command line, so we build the
-    # canonical compiler view: [<flag fragments>, -D..., -I/-isystem ..., -c src].
+    # canonical compiler view in the order CMake's generators emit it
+    # ($DEFINES $INCLUDES $FLAGS): [-D..., -I/-isystem ..., <flag fragments>,
+    # -c src]. The order matters for -U: a -UNDEBUG in CMAKE_CXX_FLAGS comes
+    # after, and so cancels, a -DNDEBUG compile definition.
     actions: List[Action] = []
     for cg in tobj.get("compileGroups", []):
         base: List[str] = []
-        for frag in cg.get("compileCommandFragments", []):
-            base.extend(_split_fragment(frag.get("fragment", "")))
         for d in cg.get("defines", []):
             base.append("-D" + d["define"])
         for inc in cg.get("includes", []):
             base.append("-isystem" if inc.get("isSystem") else "-I")
             base.append(inc["path"])
+        for frag in cg.get("compileCommandFragments", []):
+            base.extend(_split_fragment(frag.get("fragment", "")))
         for idx in cg.get("sourceIndexes", []):
             src = sources[idx]
             argv = tuple(base + ["-c", src])
