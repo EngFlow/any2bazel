@@ -417,6 +417,105 @@ def test_source_map_reconciles_codegen_bundling_asymmetry():
     assert summarize(diff_models(a, b, cfg))["converged"]
 
 
+def _variant_models(cmake_libs, bazel_libs):
+    """One source (src/x.cc) compiled into several libraries per side, each
+    library a {name: [defines]} entry -- a multi-variant source."""
+    def build(libs, is_bazel):
+        m = _bs(CanonicalModel(), is_bazel)
+        for name, defs in libs.items():
+            raw = ["-D" + d for d in defs] + ["-std=c++17"]
+            m.add(Target(name, TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                         actions=[tu_from_raw("src/x.cc", raw, is_bazel)]))
+        return m
+    return build(cmake_libs, False), build(bazel_libs, True)
+
+
+def test_each_cmake_variant_is_paired_with_its_best_bazel_variant():
+    # libprotobuf / libprotobuf-lite style: the same source, two flag sets, on
+    # both sides. Every variant has an exact counterpart -> converged.
+    a, b = _variant_models({"proto": ["FULL"], "proto_lite": ["LITE"]},
+                           {"pkg:proto": ["FULL"], "pkg:proto_lite": ["LITE"]})
+    res = summarize(diff_models(a, b))
+    assert res["converged"], res
+
+
+def test_a_cmake_variant_missing_on_bazel_is_caught():
+    a, b = _variant_models({"proto": ["FULL"], "proto_lite": ["LITE"]},
+                           {"pkg:proto_lite": ["LITE"]})
+    discs = diff_models(a, b)
+    errs = [d for d in discs if d.severity == Severity.ERROR.value]
+    assert len(errs) == 1 and errs[0].kind == "defines_diff", errs
+    assert errs[0].cmake_only == ["FULL"], errs
+
+
+def test_an_extra_bazel_variant_is_tolerated():
+    a, b = _variant_models({"proto_lite": ["LITE"]},
+                           {"pkg:proto": ["FULL"], "pkg:proto_lite": ["LITE"]})
+    discs = diff_models(a, b)
+    assert summarize(discs)["converged"], discs
+    assert discs == [], discs  # the matching variant was chosen, not FULL
+
+
+def test_tied_pairings_prefer_the_smaller_difference():
+    # Three CMake bundles collapse to one source token via source_map, each
+    # with its own define; Bazel has a LIB0 TU and a TU with no define. LIB1
+    # and LIB2 tie on errors against both; the pairing must be the one that
+    # does not report LIB0 (another variant's define) as bazel_only.
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("l", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw(f"gen/a{i}.cc", [f"-DLIB{i}"], False) for i in range(3)]))
+    b.add(Target("l", TargetKind.STATIC, role=TargetRole.PRODUCTION, actions=[
+        tu_from_raw("gen/b0.cc", ["-DLIB0"], True),
+        tu_from_raw("gen/b1.cc", [], True)]))
+    discs = diff_models(a, b, MigrationConfig(source_map=(("gen/", "@gen"),)))
+    assert [(d.cmake_only, d.bazel_only) for d in discs] == \
+        [(["LIB1"], []), (["LIB2"], [])], discs
+
+
+def test_tied_pairings_prefer_the_exact_variant_over_a_noisy_one():
+    # Both Bazel variants produce no discrepancy against CMake {-std=c++17};
+    # the one that only ADDS flags (-w, -Wno-error=foo) must not be chosen.
+    from diff import _best_match
+    from reconstruct import reconstruct
+    a, b = _bs(CanonicalModel(), False), _bs(CanonicalModel(), True)
+    a.add(Target("l", TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                 actions=[tu_from_raw("x.cc", ["-std=c++17"], False)]))
+    for name, raw in (("a:noisy", ["-std=c++17", "-w", "-Wno-error=foo"]),
+                      ("b:exact", ["-std=c++17"])):
+        b.add(Target(name, TargetKind.STATIC, role=TargetRole.PRODUCTION,
+                     actions=[tu_from_raw("x.cc", raw, True)]))
+    ta = reconstruct(a)["l"].tus[0]
+    b_vs = [reconstruct(b)[n].tus[0] for n in ("a:noisy", "b:exact")]
+    discs, chosen = _best_match("<libraries>", ta, b_vs, MigrationConfig())
+    assert discs == [] and chosen.flags == ("-std=c++17",), chosen
+
+
+def test_multi_variant_verdict_does_not_depend_on_hash_seed():
+    # Regression: libraries used to be pooled with dict.setdefault while
+    # iterating a SET of names, so which variant got compared -- and the
+    # verdict -- changed with PYTHONHASHSEED.
+    import json
+    import subprocess
+    import tempfile
+    from serialize import dump_model
+    libs = {f"lib{i}": (["LITE"] if i % 2 else ["FULL"]) for i in range(8)}
+    a, b = _variant_models(libs, {"pkg:" + k: v for k, v in libs.items()})
+    b.targets.pop("pkg:lib0")  # FULL is still built by pkg:lib2, pkg:lib4, ...
+    with tempfile.TemporaryDirectory() as d:
+        pa, pb = os.path.join(d, "a.json"), os.path.join(d, "b.json")
+        dump_model(a, pa)
+        dump_model(b, pb)
+        script = os.path.join(os.path.dirname(__file__), "..", "scripts", "diff.py")
+        outs = set()
+        for seed in range(8):
+            env = dict(os.environ, PYTHONHASHSEED=str(seed))
+            out = subprocess.run([sys.executable, script, pa, pb], env=env,
+                                 capture_output=True, text=True, check=True).stdout
+            outs.add(out)
+    assert len(outs) == 1, "diff output varies with PYTHONHASHSEED"
+    assert json.loads(outs.pop())["converged"]
+
+
 def test_ignore_flags_and_defines_suppress_diffs():
     # A reviewer-approved flag/define difference is suppressed via config and
     # the diff converges; without the config it's an error.
