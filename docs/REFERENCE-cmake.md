@@ -54,6 +54,10 @@ aquery must mirror.
 - **Link flags**: CMake repeats compile/codegen flags (`-fvisibility=hidden`,
   `-fno-common`) on the link line, where they're benign, while Bazel doesn't.
   This is the common `ignore.link_flags` case.
+- **Redundant `-c` in project flags**: some projects put `-c` into
+  `CMAKE_<LANG>_FLAGS` (e.g. `"-c -std=c11"`), which compilers tolerate. `-c`
+  takes no argument, so it is dropped on its own; the flag after it is still
+  compared and the TU is still keyed by its real source.
 
 ## Tests
 
