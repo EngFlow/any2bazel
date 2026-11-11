@@ -29,7 +29,8 @@ Usage:
     python3 extract_cmake.py <build> <repo_root> model.cmake.json
 
 The reply lands in <build>/.cmake/api/v1/reply/. We read the codemodel index,
-then each per-target jsonFile.
+then each per-target jsonFile. <src> may be <repo_root> or any directory under
+it: source paths are resolved against the codemodel's top-level source dir.
 """
 
 from __future__ import annotations
@@ -139,10 +140,14 @@ def _target_id_to_name(codemodel: dict) -> Dict[str, str]:
     return out
 
 
-def _parse_target(tobj: dict, repo_root: str) -> Target:
+def _parse_target(tobj: dict, source_dir: str) -> Target:
     name = tobj["name"]
     kind = _KIND.get(tobj.get("type", ""), TargetKind.UNKNOWN)
-    sources = [s["path"] for s in tobj.get("sources", [])]
+    # The File API gives sources inside the top-level source dir relative to IT
+    # (not to repo_root, which differs when `cmake -S` is a subdirectory), and
+    # others absolute. Make them all absolute so they key repo-relative later.
+    sources = [os.path.normpath(os.path.join(source_dir, s["path"]))
+               for s in tobj.get("sources", [])]
 
     # Synthesize one CppCompile Action per source: an argv the differ parses the
     # same way it parses Bazel's. CMake has no real command line, so we build the
@@ -230,6 +235,8 @@ def extract(build_dir: str, repo_root: str,
     reply_dir = os.path.join(build_dir, ".cmake", "api", "v1", "reply")
     codemodel = _find_codemodel(reply_dir)
     id_to_name = _target_id_to_name(codemodel)
+    # top-level source dir (`cmake -S`); may be any directory under repo_root
+    source_dir = codemodel.get("paths", {}).get("source") or repo_root
 
     model = CanonicalModel(build_system=BuildSystem.CMAKE, repo_root=repo_root)
     include_dirs = set()
@@ -237,7 +244,7 @@ def extract(build_dir: str, repo_root: str,
     for tref in cfg["targets"]:
         with open(os.path.join(reply_dir, tref["jsonFile"])) as f:
             tobj = json.load(f)
-        target = _parse_target(tobj, repo_root)
+        target = _parse_target(tobj, source_dir)
         _attach_deps(target, tobj, id_to_name)
         model.add(target)
         for cg in tobj.get("compileGroups", []):
