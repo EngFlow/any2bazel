@@ -139,6 +139,26 @@ def test_full_pipeline_converges():
         assert res["errors"] == 0, json.dumps(res, indent=2)
 
 
+def test_cmake_flags_come_after_definitions_so_undefine_applies():
+    # CMake emits $DEFINES $INCLUDES $FLAGS: a -UNDEBUG in CMAKE_CXX_FLAGS
+    # cancels a NDEBUG compile definition.
+    import extract_cmake as ec
+    tobj = dict(TARGET_MYLIB, compileGroups=[dict(
+        TARGET_MYLIB["compileGroups"][0],
+        compileCommandFragments=[{"fragment": "-std=c++17 -UNDEBUG"}],
+        defines=[{"define": "NDEBUG"}, {"define": "FOO=1"}])])
+    tu = reconstruct(_model_of(ec._parse_target(tobj, REPO)))["mylib"].tus[0]
+    assert tu.defines == ("FOO=1",), tu
+    assert "-UNDEBUG" in tu.flags, tu  # the last word on NDEBUG: still compared
+
+
+def _model_of(target):
+    from model import BuildSystem, CanonicalModel
+    m = CanonicalModel(build_system=BuildSystem.CMAKE, repo_root=REPO)
+    m.add(target)
+    return m
+
+
 def test_cmake_extracts_canonical_flags():
     with tempfile.TemporaryDirectory() as root:
         build = _write_cmake_fixture(root)
