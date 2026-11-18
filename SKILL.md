@@ -268,10 +268,33 @@ rather than recalled). Put `common --check_direct_dependencies=error` in the
 generated `.bazelrc` so a declared version that MVS overrides fails the build
 instead of being a warning nobody reads.
 
-**Values read from the repository** (`git describe`, a commit hash) are lost
-silently: a genrule cannot see `.git` from the sandbox, and the binary reports
-an "unknown version". Feed them through `--workspace_status_command` to a
-`stamp = 1` rule.
+**If the reference build reads a value from the repository** (`git describe`,
+a commit hash), a Bazel action cannot: the sandbox has no `.git`, and the
+binary silently reports the project's "unknown version". First see *when* the
+reference reads it. If it reads it on every build, reproduce that with
+`--workspace_status_command` and a rule that reads the stable status file (a
+genrule with `stamp = 1`, or a rule that takes `ctx.info_file`). If it reads it
+only when it is configured, a new commit rebuilds nothing there, and a stamp
+that follows every commit costs more than the reference does: stamp only under
+`--stamp`, and say so in the summary.
+
+Keep the stamp as narrow as the reference does. Give the status file only to
+the rule that needs it, and write the value into the one generated file the
+reference writes it into. Everything that reads a stamped output is rebuilt
+when a `STABLE_` value changes, and a commit hash changes on every commit.
+Check the scope before reporting:
+
+```bash
+# unfiltered, unlike the differ's aquery
+bazel aquery '//...' --output=jsonproto --noinclude_commandline > aquery.all.json
+python3 scripts/stamp_scope.py aquery.all.json
+```
+
+It lists the stamped actions, the actions that will rerun with them, and the
+compiles that may. A code generator that lists a stamped header among its
+inputs (Qt's moc lists every header) reruns on every commit whether or not it
+uses it. Where many compiles may rerun, measure; `stamp_scope.py --help` says
+how. Do not add stamping to a project whose reference build has none.
 
 The reference guide covers what is specific to translating its build system
 (for CMake: the build type and configure-time generated files).
