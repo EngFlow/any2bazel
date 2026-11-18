@@ -40,6 +40,8 @@ python3 "$SKILL_DIR/scripts/extract_cmake.py" <build> <repo_root> model.cmake.js
 > the content differ are TODO (see
 > [TODO-configure-time-generation.md](TODO-configure-time-generation.md)). This
 > is distinct from build-time codegen (genrules), which is also unmodeled.
+> `diff.py` lists them in a `configured_files_not_compared` warning (see
+> [Diff against reference build](../SKILL.md#diff)).
 
 The project flags passed to `cmake` define the platform/options the Bazel
 aquery must mirror.
